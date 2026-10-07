@@ -34,6 +34,7 @@ from mod_update_checker.report import (
     STATUS_UPDATE_AVAILABLE,
     Report,
     UpdateEntry,
+    render_entry_lines,
     render_full,
     render_summary,
 )
@@ -829,6 +830,199 @@ def test_summary_and_full_listing_render_in_both_languages(report, language):
     assert any("library.jar" in line for line in full)
     # No raw keys leaked through, which is what a missing translation looks like.
     assert not [line for line in full if line.strip().startswith(("note.", "report.", "line."))]
+
+
+# --------------------------------------------------------------------------------------
+# What a listing looks like
+#
+# These are not cosmetic tests. The console is where a check is read, and the first version of
+# this listing put two URLs on every line: a hundred and seventy characters, wrapping several
+# times in a terminal and unreadable in the game's chat box. Readability is the feature; these
+# are the assertions that keep it.
+# --------------------------------------------------------------------------------------
+
+#: A CDN url as Modrinth actually publishes them — long, and made of ids.
+_CDN_URL = ("https://cdn.modrinth.com/data/AABBCCDD/versions/ZZYYXXWW/"
+            "some-mod-1.1.0%2Bmc26.3-fabric.jar")
+
+#: Longest line a listing may produce. The previous layout ran to 170+ characters and wrapped
+#: three times in a normal terminal; a typical row now measures about 66. This is the ceiling,
+#: not the target — it is deliberately loose enough for a long mod name, a version string like
+#: ``1.19.2-0.5.3+build.31``, and a long project slug all at once.
+_LINE_BUDGET = 100
+
+
+def _entry_with_links(mod_id, status, *, name=None, local="1.0.0", latest="1.1.0", by="hash"):
+    """An entry carrying both URLs, which is what a real run produces."""
+    entry = UpdateEntry(
+        mod_id=mod_id,
+        name=name or mod_id.title(),
+        file_name=mod_id + ".jar",
+        local_version=local,
+        latest_version=latest,
+        status=status,
+        matched_by=by,
+    )
+    entry.project_url = "https://modrinth.com/mod/" + mod_id
+    entry.download_url = _CDN_URL
+    return entry
+
+
+@pytest.mark.parametrize("render", ["summary", "full"])
+def test_no_rendering_carries_the_download_url(render):
+    """The download link belongs in the JSON, not in a line somebody has to read.
+
+    It is ~85 characters of opaque ids, it is not clickable in a console, and the project page
+    answers the same question ("where is the new version") in 37. Anything automating the fetch
+    reads ``last_report.json``, which still carries it.
+
+    Asserted against the *entry's own* download url rather than a pattern, so it cannot be
+    fooled by a file name that happens to look like one — ``sodium.jar`` is how the mod is
+    identified and belongs on the line.
+    """
+    tr = make_translator("zh_cn")
+    linked = _entry_with_links("alpha", STATUS_UPDATE_AVAILABLE)
+    # An unresolved jar is the case whose line shows the file name, so it is the one that
+    # proves the two are not being confused with each other.
+    unresolved = UpdateEntry(mod_id="", name="Mystery", file_name="mystery.jar",
+                             status=STATUS_UNRESOLVED)
+    report = Report(
+        generated_at="2026-01-01T00:00:00+00:00",
+        server=SERVER,
+        mods_directory="server/mods",
+        entries=[linked, unresolved],
+    )
+
+    lines = render_summary(report, tr) if render == "summary" else render_full(report, tr)
+    body = "\n".join(lines)
+
+    assert linked.project_url in body, "the project page is the replacement, so it has to be there"
+    assert linked.download_url not in body
+    assert not [line for line in lines if "cdn." in line], body
+    # The file name is not the url and must survive in the full listing: it is what the jar is
+    # called on disk, and it is the only identifier an unresolved jar has.
+    if render == "full":
+        assert "mystery.jar" in body
+
+
+@pytest.mark.parametrize("render", ["summary", "full"])
+def test_a_line_carries_at_most_one_link(render):
+    """The structural guarantee, and the one that keeps the format from creeping back.
+
+    Whatever gets added to a row later, it may not be another url: one link per line is what
+    makes a list scannable, and a width budget alone would still allow two short ones.
+    """
+    tr = make_translator("zh_cn")
+    report = Report(
+        generated_at="2026-01-01T00:00:00+00:00",
+        server=SERVER,
+        mods_directory="server/mods",
+        download_folder="config/mod_update_checker/downloads",
+        entries=[
+            _entry_with_links("sodium", STATUS_UPDATE_AVAILABLE),
+            _entry_with_links("ferrite-core", STATUS_UPDATE_AVAILABLE,
+                              name="FerriteCore", latest="1.19.2-0.5.3+build.31"),
+            _entry_with_links("fabric-api", STATUS_AWAITING_INSTALL, name="Fabric API"),
+            _entry_with_links("blocked", STATUS_NO_COMPATIBLE_BUILD, name="Blocked Mod"),
+            _entry_with_links("iris", STATUS_UP_TO_DATE, name="Iris"),
+        ],
+    )
+
+    lines = render_summary(report, tr) if render == "summary" else render_full(report, tr)
+    crowded = [line for line in lines if line.count("http") > 1]
+    assert crowded == [], "more than one link on a line: {}".format(crowded)
+
+
+@pytest.mark.parametrize("render", ["summary", "full"])
+def test_every_rendered_line_fits_in_a_console_line(render):
+    """The width budget, checked against entries carrying both urls and a long version.
+
+    Uses the worst case on purpose: a long mod name, a version string the length of
+    ``1.19.2-0.5.3+build.31``, and both urls populated. If a url is ever added back to the
+    rendering, this is what fails.
+    """
+    tr = make_translator("zh_cn")
+    report = Report(
+        generated_at="2026-01-01T00:00:00+00:00",
+        server=SERVER,
+        mods_directory="server/mods",
+        download_folder="config/mod_update_checker/downloads",
+        entries=[
+            _entry_with_links("sodium", STATUS_UPDATE_AVAILABLE),
+            _entry_with_links("ferrite-core", STATUS_UPDATE_AVAILABLE,
+                              name="FerriteCore", latest="1.19.2-0.5.3+build.31"),
+            _entry_with_links("fabric-api", STATUS_AWAITING_INSTALL,
+                              name="Fabric API", latest="0.120.0"),
+            _entry_with_links("blocked", STATUS_NO_COMPATIBLE_BUILD, name="Blocked Mod"),
+            _entry_with_links("iris", STATUS_UP_TO_DATE, name="Iris"),
+            _entry_with_links("local-dev", STATUS_LOCAL_AHEAD, name="Local Dev Build"),
+        ],
+    )
+
+    lines = render_summary(report, tr) if render == "summary" else render_full(report, tr)
+    over = ["{} ({})".format(line, len(line)) for line in lines if len(line) > _LINE_BUDGET]
+    assert over == [], "lines past the budget://n" + "\n".join(over)
+
+
+def test_project_links_are_offered_only_where_visiting_the_page_is_the_next_step(report):
+    """A link on every row is the same as a link on none: neither tells you what to do.
+
+    ``update_available`` and ``no_compatible_build`` end with somebody opening a web page.
+    ``awaiting_install`` does not — the file is already on disk — and leaving it out is what
+    makes the two groups distinguishable at a glance.
+    """
+    tr = make_translator("zh_cn")
+    entries = [
+        _entry_with_links("alpha", STATUS_UPDATE_AVAILABLE),
+        _entry_with_links("beta", STATUS_AWAITING_INSTALL),
+        _entry_with_links("blocked", STATUS_NO_COMPATIBLE_BUILD),
+    ]
+    rendered = "\n".join(render_entry_lines(entries, tr, verbose=False))
+
+    for mod_id in ("alpha", "blocked"):
+        assert "modrinth.com/mod/" + mod_id in rendered
+    assert "modrinth.com/mod/beta" not in rendered, "a fetched build needs no link"
+
+
+def test_a_listing_of_links_starts_them_in_one_column():
+    """Ragged links are the thing that makes a list of urls hard to scan."""
+    tr = make_translator("zh_cn")
+    entries = [
+        _entry_with_links("a", STATUS_UPDATE_AVAILABLE, name="A"),
+        _entry_with_links("longer-mod-id", STATUS_UPDATE_AVAILABLE, name="A Considerably Longer Name"),
+        _entry_with_links("mid", STATUS_UPDATE_AVAILABLE, name="Mid Length"),
+    ]
+    lines = render_entry_lines(entries, tr, verbose=False)
+
+    columns = [line.index("https://") for line in lines]
+    assert len(set(columns)) == 1, columns
+
+
+def test_a_full_listing_still_says_which_status_each_row_is():
+    """The link might be gone, but the rows here are of all kinds and must stay tellable apart."""
+    tr = make_translator("zh_cn")
+    entries = [
+        _entry_with_links("alpha", STATUS_UPDATE_AVAILABLE),
+        _entry_with_links("local-dev", STATUS_LOCAL_AHEAD, name="Local Dev Build"),
+        _entry_with_links("mystery", STATUS_UNRESOLVED, name="Mystery"),
+    ]
+    body = "\n".join(render_entry_lines(entries, tr, verbose=True))
+
+    for label in ("可更新", "本地版本更新", "无法定位上游"):
+        assert label in body, label
+
+
+def test_a_name_match_is_flagged_but_the_normal_case_is_not():
+    """The caveat has to stand out, which it cannot do if every row carries boilerplate."""
+    tr = make_translator("zh_cn")
+    entries = [
+        _entry_with_links("exact", STATUS_UPDATE_AVAILABLE, by="hash"),
+        _entry_with_links("guessed", STATUS_UPDATE_AVAILABLE, by="name"),
+    ]
+    lines = render_entry_lines(entries, tr, verbose=True)
+
+    assert "按名称匹配" in lines[1], lines[1]
+    assert "按文件哈希" not in lines[0], lines[0]
 
 
 def test_summary_says_so_when_there_is_nothing_to_do(tmp_path, upstream):

@@ -41,12 +41,14 @@ __all__ = [
     "STATUS_IGNORED",
     "ALL_STATUSES",
     "ACTIONABLE_STATUSES",
+    "LINKED_STATUSES",
     "UPDATE_ENTRY_ORDER",
     "UpdateEntry",
     "Report",
     "render_summary",
     "render_full",
     "render_entry_line",
+    "render_entry_lines",
     "render_statuses",
     "entry_from_scan",
     "mc_mismatch_note",
@@ -92,6 +94,24 @@ ACTIONABLE_STATUSES: Tuple[str, ...] = (
 
 #: Display order for a full listing: most urgent first, then the noise, then the good news.
 UPDATE_ENTRY_ORDER: Dict[str, int] = {status: index for index, status in enumerate(ALL_STATUSES)}
+
+#: Statuses whose next step is on the project page, and only those. An update to fetch, or a
+#: project with nothing published for this server — both end with somebody opening a web page.
+#:
+#: Deliberately excludes ``awaiting_install``: the build is already on disk, so a link adds
+#: nothing to the line, and leaving it out is what makes the two groups look different at a
+#: glance — one has links because there is still something to go and get.
+LINKED_STATUSES: Tuple[str, ...] = (
+    STATUS_UPDATE_AVAILABLE,
+    STATUS_NO_COMPATIBLE_BUILD,
+)
+
+#: How an entry was tied to a project: by the bytes of the file, or by its name. Only the
+#: second is a guess, and a line that said "matched by hash" on every row would bury it.
+MATCHED_BY_NAME = "name"
+
+#: Blank columns inserted between the description and the project link.
+_LINK_GAP = "  "
 
 Translator = Callable[..., str]
 
@@ -289,8 +309,20 @@ def _status_key(status: str) -> str:
     return "status." + status
 
 
-def render_entry_line(entry: UpdateEntry, tr: Translator, verbose: bool) -> str:
-    """One line: ``name  local -> latest  [status]``."""
+def _entry_parts(entry: UpdateEntry, tr: Translator, verbose: bool) -> Tuple[str, str]:
+    """``(description, project link)`` for one entry.
+
+    The description is the mod and its versions, plus — only in a mixed listing — how it was
+    identified. In the summary the surrounding heading already says what the group means
+    ("these have updates and have not been downloaded"), so repeating the status on every row
+    is noise; in a full listing the rows are of all kinds at once and the status is the only
+    thing that tells them apart.
+
+    The link is empty unless visiting the project page is the next step — see
+    :data:`LINKED_STATUSES`. What is *not* here any more is the download URL: it is eighty-odd
+    characters of opaque ids and version strings, it made every line wrap, and it is still in
+    the JSON report for anything that wants to fetch a file automatically.
+    """
     if entry.status == STATUS_UPDATE_AVAILABLE:
         core = tr(
             "line.update",
@@ -316,16 +348,43 @@ def render_entry_line(entry: UpdateEntry, tr: Translator, verbose: bool) -> str:
             latest=entry.latest_version or "?",
         )
 
-    parts = [tr(_status_key(entry.status))]
-    if verbose and entry.platform:
-        parts.append(entry.platform)
-    if verbose and entry.matched_by:
-        parts.append(tr("matched_by." + entry.matched_by))
-    if entry.project_url:
-        parts.append(entry.project_url)
-    if entry.download_url:
-        parts.append(entry.download_url)
-    return "{}  ({})".format(core, ", ".join(parts))
+    notes: List[str] = []
+    if verbose:
+        notes.append(tr(_status_key(entry.status)))
+        # Only the guess is worth printing. Saying "matched by hash" on every row would bury
+        # the one row where the plugin was not sure, which is the row that needs reading.
+        if entry.matched_by == MATCHED_BY_NAME:
+            notes.append(tr("matched_by." + MATCHED_BY_NAME))
+
+    description = core if not notes else "{}  ({})".format(core, ", ".join(notes))
+    link = entry.project_url if entry.status in LINKED_STATUSES else ""
+    return description, link
+
+
+def render_entry_line(entry: UpdateEntry, tr: Translator, verbose: bool) -> str:
+    """One entry as a single line. Use :func:`render_entry_lines` to render a group of them."""
+    description, link = _entry_parts(entry, tr, verbose)
+    return description if not link else description + _LINK_GAP + link
+
+
+def render_entry_lines(
+    entries: Sequence[UpdateEntry], tr: Translator, verbose: bool = False
+) -> List[str]:
+    """A group of entries, with their project links lined up in one column.
+
+    Alignment is computed over the group rather than fixed, so the column sits right after the
+    longest description it actually has to clear. Without it the links start at a different
+    place on every row, which is exactly the ragged look a list of URLs produces.
+    """
+    parts = [_entry_parts(entry, tr, verbose) for entry in entries]
+    width = max((len(description) for description, link in parts if link), default=0)
+    lines: List[str] = []
+    for description, link in parts:
+        if link:
+            lines.append("  " + description.ljust(width) + _LINK_GAP + link)
+        else:
+            lines.append("  " + description)
+    return lines
 
 
 def render_summary(report: Report, tr: Translator, max_updates: int = 12) -> List[str]:
@@ -345,8 +404,7 @@ def render_summary(report: Report, tr: Translator, max_updates: int = 12) -> Lis
         if not entries:
             return
         lines.append(tr(header_key, count=len(entries)))
-        for entry in entries[:max_updates]:
-            lines.append("  " + render_entry_line(entry, tr, verbose=False))
+        lines.extend(render_entry_lines(entries[:max_updates], tr, verbose=False))
         if len(entries) > max_updates:
             lines.append(tr("report.and_more", count=len(entries) - max_updates))
         if extra:
@@ -395,8 +453,11 @@ def render_full(report: Report, tr: Translator) -> List[str]:
     lines = list(render_summary(report, tr, max_updates=0))
 
     lines.append(tr("report.all_mods"))
-    for entry in report.sorted_entries():
-        lines.append("  " + render_entry_line(entry, tr, verbose=True))
+    ordered = report.sorted_entries()
+    # Rendered as one block so the project links line up down the whole listing: the column
+    # width depends on every row, which is why the notes are appended here rather than inside.
+    for entry, rendered in zip(ordered, render_entry_lines(ordered, tr, verbose=True)):
+        lines.append(rendered)
         for key, args in entry.notes:
             lines.append("      - " + tr(key, **args))
         if entry.error:
