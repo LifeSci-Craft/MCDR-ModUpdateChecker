@@ -504,7 +504,7 @@ PYTHONPATH=.testlibs python -m pytest                  # 含真实 MCDR 端到�
 # 跨 MCDR 版本
 python tools/mcdr_matrix.py --current
 
-# 打包 + 校验产物（可复现、内容白名单、包内代码仍能编译）
+# 打包 + 校验产物（可复现、内容白名单、注释剥离、包内代码仍能编译）
 python pack.py
 python tools/check_artifact.py
 
@@ -512,13 +512,27 @@ python tools/check_artifact.py
 python tools/probe_upstream.py
 ```
 
+### 发布一个新版本
+
+发布产物的内容有一套固定标准，`pack.py` 与 `tools/check_artifact.py` 负责把它钉住：
+
+| 项目 | 规则 | 由谁保证 |
+|---|---|---|
+| `CHANGELOG.md` | **只保留最新一个版本**的条目，更早的条目属于 GitHub Releases | 发版时手工替换（本文件开头已写明） |
+| `README.md` | **完全不进包**（MCDR 从不读它，发布页已经写了同样的内容） | `pack.py` 的白名单 + `check_artifact.py` 的 `FORBIDDEN_ROOTS` |
+| 代码注释与 docstring | **只留在仓库里**；进包的 `.py` 全部被清空（行号保留，堆栈仍能对上源文件） | `pack.py` 的 `packaged_source()` + `check_artifact.py` 的 `check_stripped()` |
+| 其它 | 只打包 `mcdreforged.plugin.json` / 插件包内的 `.py` / `lang/*.json` / `LICENSE` / `CHANGELOG.md` | 同上，白名单式打包 |
+
+发版的顺序：**建分支 → 推分支 → 开 PR → 合并 → 再在合并后的 `main` 上打 tag 发 Release**。
+这样每个版本「新增/删除了什么」在 PR 页面里是逐行可见的。
+
 推送到 `main` 时会自动跑 CI（`.github/workflows/ci.yml`）：
 
 | 作业 | 内容 |
 |---|---|
 | `unit` | Python 3.10 与 3.13 上跑单元与集成测试（3.10 无 `tomllib`，顺带覆盖 Forge 元数据的正则回退路径） |
 | `mcdr-matrix` | **2.13.0 / 2.14.1 / 2.15.0 / 2.15.7 / 2.16.0 各一个作业**，各自起真实 MCDR 跑完整流程 |
-| `artifact` | 连打两次产物比字节（可复现）、检查包内不含 tests/tools/README、确认包内 `.py` 仍能编译 |
+| `artifact` | 连打两次产物比字节（可复现）、检查包内不含 tests/tools/README、确认包内 `.py` 已无注释与 docstring 且仍能编译 |
 
 目录结构：
 
@@ -532,6 +546,7 @@ mod_update_checker/
 ├── versioning.py    版本比较与 MC 版本范围匹配
 ├── digests.py       单次遍历算出 SHA-1 / SHA-512 / 大小
 ├── downloads.py     下载新版本、哈希校验、清单与旧版本清理
+├── installer.py     关服后把下载好的版本装进 mods/（唯一会改动 mods/ 的模块）
 ├── report.py        报告模型与渲染
 ├── serverinfo.py    MC 版本 / 加载器推断
 ├── i18n.py          多语言查表

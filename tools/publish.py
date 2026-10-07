@@ -49,7 +49,7 @@ DEFAULT_NAME = "MCDR-ModUpdateChecker"
 
 DESCRIPTION = (
     "MCDR plugin that compares the server's installed Fabric mods against Modrinth and "
-    "against Modrinth, and reports which ones are out of date."
+    "reports which ones are out of date."
 )
 
 

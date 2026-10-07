@@ -17,6 +17,7 @@ asserted rather than assumed.
 """
 
 import json
+import re
 
 import pytest
 
@@ -39,6 +40,7 @@ from mod_update_checker.report import (
     render_detail,
     render_entry_lines,
     render_full,
+    render_index_body,
     render_summary,
 )
 from mod_update_checker.scanner import scan_jar, scan_mods
@@ -835,6 +837,39 @@ def test_summary_and_full_listing_render_in_both_languages(report, language):
     assert not [line for line in full if line.strip().startswith(("note.", "report.", "line."))]
 
 
+def test_the_full_listing_does_not_claim_rows_were_held_back():
+    """The summary is capped and says how many rows it left out; the full one is not capped.
+
+    ``render_full`` asks for the summary's headings with ``max_updates=0``, and the cap used
+    to be applied as "more than zero entries were held back" — so the text report opened with
+    ``... and 13 more`` directly above the section listing all thirteen, with none of them
+    shown above it. The number was the whole list, presented as a remainder.
+    """
+    tr = make_translator("en_us")
+    entries = [
+        UpdateEntry(mod_id="mod{}".format(index), name="Mod {}".format(index),
+                    file_name="mod{}.jar".format(index), local_version="1.0",
+                    latest_version="2.0", status=STATUS_UPDATE_AVAILABLE)
+        for index in range(13)
+    ]
+    report = Report(
+        generated_at="2026-01-01T00:00:00+00:00",
+        server=SERVER,
+        mods_directory="server/mods",
+        entries=entries,
+    )
+
+    summary = "\n".join(render_summary(report, tr))
+    full = "\n".join(render_full(report, tr))
+
+    hidden_line = tr("report.and_more", count=len(entries) - 12)
+    assert hidden_line in summary, "the summary must say what it left out"
+    assert hidden_line not in full, "nothing is left out of the full listing"
+    assert tr("report.and_more", count=len(entries)) not in full
+    # And every mod is there, which is what makes the line above a lie rather than a warning.
+    assert all("Mod {}".format(index) in full for index in range(13))
+
+
 # --------------------------------------------------------------------------------------
 # What a listing looks like
 #
@@ -1092,14 +1127,27 @@ def test_the_actionable_mods_are_never_the_ones_left_out():
 
 
 def test_a_truncated_listing_says_how_many_it_held_back():
-    """A silent cap is worse than no cap: the reader cannot tell a short list from a cut one."""
+    """A silent cap is worse than no cap: the reader cannot tell a short list from a cut one.
+
+    The count is read out of the line and compared with the number of mods that are actually
+    missing from the body. Asserting on the *text* would not do: an earlier version printed
+    "另有 -9 个未显示", and the loose check written for it ("no ``-`` in the body") also
+    matched the version arrows in every row, so it could only ever fail — or, worse, pass for
+    the wrong reason.
+    """
     tr = make_translator("zh_cn")
     report = _index_report(_many(actionable=40, up_to_date=160))
     body = "\n".join(render_index_body(report, tr))
 
     assert "另有" in body and "未显示" in body
-    # And the count is positive — an early version printed "another -9 not shown".
-    assert "-0" not in body and " -" not in body
+    match = re.search(r"另有\s+(\d+)\s+个未显示", body)
+    assert match is not None, body
+    omitted = int(match.group(1))
+    # Every mod is either printed as a row or counted in that number, never both and never
+    # neither — which is the arithmetic the line is claiming.
+    printed = [line for line in body.splitlines() if line.strip().startswith("[")]
+    assert omitted > 0
+    assert len(printed) + omitted == len(report.entries)
 
 
 def test_the_number_in_the_listing_identifies_the_mod_it_looks_up():

@@ -255,10 +255,9 @@ def _single_predicate(op: Optional[str], base: str) -> Callable[[str], bool]:
         return lambda _version: True
 
     if any(segment in _WILDCARD_SEGMENTS for segment in _segments(base)):
-        if op in (None, "=", "=="):
-            return lambda version: _wildcard_match(base, version)
-        # ``>=1.21.x`` is nonsense; treating it as a wildcard match is the least
-        # surprising thing to do, and it keeps a broken metadata file from raising.
+        # The operator is ignored on purpose: ``>=1.21.x`` is nonsense, and reading it as the
+        # same wildcard match keeps a broken metadata file from raising. Any other reading
+        # would have to invent an ordering that no author meant.
         return lambda version: _wildcard_match(base, version)
 
     def at_least(version: str) -> bool:

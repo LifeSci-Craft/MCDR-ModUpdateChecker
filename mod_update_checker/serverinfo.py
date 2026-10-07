@@ -31,7 +31,6 @@ from .versioning import covers
 
 __all__ = [
     "ServerContext",
-    "MC_VERSION_SOURCES",
     "read_log_head",
     "parse_log_text",
     "detect_loader_from_mods",
@@ -39,9 +38,6 @@ __all__ = [
     "mod_supports_server_version",
     "sanitize_version",
 ]
-
-#: Where an answered ``mc_version`` came from, most trustworthy first. Printed in reports.
-MC_VERSION_SOURCES = ("config", "server_info", "log", "mods", "unknown")
 
 #: Startup lines that name the game version, in priority order. Fabric and Quilt announce
 #: the version with the loader on one line; vanilla/Forge print the older sentence, which

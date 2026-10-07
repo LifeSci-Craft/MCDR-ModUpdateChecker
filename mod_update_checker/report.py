@@ -48,7 +48,6 @@ __all__ = [
     "Report",
     "render_summary",
     "render_full",
-    "render_entry_line",
     "render_entry_lines",
     "render_index_row",
     "render_index",
@@ -58,7 +57,6 @@ __all__ = [
     "entry_detail_rows",
     "index_selection",
     "CHAT_PAGE_LINES",
-    "render_statuses",
     "entry_from_scan",
     "mc_mismatch_note",
 ]
@@ -420,12 +418,6 @@ def _entry_parts(entry: UpdateEntry, tr: Translator, verbose: bool) -> Tuple[str
     return description, link
 
 
-def render_entry_line(entry: UpdateEntry, tr: Translator, verbose: bool) -> str:
-    """One entry as a single line. Use :func:`render_entry_lines` to render a group of them."""
-    description, link = _entry_parts(entry, tr, verbose)
-    return description if not link else description + _LINK_GAP + link
-
-
 def render_entry_lines(
     entries: Sequence[UpdateEntry], tr: Translator, verbose: bool = False
 ) -> List[str]:
@@ -485,7 +477,11 @@ def render_summary(report: Report, tr: Translator, max_updates: int = 12) -> Lis
             return
         lines.append(tr(header_key, count=len(entries)))
         lines.extend(render_entry_lines(entries[:max_updates], tr, verbose=False))
-        if len(entries) > max_updates:
+        # Only when rows were actually held back. The full listing calls this with
+        # ``max_updates=0`` on purpose, to get the headings without the rows — and the
+        # "and N more" line then claimed N items had been shown and N were missing, right
+        # above the section that lists all of them.
+        if max_updates and len(entries) > max_updates:
             lines.append(tr("report.and_more", count=len(entries) - max_updates))
         if extra:
             lines.append(extra)
@@ -681,11 +677,6 @@ def render_detail(entry: UpdateEntry, tr: Translator) -> List[str]:
         (label + value) if label else value
         for label, value, _url in entry_detail_rows(entry, tr)
     ]
-
-
-def render_statuses(tr: Translator) -> Sequence[Tuple[str, str]]:
-    """``(status, human label)`` pairs, for help text."""
-    return [(status, tr(_status_key(status))) for status in ALL_STATUSES]
 
 
 def entry_from_scan(mod: Any) -> UpdateEntry:

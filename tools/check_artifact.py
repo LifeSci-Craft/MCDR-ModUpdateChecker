@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Verify the packed ``.mcdr``: reproducible, minimal, and actually loadable.
+"""Verify the packed ``.mcdr``: reproducible, minimal, stripped, and actually loadable.
 
-Three separate things are checked, because each has a different way of going wrong quietly:
+Four separate things are checked, because each has a different way of going wrong quietly:
 
 * **Reproducibility.** The packer pins zip timestamps and permission bits so that packing the
   same source twice yields byte-identical output. That is what lets anyone verify a release by
@@ -10,6 +10,9 @@ Three separate things are checked, because each has a different way of going wro
 * **Contents.** Only the plugin payload, the metadata, the licence and the changelog ship. A
   deny-list packer would eventually sweep in ``tests/`` or a stray ``conftest.py``, and MCDR
   refuses to load an archive with a root-level module — so the absence is asserted.
+* **Stripping.** Comments and docstrings belong to the repository, not to the artifact. The
+  stripper is in ``pack.py``, so this asserts it ran rather than trusting it: a packer whose
+  stripper quietly stopped working would otherwise only show up as a slightly larger file.
 * **Loadability.** The archive's ``mcdreforged.plugin.json`` parses, declares the expected id
   and version, and every ``.py`` inside still compiles after the comment/docstring stripper has
   been over it. The stripper uses ``tokenize`` and ``ast``; shipping a file it mangled would
@@ -22,10 +25,13 @@ Usage::
 """
 
 import argparse
+import ast
 import hashlib
+import io
 import json
 import sys
 import tempfile
+import tokenize
 import zipfile
 from pathlib import Path
 
@@ -107,6 +113,41 @@ def check_contents(archive_path: Path) -> None:
             print("  {:52} {:>7} B".format(name, archive.getinfo(name).file_size))
 
 
+def check_stripped(archive_path: Path) -> None:
+    """No comment and no docstring survives into the artifact.
+
+    Both are checked with the same tools the stripper uses, because both are the release
+    standard rather than a nicety: the repository is what a developer reads, and comments were
+    about a seventh of the artifact that nobody opening a ``.mcdr`` would ever see.
+    """
+    with zipfile.ZipFile(archive_path) as archive:
+        for name in archive.namelist():
+            if not name.endswith(".py"):
+                continue
+            source = archive.read(name).decode("utf-8")
+
+            for token in tokenize.generate_tokens(io.StringIO(source).readline):
+                assert token.type != tokenize.COMMENT, "{} ships a comment on line {}: {}".format(
+                    name, token.start[0], token.string
+                )
+
+            for node in ast.walk(ast.parse(source)):
+                if not isinstance(
+                    node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+                ) or not node.body:
+                    continue
+                first = node.body[0]
+                if (
+                    isinstance(first, ast.Expr)
+                    and isinstance(first.value, ast.Constant)
+                    and isinstance(first.value.value, str)
+                ):
+                    raise AssertionError(
+                        "{} ships a docstring on line {}".format(name, first.lineno)
+                    )
+        print("stripped        : no comments, no docstrings")
+
+
 def check_loadable(archive_path: Path) -> None:
     """Metadata parses and every shipped module still compiles after stripping."""
     with zipfile.ZipFile(archive_path) as archive:
@@ -145,12 +186,14 @@ def main() -> int:
             raise SystemExit("no such file: {}".format(path))
         print("checking        : {}".format(path))
         check_contents(path)
+        check_stripped(path)
         check_loadable(path)
     else:
         with tempfile.TemporaryDirectory(prefix="muc_artifact_") as folder:
             workdir = Path(folder)
             path = check_reproducible(workdir)
             check_contents(path)
+            check_stripped(path)
             check_loadable(path)
 
     print()

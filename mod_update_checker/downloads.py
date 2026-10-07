@@ -33,7 +33,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from .report import STATUS_AWAITING_INSTALL, STATUS_UPDATE_AVAILABLE, UpdateEntry
 from .upstream import NotFound, Unauthorised, UpstreamError
@@ -180,12 +180,6 @@ class DownloadOptions:
     #: *Extra* attempts after the first one fails, so the total is ``1 + retries``. Follows the
     #: same convention as the ``http_retries`` setting, so the two do not read differently.
     retries: int = 3
-    #: Modrinth's own project, for the advisory in the log. Cosmetic.
-    source_name: str = "modrinth"
-
-    @property
-    def max_megabytes(self) -> float:
-        return self.max_bytes / (1024.0 * 1024.0)
 
 
 @dataclass
@@ -412,18 +406,11 @@ class Downloader:
         options: DownloadOptions,
         logger: Optional[Any] = None,
         ledger: Optional[DownloadLedger] = None,
-        fallback_name: Callable[[UpdateEntry], str] = None,  # type: ignore[assignment]
     ) -> None:
         self.http = http
         self.options = options
         self.logger = logger
         self.ledger = ledger
-        self._fallback_name = fallback_name or self._default_fallback
-
-    @staticmethod
-    @staticmethod
-    def _default_fallback(entry: UpdateEntry) -> str:
-        return entry.fallback_file_name()
 
     def _log(self, level: str, message: str) -> None:
         if self.logger is None:
@@ -551,7 +538,7 @@ class Downloader:
         """
         expected = (entry.download_sha1 or "").lower()
         plain = self.options.folder / safe_jar_name(
-            entry.download_filename, self._fallback_name(entry)
+            entry.download_filename, entry.fallback_file_name()
         )
         suffixed = plain.with_name("{}.{}{}".format(plain.stem, expected[:8], plain.suffix))
 

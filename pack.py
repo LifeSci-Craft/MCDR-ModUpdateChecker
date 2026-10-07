@@ -16,7 +16,8 @@ Only these are shipped:
 * ``mcdreforged.plugin.json`` — package metadata (required)
 * ``mod_update_checker/**.py`` — the plugin code, recursively (submodules included)
 * ``mod_update_checker/lang/*.json`` — the message catalogues (one file per language)
-* ``LICENSE``, ``CHANGELOG.md`` — licence text and the shipped changelog
+* ``LICENSE``, ``CHANGELOG.md`` — licence text and the shipped changelog, which carries only
+  the latest release (older ones live on the release page)
 
 The ``.py`` files are shipped with their comments and docstrings blanked out
 (``packaged_source()``): the repository keeps them, the artifact does not need them. Line

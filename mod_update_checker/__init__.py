@@ -1520,7 +1520,8 @@ def _plugin_title(server: Optional[PluginServerInterface]) -> Tuple[str, str]:
 
 
 def _title_line(server: Optional[PluginServerInterface] = None) -> RTextList:
-    """``========  Mod Update Checker v1.5.0  ========``
+    """``========  Mod Update Checker v1.0.0  ========`` — the name and version read from
+    the plugin metadata, so the example above is just a shape, not a version to keep in step.
 
     The bar is sized to the name so the two sides stay even, with a floor so a very long or
     very short name still looks deliberate. Name and version are coloured differently because

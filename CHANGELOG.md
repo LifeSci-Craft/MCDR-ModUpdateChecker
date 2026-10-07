@@ -1,5 +1,12 @@
 # CHANGELOG
 
+本插件所有值得一提的变更都记录在此。插件包内也附带同一份 `CHANGELOG.md`。
+
+格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
+
+**本文件只保留最新一个版本的条目**，更早版本的记录见
+[GitHub Releases](https://github.com/Pau1am/MCDR-ModUpdateChecker/releases)。
+
 > **关于版本号**：开发期间的迭代（1.0.0 → 1.6.0）都只是内部过程，从未对外发布。首次公开发布统一记为
 > **v1.0.0**，下面这一条即该版本的完整内容。
 
@@ -218,10 +225,12 @@ Sodium
 | `logger.info(RText)` 的颜色被静默丢弃（已实测 `str(RText(...))` 不含 ANSI） | 代码看起来在给控制台上色，实际什么都没有 | 控制台走纯文本、回复走 RText（`source.reply` 会调 `to_colored_text()`，颜色确实生效），并写明这个不对称 |
 | `GET /projects?ids=` 未容忍 404 | 一个失效的项目 id 会让整批 Mod 一起丢掉标题与链接 | 改为容忍 404，坏 id 只影响它自己 |
 | 文档 / 死代码 | 一处注释声称 `Literal` 集合写法「2.15 起才支持」（实测 2.13 已支持，只有类型注解写的是 `str`）；`modrinth.is_permanent` 无人调用 | 更正注释、删除死代码 |
+| 语言目录自检漏了 `install.` 这一族键 | 新加的 15 条安装文案全被判成「无人引用」，打包前的自检直接失败——扫描器只认识写死的那几个键前缀 | 家族列表补上 `install`；`install.reason.<code>` 是渲染时拼接的，改为从 `installer.py` 里读出码表并**双向**校验（缺一条或剩一条都失败），新增对应测试 |
+| `render_full` 里那句「还有 N 个未显示」 | `last_report.txt` 在分组标题下直接写「还有 13 个未显示」，而紧接着的完整清单里 13 个一个不少——**全部**被当成了**剩余** | 只有真的截断了才输出该行（摘要仍会照说），补了回归测试 |
+| 一批无人调用的函数、参数与字段 | 读代码的人要逐条确认它们是否还有用；其中 `Downloader._default_fallback` 上叠了两个 `@staticmethod`，模块文档还在承诺一个并不存在的「代理设置」，`UpstreamError.attempts` 是只写不读的字段 | 逐个核实引用数为零后删除；`HttpClient(proxies=…)` 与 `DownloadOptions.source_name` / `max_megabytes` 一并未用，一并去掉 |
+| 几处「看着像在做事、其实什么都没做」的写法 | 读的人每次都要停下来判断它是否有意图 | `scan_jar` 里的 `if metadata is None: pass`；`_single_predicate` 中两个分支返回同一个 lambda；`_metadata_from_fabric` / `_quilt` 在 `_string_list` 之后又对字符串特判一遍；`modrinth.py` 三处函数内重复 `import json` |
 
----
-
-## 关于被移除的 CurseForge 支持
+### 关于被移除的 CurseForge 支持
 
 开发期间实现过、随后**整条移除**。当时的理由：
 

@@ -6,9 +6,9 @@ the middle of an admin's console output. And a key that exists in ``en_us`` but 
 ``zh_cn`` degrades to English without anyone noticing.
 
 So the two directions are both checked: nothing the code asks for is missing, and nothing the
-catalogue offers has gone stale. The handful of keys built at runtime (``status.<x>`` and
-``matched_by.<x>``) cannot be found by scanning, so they are listed explicitly and checked for
-completeness instead.
+catalogue offers has gone stale. The handful of keys built at runtime (``status.<x>``,
+``matched_by.<x>`` and ``install.reason.<code>``) cannot be found by scanning, so they are
+listed explicitly and checked for completeness instead.
 """
 
 import json
@@ -25,7 +25,14 @@ PACKAGE = Path(__file__).resolve().parent.parent / "mod_update_checker"
 CATALOGUES = sorted(PACKAGE.glob("lang/*.json"))
 
 #: Key families whose full name is only known at runtime.
-DYNAMIC_PREFIXES = ("status.", "matched_by.")
+DYNAMIC_PREFIXES = ("status.", "matched_by.", "install.reason.")
+
+#: Where the ``install.reason.<code>`` codes are written down. ``_install_reason`` prefixes a
+#: record's short reason code at render time, so the catalogue keys for them are invisible to
+#: the scanner below; the codes themselves are read out of the installer, which keeps the two
+#: in step without a second copy of the list.
+_INSTALL_REASONS_IN_CODE = re.compile(r'_skip\(\s*record,\s*"([a-z0-9\-]+)"')
+INSTALLER_SOURCE = PACKAGE / "installer.py"
 
 #: Values the dynamic families are built from.
 #: How an entry was tied to a project. ``fingerprint`` went with CurseForge.
@@ -41,7 +48,7 @@ MATCHED_BY_VALUES = ("hash", "name")
 #: list is a deliberate allow-list of the dotted prefixes that mean something to this plugin.
 _KEY_IN_CODE = re.compile(
     r'"('
-    r'(?:line|note|advisory|report|command|console|check|help|language|download|detail)'
+    r'(?:line|note|advisory|report|command|console|check|help|install|language|download|detail)'
     r'\.[a-z_0-9]+(?:\.[a-z_0-9]+)*'
     r')"'
 )
@@ -127,6 +134,22 @@ def test_the_dynamic_key_families_are_complete():
     assert {
         key for key in available if key.startswith("matched_by.")
     } == {"matched_by." + value for value in MATCHED_BY_VALUES}
+
+
+def test_every_skip_reason_has_a_translation_and_nothing_else_does():
+    """``install.reason.<code>`` is built from the record's reason code at render time.
+
+    Both directions matter: a code with no sentence would print ``install.reason.name-taken``
+    into the console, and a sentence whose code no longer exists is a leftover nobody would
+    notice — the exact failure the two lists above exist to prevent.
+    """
+    codes = set(_INSTALL_REASONS_IN_CODE.findall(INSTALLER_SOURCE.read_text(encoding="utf-8")))
+    assert codes, "the reason codes could not be read out of installer.py any more"
+    available = set(catalogue("en_us"))
+    assert {"install.reason." + code for code in codes} <= available
+    assert {
+        key for key in available if key.startswith("install.reason.")
+    } == {"install.reason." + code for code in codes}
 
 
 @pytest.mark.parametrize("language", ["en_us", "zh_cn"])

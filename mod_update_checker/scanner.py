@@ -273,10 +273,9 @@ def _contact_links(contact: Any) -> Tuple[str, ...]:
 
 def _metadata_from_fabric(data: Dict[str, Any], entry: str, loader: str) -> ModMetadata:
     depends = data.get("depends") if isinstance(data.get("depends"), dict) else {}
-    provides = data.get("provides")
-    provided = _string_list(provides) if provides is not None else ()
-    if isinstance(provides, str):
-        provided = (provides,)
+    # ``_string_list`` already flattens the bare-string form, so ``provides`` needs no
+    # special case of its own here.
+    provided = _string_list(data.get("provides"))
     return ModMetadata(
         mod_id=_first_string(data.get("id")),
         name=_first_string(data.get("name")) or _first_string(data.get("id")),
@@ -309,9 +308,7 @@ def _metadata_from_quilt(data: Dict[str, Any], entry: str) -> ModMetadata:
     elif isinstance(depends, dict):
         mc_range = depends.get("minecraft")
     provides = loader_block.get("provides")
-    provided = _string_list(provides) if provides is not None else ()
-    if isinstance(provides, str):
-        provided = (provides,)
+    provided = _string_list(provides)
     return ModMetadata(
         mod_id=_first_string(loader_block.get("id")),
         name=_first_string(metadata_block.get("name"))
@@ -521,11 +518,9 @@ def scan_jar(path: Path) -> ScannedMod:
         mod.error = "not a readable jar ({}: {})".format(type(error).__name__, error)
         return mod
 
-    if mod.metadata is None:
-        # A perfectly valid jar that simply is not a mod: a library, a datapack archive, a
-        # stray download. Left without an error so the report can list it as unidentified
-        # rather than as a failure.
-        pass
+    # ``metadata is None`` is not an error: a perfectly valid jar that simply is not a mod — a
+    # library, a datapack archive, a stray download — is left without one so the report can
+    # list it as unidentified rather than as a failure.
     return mod
 
 

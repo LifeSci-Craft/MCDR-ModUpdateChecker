@@ -410,17 +410,29 @@ def test_the_end_to_end_run_uses_the_shipped_defaults():
 
     # Every option the tool sets, as a dotted path — the config file groups its options into
     # sections, so comparing sets of paths is the only way to ask this question of both shapes.
+    #
+    # Both runs are asked. One option (``download.install_on_stop``) is set by ``--with-install``
+    # alone, because installing moves the fetched files out of the folder the default run's
+    # download assertions inspect; without asking about both, the declared list and the set it
+    # describes would never agree.
     from support import flatten_options, option_paths
 
+    with_install = tool.plugin_config(_Upstream(), install=True)
     overridden = flatten_options(config)
 
-    assert set(tool.CONFIG_OVERRIDES) == set(overridden), (
+    assert set(tool.CONFIG_OVERRIDES) == set(overridden) | set(flatten_options(with_install)), (
         "the matrix config drifted from its declared overrides://n"
         "  extra: {}\n  missing: {}".format(
-            sorted(set(overridden) - set(tool.CONFIG_OVERRIDES)),
-            sorted(set(tool.CONFIG_OVERRIDES) - set(overridden)),
+            sorted((set(overridden) | set(flatten_options(with_install)))
+                   - set(tool.CONFIG_OVERRIDES)),
+            sorted(set(tool.CONFIG_OVERRIDES)
+                   - set(overridden) - set(flatten_options(with_install))),
         )
     )
+
+    # And the install run differs by exactly that one option, so the second run stays a second
+    # run of the same thing rather than a differently configured one.
+    assert set(flatten_options(with_install)) - set(overridden) == {"download.install_on_stop"}
 
     # The options whose defaults must be in force, i.e. absent from the override dict. These
     # are the ones that decide whether a code path runs at all.
