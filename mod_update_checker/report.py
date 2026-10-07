@@ -32,6 +32,7 @@ from .serverinfo import ServerContext
 __all__ = [
     "STATUS_UP_TO_DATE",
     "STATUS_UPDATE_AVAILABLE",
+    "STATUS_AWAITING_INSTALL",
     "STATUS_LOCAL_AHEAD",
     "STATUS_NO_COMPATIBLE_BUILD",
     "STATUS_UNRESOLVED",
@@ -53,6 +54,11 @@ __all__ = [
 
 STATUS_UP_TO_DATE = "up_to_date"
 STATUS_UPDATE_AVAILABLE = "update_available"
+#: The newer build has been fetched into the plugin's download folder and is waiting to be
+#: copied into ``mods/``. Distinct from ``update_available`` on purpose: there is nothing left
+#: to download, and telling the admin about an update they have already fetched is the noise
+#: this status exists to remove.
+STATUS_AWAITING_INSTALL = "awaiting_install"
 STATUS_LOCAL_AHEAD = "local_ahead"
 STATUS_NO_COMPATIBLE_BUILD = "no_compatible_build"
 STATUS_UNRESOLVED = "unresolved"
@@ -62,6 +68,7 @@ STATUS_IGNORED = "ignored"
 
 ALL_STATUSES: Tuple[str, ...] = (
     STATUS_UPDATE_AVAILABLE,
+    STATUS_AWAITING_INSTALL,
     STATUS_NO_COMPATIBLE_BUILD,
     STATUS_LOCAL_AHEAD,
     STATUS_UNRESOLVED,
@@ -72,8 +79,14 @@ ALL_STATUSES: Tuple[str, ...] = (
 )
 
 #: Statuses that warrant doing something. Everything else is information.
+#:
+#: ``awaiting_install`` belongs here: there is nothing left to download, but the work is not
+#: finished — somebody still has to move the file. Leaving it out would mean the "ready to
+#: install" section is suppressed by ``notify_on_updates_only``, which is the one setting most
+#: servers run with.
 ACTIONABLE_STATUSES: Tuple[str, ...] = (
     STATUS_UPDATE_AVAILABLE,
+    STATUS_AWAITING_INSTALL,
     STATUS_NO_COMPATIBLE_BUILD,
 )
 
@@ -114,6 +127,25 @@ class UpdateEntry:
     def actionable(self) -> bool:
         return self.status in ACTIONABLE_STATUSES
 
+    def fallback_file_name(self) -> str:
+        """The name this mod's download is filed under when upstream offers nothing usable.
+
+        Defined here rather than in the download module because two places need the same answer:
+        the name to write under, and the name to look for when asking whether the build is
+        already on disk. Two independent guesses at it would eventually disagree, and the
+        symptom would be re-downloading a file that is already sitting there.
+
+        The mod id is used before the local file name: it is the stabler identity, and it is
+        already free of spaces, which are the one thing worth avoiding in a file name here.
+        """
+        raw = self.mod_id or self.file_name
+        stem = "".join(character if character.isalnum() or character in "-_." else "-"
+                       for character in raw).strip("-.") or "mod"
+        # A local file name already ends in ``.jar``; appending another would give "mod.jar.jar".
+        if stem.lower().endswith(".jar"):
+            stem = stem[:-4]
+        return "{}.jar".format(stem[:100] or "mod")
+
     @property
     def sort_key(self) -> Tuple[int, str]:
         return (UPDATE_ENTRY_ORDER.get(self.status, 99), self.name.lower())
@@ -137,6 +169,10 @@ class Report:
     generated_at: str
     server: ServerContext
     mods_directory: str
+    #: Where fetched builds are put. Empty when the feature is off and nothing has been
+    #: fetched — a path to a folder that does not exist helps nobody, and an entry that is
+    #: "waiting to be installed" needs to be able to say *where*.
+    download_folder: str = ""
     entries: List[UpdateEntry] = field(default_factory=list)
     total_jars: int = 0
     unidentified: List[Tuple[str, str]] = field(default_factory=list)
@@ -175,6 +211,11 @@ class Report:
         return self.by_status(STATUS_UPDATE_AVAILABLE)
 
     @property
+    def awaiting_install(self) -> List[UpdateEntry]:
+        """Builds already fetched into the download folder, not yet in ``mods/``."""
+        return self.by_status(STATUS_AWAITING_INSTALL)
+
+    @property
     def blocked(self) -> List[UpdateEntry]:
         return self.by_status(STATUS_NO_COMPATIBLE_BUILD)
 
@@ -186,11 +227,24 @@ class Report:
 
     @property
     def actionable_count(self) -> int:
-        return len(self.updates) + len(self.blocked)
+        """How many entries need somebody to do something.
+
+        Derived from :data:`ACTIONABLE_STATUSES` rather than listing the statuses again. It
+        used to be ``len(self.updates) + len(self.blocked)``, which meant adding a status to
+        the tuple had no effect here at all — and the symptom was subtle: the "downloaded,
+        waiting to be installed" section silently disappeared, because the automatic check
+        gates its output on this number.
+        """
+        return sum(1 for entry in self.entries if entry.actionable)
 
     @property
     def has_updates(self) -> bool:
-        return bool(self.updates)
+        """Is there anything worth telling someone about in game?
+
+        A build fetched but not yet installed counts: the admin has not finished, and the
+        notification is where they find out that the file is waiting for them.
+        """
+        return bool(self.updates or self.awaiting_install)
 
     def sorted_entries(self) -> List[UpdateEntry]:
         return sorted(self.entries, key=lambda entry: entry.sort_key)
@@ -244,6 +298,12 @@ def render_entry_line(entry: UpdateEntry, tr: Translator, verbose: bool) -> str:
             local=entry.local_version or "?",
             latest=entry.latest_version or "?",
         )
+    elif entry.status == STATUS_AWAITING_INSTALL:
+        core = tr(
+            "line.awaiting_install",
+            name=entry.name,
+            latest=entry.latest_version or "?",
+        )
     elif entry.status == STATUS_UP_TO_DATE:
         core = tr("line.up_to_date", name=entry.name, version=entry.local_version or "?")
     elif entry.status in (STATUS_UNRESOLVED, STATUS_NOT_A_MOD):
@@ -269,27 +329,44 @@ def render_entry_line(entry: UpdateEntry, tr: Translator, verbose: bool) -> str:
 
 
 def render_summary(report: Report, tr: Translator, max_updates: int = 12) -> List[str]:
-    """The short form: what needs attention, plus a tally. Used for the console notification."""
+    """The short form: what needs attention, plus a tally. Used for the console notification.
+
+    The two groups are kept apart rather than merged into one "has an update" list, because the
+    next action differs completely: one needs fetching (or could not be fetched), the other
+    needs copying into ``mods/``. A single list would leave an admin re-reading a mod they
+    fetched yesterday, wondering whether the download had worked.
+    """
     lines: List[str] = []
     lines.append(
         tr("report.header", version=report.server.describe(), source=report.server.mc_version_source)
     )
 
-    updates = report.updates
-    if updates:
-        lines.append(tr("report.updates_found", count=len(updates)))
-        for entry in updates[:max_updates]:
+    def section(entries, header_key, extra=None):
+        if not entries:
+            return
+        lines.append(tr(header_key, count=len(entries)))
+        for entry in entries[:max_updates]:
             lines.append("  " + render_entry_line(entry, tr, verbose=False))
-        if len(updates) > max_updates:
-            lines.append(tr("report.and_more", count=len(updates) - max_updates))
-    else:
+        if len(entries) > max_updates:
+            lines.append(tr("report.and_more", count=len(entries) - max_updates))
+        if extra:
+            lines.append(extra)
+
+    updates = report.updates
+    pending = report.awaiting_install
+
+    section(updates, "report.updates_found")
+    section(
+        pending,
+        "report.awaiting_install_found",
+        tr("report.awaiting_install_hint", folder=report.download_folder)
+        if report.download_folder
+        else None,
+    )
+    if not updates and not pending:
         lines.append(tr("report.no_updates"))
 
-    blocked = report.blocked
-    if blocked:
-        lines.append(tr("report.blocked_found", count=len(blocked)))
-        for entry in blocked[:max_updates]:
-            lines.append("  " + render_entry_line(entry, tr, verbose=False))
+    section(report.blocked, "report.blocked_found")
 
     tally = report.counts()
     lines.append(
@@ -298,6 +375,7 @@ def render_summary(report: Report, tr: Translator, max_updates: int = 12) -> Lis
             total=len(report.entries),
             up_to_date=tally.get(STATUS_UP_TO_DATE, 0),
             update=tally.get(STATUS_UPDATE_AVAILABLE, 0),
+            awaiting=tally.get(STATUS_AWAITING_INSTALL, 0),
             blocked=tally.get(STATUS_NO_COMPATIBLE_BUILD, 0),
             unresolved=tally.get(STATUS_UNRESOLVED, 0)
             + tally.get(STATUS_NOT_A_MOD, 0)

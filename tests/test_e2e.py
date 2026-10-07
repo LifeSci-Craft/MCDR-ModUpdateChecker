@@ -97,10 +97,15 @@ def test_the_packed_plugin_works_inside_a_real_mcdr(tmp_path):
     assert result["modrinth_used"] and result["curseforge_used"], detail
 
     # Both channels resolved the mods they were supposed to.
-    assert result["statuses"].get("outdated.jar") == "update_available", detail
+    #
+    # ``outdated.jar`` is the interesting one: the run downloads it, so by the time the report
+    # is written its build is on disk and it must no longer be described as an update waiting
+    # to be fetched — that is the whole point of the awaiting_install status.
+    assert result["statuses"].get("outdated.jar") == "awaiting_install", detail
+    # ``cfonly.jar`` is on CurseForge only, so its download is skipped and it stays an update.
+    assert result["statuses"].get("cfonly.jar") == "update_available", detail
     assert result["statuses"].get("current.jar") == "up_to_date", detail
     assert result["statuses"].get("blocked.jar") == "no_compatible_build", detail
-    assert result["statuses"].get("cfonly.jar") == "update_available", detail
     assert result["statuses"].get("library.jar") == "not_a_mod", detail
 
     # Every command is reachable, including the alias.

@@ -27,8 +27,13 @@ from mod_update_checker.downloads import (
     STATUS_SKIPPED,
     DownloadOptions,
     Downloader,
+    entry_key,
     resolve_folder,
     safe_jar_name,
+)
+from mod_update_checker.report import (
+    STATUS_AWAITING_INSTALL,
+    STATUS_UPDATE_AVAILABLE,
 )
 from mod_update_checker.upstream import HttpClient
 
@@ -494,3 +499,238 @@ def test_outcomes_are_matched_back_to_the_entry_they_came_from(tmp_path, cdn, ht
     assert outcomes[0].file_name == "demo.jar"
     assert outcomes[0].mod_id == "demo"
     assert outcomes[0].ok is True
+
+
+# --------------------------------------------------------------------------------------
+# The ledger: which downloaded file belongs to which mod
+# --------------------------------------------------------------------------------------
+
+
+def _ledger(tmp_path):
+    from mod_update_checker.downloads import DownloadLedger
+
+    return DownloadLedger(tmp_path / "download-manifest.json")
+
+
+def test_the_ledger_round_trips(tmp_path):
+    ledger = _ledger(tmp_path)
+    ledger.record("sodium", "sodium-0.6.0.jar", "A" * 40, "0.6.0", "2026-01-01T00:00:00+00:00")
+    ledger.save()
+
+    reloaded = _ledger(tmp_path)
+    record = reloaded.get("sodium")
+    assert record["file"] == "sodium-0.6.0.jar"
+    assert record["version"] == "0.6.0"
+    # The hash is normalised, or a hash comparison would fail on case alone.
+    assert record["sha1"] == "a" * 40
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "",
+        "not json",
+        "[]",
+        '{"version": 99, "mods": {}}',            # a format this build does not understand
+        '{"version": 1, "mods": []}',              # wrong shape for the records
+        '{"version": 1, "mods": {"a": "nope"}}',   # a record that is not an object
+        '{"version": 1, "mods": {"a": {"file": 5}}}',
+    ],
+)
+def test_a_malformed_ledger_is_ignored_rather_than_fatal(tmp_path, content):
+    """Written by this plugin, read by an older version, edited by hand — all can happen.
+
+    A plugin must not fail a check over its own bookkeeping. Losing it costs one extra
+    download; crashing costs the admin their update report.
+    """
+    path = tmp_path / "download-manifest.json"
+    path.write_text(content, encoding="utf-8")
+
+    from mod_update_checker.downloads import DownloadLedger
+
+    ledger = DownloadLedger(path)
+    assert ledger.get("anything") is None
+    ledger.record("sodium", "a.jar", "b" * 40, "1.0", "now")
+    ledger.save()  # and it recovers by overwriting
+
+
+def test_the_ledger_is_kept_outside_the_download_folder(tmp_path):
+    """So that the folder stays nothing but jars, and is checked as such."""
+    from mod_update_checker.downloads import DownloadLedger
+
+    ledger = DownloadLedger(tmp_path / "download-manifest.json")
+    ledger.record("x", "x.jar", "c" * 40, "1", "now")
+    ledger.save()
+
+    assert (tmp_path / "download-manifest.json").is_file()
+    assert not (tmp_path / "downloads").exists()
+
+
+# --------------------------------------------------------------------------------------
+# Replacing a superseded download
+# --------------------------------------------------------------------------------------
+
+
+def _seed(tmp_path, ledger, entry, name, blob, version="1.0.0"):
+    folder = tmp_path / "downloads"
+    folder.mkdir(exist_ok=True)
+    (folder / name).write_bytes(blob)
+    ledger.record(entry_key(entry), name, hashlib.sha1(blob).hexdigest(), version, "then")
+    ledger.save()
+
+
+def test_a_superseded_download_is_replaced_rather_than_accumulating(tmp_path, cdn, http):
+    """The behaviour that keeps the folder from filling with every version ever fetched.
+
+    Names cannot do this job — the new build has a different one — which is exactly why the
+    ledger records who a file belongs to.
+    """
+    from mod_update_checker.downloads import DownloadLedger
+
+    ledger = DownloadLedger(tmp_path / "download-manifest.json")
+    older = b"PK\x03\x04" + b"version one" * 20
+    new = b"PK\x03\x04" + b"version two" * 20
+    entry = _entry(**_publish(cdn, "demo-1.2.0.jar", new))
+    _seed(tmp_path, ledger, entry, "demo-1.0.0.jar", older, version="1.0.0")
+
+    outcomes = _run_with_ledger(tmp_path, http, [entry], ledger)
+
+    assert outcomes[0].status == STATUS_DOWNLOADED, outcomes[0].detail
+    folder = tmp_path / "downloads"
+    assert not (folder / "demo-1.0.0.jar").exists(), "the superseded build was left behind"
+    assert (folder / "demo-1.2.0.jar").read_bytes() == new
+    assert len(list(folder.iterdir())) == 1, "the folder accumulated a copy"
+    # And the ledger now points at the new file, so the next run recognises it.
+    assert DownloadLedger(tmp_path / "download-manifest.json").file_of(entry_key(entry)) == \
+        "demo-1.2.0.jar"
+
+
+def test_a_download_that_is_already_current_is_not_re_downloaded(tmp_path, cdn, http):
+    """Recorded hash matches the wanted one: nothing to do, and no network traffic."""
+    from mod_update_checker.downloads import DownloadLedger
+
+    ledger = DownloadLedger(tmp_path / "download-manifest.json")
+    blob = b"PK\x03\x04" + b"current" * 20
+    entry = _entry(**_publish(cdn, "demo-1.1.0.jar", blob))
+    _seed(tmp_path, ledger, entry, "demo-1.1.0.jar", blob, version="1.1.0")
+
+    cdn.clear_requests()
+    outcomes = _run_with_ledger(tmp_path, http, [entry], ledger)
+
+    assert outcomes[0].status == STATUS_ALREADY_PRESENT
+    assert not cdn.request_paths(), "an up-to-date download was fetched again"
+
+
+def test_a_file_the_plugin_did_not_write_is_never_deleted(tmp_path, cdn, http):
+    """Deleting a file we are not certain we created would be the worst bug here.
+
+    The ledger records bytes; if the file on disk is not those bytes, it is someone else's and
+    is left alone. The new build then lands under a hash-suffixed name rather than clobbering it.
+    """
+    from mod_update_checker.downloads import DownloadLedger
+
+    ledger = DownloadLedger(tmp_path / "download-manifest.json")
+    recorded = b"PK\x03\x04" + b"what we wrote" * 20
+    replaced_by_admin = b"PK\x03\x04" + b"something else entirely" * 20
+    entry = _entry(**_publish(cdn, "demo-1.2.0.jar", b"PK\x03\x04 new" * 20))
+    _seed(tmp_path, ledger, entry, "demo-1.0.0.jar", recorded, version="1.0.0")
+    # The admin overwrote our download with their own file of the same name.
+    (tmp_path / "downloads" / "demo-1.0.0.jar").write_bytes(replaced_by_admin)
+
+    outcomes = _run_with_ledger(tmp_path, http, [entry], ledger)
+
+    assert outcomes[0].status == STATUS_DOWNLOADED, outcomes[0].detail
+    kept = (tmp_path / "downloads" / "demo-1.0.0.jar").read_bytes()
+    assert kept == replaced_by_admin, "a file we did not write was deleted"
+
+
+def test_a_record_for_a_missing_file_is_dropped_silently(tmp_path, cdn, http):
+    """The admin installed it, so the record is simply stale — not an error."""
+    from mod_update_checker.downloads import DownloadLedger
+
+    ledger = DownloadLedger(tmp_path / "download-manifest.json")
+    blob = b"PK\x03\x04" + b"gone" * 20
+    entry = _entry(**_publish(cdn, "demo-1.1.0.jar", blob))
+    _seed(tmp_path, ledger, entry, "demo-1.0.0.jar", b"older", version="1.0.0")
+    (tmp_path / "downloads" / "demo-1.0.0.jar").unlink()
+
+    outcomes = _run_with_ledger(tmp_path, http, [entry], ledger)
+
+    assert outcomes[0].status == STATUS_DOWNLOADED
+    assert not (tmp_path / "downloads" / "demo-1.0.0.jar").exists()
+
+
+def _run_with_ledger(tmp_path, http, entries, ledger, max_bytes=10 * MEGABYTE):
+    from mod_update_checker.downloads import Downloader
+
+    options = DownloadOptions(folder=tmp_path / "downloads", max_bytes=max_bytes)
+    return Downloader(http, options, ledger=ledger).run(entries)
+
+
+# --------------------------------------------------------------------------------------
+# Classifying what is already fetched
+# --------------------------------------------------------------------------------------
+
+
+def test_classify_moves_a_fetched_build_out_of_the_update_list(tmp_path):
+    """A mod that has been fetched is no longer "an update to download"."""
+    blob = b"PK\x03\x04" + b"fetched" * 10
+    folder = tmp_path / "downloads"
+    folder.mkdir()
+    entry = _entry(**_publish(FakeUpstream(), "demo-1.1.0.jar", blob))
+    (folder / entry.download_filename).write_bytes(blob)
+
+    from mod_update_checker.downloads import classify_downloaded
+
+    moved = classify_downloaded([entry], folder, ledger=None)
+
+    assert moved == [entry]
+    assert entry.status == STATUS_AWAITING_INSTALL
+
+
+def test_classify_leaves_content_that_does_not_match(tmp_path):
+    """A truncated or hand-replaced jar is not something to tell someone to install."""
+    folder = tmp_path / "downloads"
+    folder.mkdir()
+    entry = _entry(**_publish(FakeUpstream(), "demo-1.1.0.jar", b"PK\x03\x04 good" * 10))
+    (folder / entry.download_filename).write_bytes(b"PK\x03\x04 truncated")
+
+    from mod_update_checker.downloads import classify_downloaded
+
+    assert classify_downloaded([entry], folder, ledger=None) == []
+    assert entry.status == STATUS_UPDATE_AVAILABLE
+
+
+def test_classify_ignores_entries_that_are_not_updates(tmp_path):
+    folder = tmp_path / "downloads"
+    folder.mkdir()
+    blob = b"PK\x03\x04" + b"x" * 30
+    entry = _entry(**_publish(FakeUpstream(), "demo-1.1.0.jar", blob))
+    entry.status = "up_to_date"
+    (folder / entry.download_filename).write_bytes(blob)
+
+    from mod_update_checker.downloads import classify_downloaded
+
+    assert classify_downloaded([entry], folder, ledger=None) == []
+    assert entry.status == "up_to_date"
+
+
+def test_classify_needs_a_hash_to_work_with(tmp_path):
+    """Without a hash nothing can be verified, so nothing may be called ready."""
+    folder = tmp_path / "downloads"
+    folder.mkdir()
+    entry = _entry(download_sha1="")
+    (folder / entry.download_filename).write_bytes(b"whatever")
+
+    from mod_update_checker.downloads import classify_downloaded
+
+    assert classify_downloaded([entry], folder, ledger=None) == []
+    assert entry.status == STATUS_UPDATE_AVAILABLE
+
+
+def test_classify_handles_a_folder_that_does_not_exist(tmp_path):
+    from mod_update_checker.downloads import classify_downloaded
+
+    entry = _entry()
+    assert classify_downloaded([entry], tmp_path / "nope", ledger=None) == []
+    assert entry.status == STATUS_UPDATE_AVAILABLE

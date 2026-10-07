@@ -315,6 +315,41 @@ def plugin_config(upstream) -> dict:
     return config
 
 
+#: A build left in the downloads folder from an earlier run, for a mod whose newer build is
+#: available now. Seeded so the run has to notice it is superseded, remove it, and fetch the new
+#: one — the "an updated mod gets re-downloaded" behaviour, checked against a real MCDR.
+STALE_DOWNLOAD = {
+    "mod_id": "outdated",
+    "file": "outdated-1.0.5.jar",
+    "version": "1.0.5",
+    "bytes": b"PK\x03\x04 an older build that has since been superseded",
+}
+
+
+def seed_stale_download(root: Path) -> None:
+    """Plant an older download plus the ledger entry that claims it."""
+    folder = root / "config" / PLUGIN_ID / "downloads"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / STALE_DOWNLOAD["file"]).write_bytes(STALE_DOWNLOAD["bytes"])
+    write(
+        root / "config" / PLUGIN_ID / "download-manifest.json",
+        json.dumps(
+            {
+                "version": 1,
+                "mods": {
+                    STALE_DOWNLOAD["mod_id"]: {
+                        "file": STALE_DOWNLOAD["file"],
+                        "sha1": hashlib.sha1(STALE_DOWNLOAD["bytes"]).hexdigest(),
+                        "version": STALE_DOWNLOAD["version"],
+                        "at": "2026-01-01T00:00:00+00:00",
+                    }
+                },
+            },
+            indent=2,
+        ),
+    )
+
+
 def build_tree(root: Path, python: str, plugin: Path, upstream, jars) -> None:
     """Lay out one MCDR instance plus a planted mods folder."""
     (root / "plugins").mkdir(parents=True, exist_ok=True)
@@ -333,6 +368,7 @@ def build_tree(root: Path, python: str, plugin: Path, upstream, jars) -> None:
         json.dumps(plugin_config(upstream), indent=2),
     )
     write(root / "permission.yml", PERMISSION_YML)
+    seed_stale_download(root)
 
 
 def feed_commands(process, delay: float) -> None:
@@ -519,6 +555,18 @@ def summarise(console: str, root: Path, version: str, python: str) -> dict:
     for name, expected in expected_files.items():
         path = downloads / name
         verified[name] = path.is_file() and _sha1_of(path) == expected
+    # A build that has been fetched is no longer an update to fetch. Asserted on the file name
+    # level so that a regression which puts it back into the "not downloaded" list is caught
+    # even if the download itself still works.
+    awaiting = {
+        entry.get("file_name") for entry in report.get("entries", [])
+        if entry.get("status") == "awaiting_install"
+    }
+    announced_updates = {
+        entry.get("file_name") for entry in report.get("entries", [])
+        if entry.get("status") == "update_available"
+        and entry.get("download_filename") in downloaded
+    }
     # The scenario serves one file with bytes that do not match its declared hash. Nothing may
     # be left behind for it, and a partial ``.part`` file counts as left behind.
     tampered_names = [name for name in expected_files if "tampered" in name]
@@ -554,6 +602,8 @@ def summarise(console: str, root: Path, version: str, python: str) -> dict:
         "downloads_written": downloaded,
         "downloads_verified": verified,
         "downloads_leftovers": leftovers,
+        "downloads_awaiting": sorted(awaiting),
+        "downloads_still_announced": sorted(announced_updates),
         "downloads_tampered_refused": bool(tampered_names)
         and all(name not in downloaded for name in tampered_names),
         # The three checks the run is judged on, reduced from the details above.
@@ -568,6 +618,21 @@ def summarise(console: str, root: Path, version: str, python: str) -> dict:
         "download_tampered_refused": bool(tampered_names)
         and all(name not in downloaded for name in tampered_names),
         "download_no_leftovers": not leftovers,
+        # The downloaded build must have left the "update to fetch" list, and the notification
+        # must say both things: what still needs fetching, and what is fetched but not installed.
+        "download_reclassified": bool(awaiting) and not announced_updates,
+        # The superseded build planted before the run must be gone, and the new one present.
+        # Both halves matter: replacing without removing would leave the folder accumulating
+        # every version a mod has been through.
+        "stale_download_removed": STALE_DOWNLOAD["file"] not in downloaded,
+        "stale_download_replaced": any(
+            name != STALE_DOWNLOAD["file"] for name in downloaded
+        ),
+        "notify_lists_both_groups": (
+            ("尚未下载" in joined or "not downloaded" in joined)
+            and ("已下载待安装" in joined or "waiting to be installed" in joined
+                 or "已下载，未安装" in joined)
+        ),
         "statuses": statuses,
         "command_summary": COMMAND_EXPECTATIONS["summary"] in console,
         "command_help": COMMAND_EXPECTATIONS["help"] in console,
@@ -599,6 +664,10 @@ CHECK_KEYS = [
     "download_hash_verified",
     "download_tampered_refused",
     "download_no_leftovers",
+    "download_reclassified",
+    "stale_download_removed",
+    "stale_download_replaced",
+    "notify_lists_both_groups",
     "command_summary",
     "command_help",
     "command_status",

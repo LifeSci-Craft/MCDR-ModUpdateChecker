@@ -6,6 +6,7 @@ firing — so they are pinned here rather than left to a review.
 """
 
 import ast
+import hashlib
 import json
 import time
 from pathlib import Path
@@ -375,6 +376,19 @@ def test_the_end_to_end_run_uses_the_shipped_defaults():
 # --------------------------------------------------------------------------------------
 
 
+def _report_with(entries):
+    """A report holding exactly ``entries``."""
+    from mod_update_checker.report import Report
+    from mod_update_checker.serverinfo import ServerContext
+
+    return Report(
+        generated_at="2026-01-01T00:00:00+00:00",
+        server=ServerContext(mc_version="26.3", mc_version_source="config", loader="fabric"),
+        mods_directory="server/mods",
+        entries=list(entries),
+    )
+
+
 def _report(updates=2, age_seconds=0.0):
     """A report with ``updates`` pending updates, produced ``age_seconds`` ago."""
     from datetime import datetime, timedelta, timezone
@@ -665,25 +679,139 @@ def test_the_download_folder_cannot_be_aimed_outside_the_plugin(tmp_path, name):
     assert reason, "a refusal has to say why"
 
 
-def test_nothing_is_downloaded_when_the_feature_is_off(tmp_path, monkeypatch):
+def _downloaded_entry(tmp_path, folder_name="downloads", blob=b"PK\x03\x04payload"):
+    """An entry with an update whose build is sitting in the download folder already."""
+    from mod_update_checker.report import UpdateEntry
+
+    folder = Path(tmp_path) / "config" / "mod_update_checker" / folder_name
+    folder.mkdir(parents=True, exist_ok=True)
+    name = "mod0-1.1.0.jar"
+    (folder / name).write_bytes(blob)
+    return UpdateEntry(
+        mod_id="mod0",
+        name="Mod 0",
+        file_name="mod0.jar",
+        local_version="1.0.0",
+        latest_version="1.1.0",
+        status="update_available",
+        platform="modrinth",
+        download_url="https://cdn.example/" + name,
+        download_filename=name,
+        download_sha1=hashlib.sha1(blob).hexdigest(),
+        download_size=len(blob),
+    )
+
+
+def test_a_downloaded_build_is_no_longer_announced_as_an_update(tmp_path):
+    """The behaviour the whole ledger exists for.
+
+    Once the newer build is on disk, announcing it as an update again on every start is noise:
+    the admin already did that step. It becomes "downloaded, waiting to be installed" instead,
+    which is a different statement and the one they still have to act on.
+    """
+    import mod_update_checker as plugin
+
+    server = _FakeServer(tmp_path)
+    config = plugin.Config.get_default()
+    entry = _downloaded_entry(tmp_path)
+
+    plugin._sync_download_state(server, _report_with([entry]), config)
+
+    assert entry.status == "awaiting_install"
+
+
+def test_download_state_is_read_even_with_downloading_switched_off(tmp_path):
+    """Off means "do not fetch", not "forget what was fetched".
+
+    An admin who turns the option off after using it should still be told the file is waiting,
+    rather than being told once more that an update exists.
+    """
+    import mod_update_checker as plugin
+
+    server = _FakeServer(tmp_path)
+    config = plugin.Config.get_default()
+    assert config.download_updates is False
+    entry = _downloaded_entry(tmp_path)
+
+    plugin._sync_download_state(server, _report_with([entry]), config)
+
+    assert entry.status == "awaiting_install"
+
+
+def test_a_file_that_does_not_match_its_hash_stays_an_update(tmp_path):
+    """Presence is not enough: a truncated or hand-replaced jar must not be called ready.
+
+    Left as ``update_available`` so the download stage deals with it, which is the correct
+    outcome — telling someone to install a file that is not what it claims to be is worse than
+    telling them to fetch it again.
+    """
+    import mod_update_checker as plugin
+
+    server = _FakeServer(tmp_path)
+    config = plugin.Config.get_default()
+    entry = _downloaded_entry(tmp_path)
+    folder = Path(server.get_data_folder()) / "downloads"
+    # Present, right name, wrong bytes.
+    (folder / entry.download_filename).write_bytes(b"not the jar you are looking for")
+
+    plugin._sync_download_state(server, _report_with([entry]), config)
+
+    assert entry.status == "update_available"
+
+
+def test_a_record_for_a_file_that_is_gone_is_dropped(tmp_path):
+    """The admin installed it (or deleted it); the bookkeeping should follow, not go stale."""
+    import mod_update_checker as plugin
+    from mod_update_checker.downloads import DownloadLedger
+
+    server = _FakeServer(tmp_path)
+    config = plugin.Config.get_default()
+    entry = _downloaded_entry(tmp_path)
+    folder = Path(server.get_data_folder()) / "downloads"
+
+    ledger = DownloadLedger(Path(server.get_data_folder()) / plugin.DOWNLOAD_LEDGER_FILE_NAME)
+    ledger.record("mod0", entry.download_filename, entry.download_sha1, "1.1.0", "now")
+    ledger.save()
+    (folder / entry.download_filename).unlink()
+
+    plugin._sync_download_state(server, _report_with([entry]), config)
+
+    assert entry.status == "update_available"
+    reloaded = DownloadLedger(Path(server.get_data_folder()) / plugin.DOWNLOAD_LEDGER_FILE_NAME)
+    assert reloaded.get("mod0") is None, "a record outlived its file"
+
+
+def test_nothing_is_fetched_when_the_feature_is_off(tmp_path, monkeypatch):
     """Off is the shipped default, so this is the path almost every server takes."""
     import mod_update_checker as plugin
 
+    server = _FakeServer(tmp_path)
     config = plugin.Config.get_default()
     assert config.download_updates is False
+    entry = _entry_with_update()
 
     def explode(*_args, **_kwargs):
-        raise AssertionError("the download stage ran while switched off")
+        raise AssertionError("a download was attempted while the feature is off")
 
-    monkeypatch.setattr(plugin, "_download_updated_mods", explode, raising=False)
-    monkeypatch.setattr(plugin, "_config", config, raising=False)
-    monkeypatch.setattr(plugin, "_run_check", lambda *a, **k: _report(), raising=False)
+    monkeypatch.setattr(plugin, "Downloader", explode, raising=False)
 
-    # Drive the gating directly: the stage is only reached when the option is on.
-    report = _report()
-    if config.download_updates:
-        plugin._download_updated_mods(None, report, config)
-    assert report is not None
+    plugin._reconcile_downloads(server, _report_with([entry]), config)
+
+    assert entry.status == "update_available"
+    assert not (Path(server.get_data_folder()) / "downloads").exists()
+
+
+def _entry_with_update():
+    from mod_update_checker.report import UpdateEntry
+
+    return UpdateEntry(
+        mod_id="mod0", name="Mod 0", file_name="mod0.jar",
+        local_version="1.0.0", latest_version="1.1.0",
+        status="update_available", platform="modrinth",
+        download_url="https://cdn.invalid/mod0-1.1.0.jar",
+        download_filename="mod0-1.1.0.jar",
+        download_sha1="a" * 40, download_size=100,
+    )
 
 
 def test_a_broken_download_stage_does_not_fail_the_check(tmp_path):
@@ -700,7 +828,7 @@ def test_a_broken_download_stage_does_not_fail_the_check(tmp_path):
     # No data folder available is the cheapest way to make the stage throw from the inside.
     server.get_data_folder = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
 
-    plugin._download_updated_mods(server, _report(), config)
+    plugin._reconcile_downloads(server, _report_with([_entry_with_update()]), config)
 
     joined = "\n".join(server.logger.messages)
     assert "WARN" in joined, joined

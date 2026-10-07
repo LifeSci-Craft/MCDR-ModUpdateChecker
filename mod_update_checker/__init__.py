@@ -37,9 +37,11 @@ from .downloads import (
     STATUS_DOWNLOADED,
     STATUS_FAILED,
     STATUS_SKIPPED,
+    DownloadLedger,
     DownloadOptions,
     DownloadOutcome,
     Downloader,
+    classify_downloaded,
     resolve_folder as resolve_download_folder_path,
 )
 from .report import ALL_STATUSES, Report, render_entry_line, render_full, render_summary
@@ -56,6 +58,9 @@ CONFIG_FILE_NAME = "config.json"
 REPORT_FILE_NAME = "last_report.json"
 REPORT_TEXT_FILE_NAME = "last_report.txt"
 CACHE_FILE_NAME = "resolve-cache.json"
+#: Which downloaded file belongs to which mod. Kept next to the other state rather than inside
+#: the download folder, so that folder stays nothing but jars.
+DOWNLOAD_LEDGER_FILE_NAME = "download-manifest.json"
 
 #: Both spellings are registered so an admin does not have to guess which one is canonical.
 ROOT_LITERALS = ("!!modupdate", "!!muc")
@@ -361,14 +366,15 @@ def _run_check(
         report = checker.run(scan, context, cache_path=cache_path)
         _last_report = report
 
+        # Before the notification, not after it. What the admin reads has to describe the state
+        # they are in when they read it: a build that gets fetched a moment later would
+        # otherwise be announced as "not yet downloaded" and then downloaded, which makes the
+        # report wrong the instant it is printed. The cost is waiting for the transfers, so a
+        # line saying how many are starting goes out first.
+        _reconcile_downloads(server, report, config)
+
         _notify(server, report, source=source, announce_clean=announce_clean,
                 broadcast=broadcast)
-
-        # After the report, not before: a fetch can take a while, and the admin should not
-        # have to wait for it to see what was found. Its outcome is logged as its own block,
-        # and the report files are written afterwards so they carry the download notes too.
-        if config.download_updates:
-            _download_updated_mods(server, report, config)
 
         if config.write_report_file:
             _write_report_files(server, report)
@@ -433,15 +439,44 @@ def _notify(
         _notify_in_game(server, report)
 
 
-def _download_updated_mods(
+def _sync_download_state(
+    server: PluginServerInterface, report: Report, config: Config
+) -> Tuple[Optional[Path], Optional[DownloadLedger]]:
+    """Load the ledger, prune it, and move already-fetched builds out of the update list.
+
+    Runs whether or not downloading is currently enabled. The download folder says what has
+    been fetched, and that stays true after the option is switched off — an admin who turns it
+    off should still be told that the file is sitting there waiting, rather than being told
+    again that an update exists.
+    """
+    folder, reason = resolve_download_folder(server, config)
+    if folder is None:
+        if config.download_updates:
+            server.logger.warning(
+                tr("download.bad_folder", name=config.download_folder_name, reason=reason)
+            )
+        return None, None
+
+    # Recorded on the report so the summary can name the folder: "ready to be installed"
+    # without saying where is only half an answer.
+    if config.download_updates or folder.is_dir():
+        report.download_folder = str(folder)
+
+    ledger = DownloadLedger(Path(server.get_data_folder()) / DOWNLOAD_LEDGER_FILE_NAME,
+                            logger=server.logger)
+    if folder.is_dir():
+        if ledger.prune(folder):
+            # Records for files that are no longer there: the admin installed them, or removed
+            # them. Either way the bookkeeping should follow.
+            ledger.save()
+    classify_downloaded(report.entries, folder, ledger)
+    return folder, ledger
+
+
+def _reconcile_downloads(
     server: PluginServerInterface, report: Report, config: Config
 ) -> None:
-    """Fetch the newer builds, if the admin asked for that.
-
-    Runs inside the check, on the check's own thread, and after the report has been announced.
-    That order matters: the admin sees the findings immediately instead of waiting for a few
-    hundred megabytes to arrive, and the download progress then shows up as its own log lines
-    rather than being folded into the report they already read.
+    """Bring the download folder and the report into agreement, fetching what is missing.
 
     Wholly self-contained. The check has already succeeded by the time this runs, so nothing in
     here — a misconfigured folder, an unreachable host, a full disk, a bug in the summary
@@ -449,19 +484,24 @@ def _download_updated_mods(
     """
     http: Optional[HttpClient] = None
     try:
-        folder, reason = resolve_download_folder(server, config)
-        if folder is None:
-            server.logger.warning(
-                tr("download.bad_folder", name=config.download_folder_name, reason=reason)
-            )
+        folder, ledger = _sync_download_state(server, report, config)
+        if folder is None or not config.download_updates:
             return
+
+        waiting = report.updates
+        if waiting:
+            server.logger.info(tr("download.starting", count=len(waiting)))
 
         options = DownloadOptions(
             folder=folder,
             max_bytes=max(1, int(config.download_max_size_mb)) * 1024 * 1024,
         )
         http = _make_http_client(config)
-        outcomes = Downloader(http, options, logger=server.logger).run(report.entries)
+        outcomes = Downloader(http, options, logger=server.logger, ledger=ledger).run(
+            report.entries
+        )
+        # Anything that just arrived is no longer an update to fetch; it is ready to install.
+        classify_downloaded(report.entries, folder, ledger)
         _log_download_outcomes(server, report, outcomes, folder)
     except Exception as error:  # noqa: BLE001 - see the docstring
         server.logger.warning(tr("download.crashed", error="{}: {}".format(
@@ -617,15 +657,36 @@ def _reply_lines(source: CommandSource, lines) -> None:
 
 
 def _notification_lines(report: Report) -> List[str]:
-    """The body of an in-game notification, in both the broadcast and the on-join case."""
-    if not report.has_updates:
-        return [tr("report.no_updates")]
-    lines = [tr("check.in_game_header", count=len(report.updates))]
-    for entry in report.updates[:NOTIFY_MAX_UPDATES]:
-        lines.append(tr("line.update", name=entry.name, local=entry.local_version or "?",
-                        latest=entry.latest_version or "?"))
-    if len(report.updates) > NOTIFY_MAX_UPDATES:
-        lines.append(tr("report.and_more", count=len(report.updates) - NOTIFY_MAX_UPDATES))
+    """The body of an in-game notification.
+
+    Two sections, because the two situations ask for different things and merging them would
+    make the more urgent one invisible: "these need fetching" and "these are fetched, install
+    them". A mod appears in exactly one of them, which is what stops an update being announced
+    again after it has already been downloaded.
+    """
+    lines: List[str] = []
+
+    updates = report.updates
+    if updates:
+        lines.append(tr("check.in_game_header", count=len(updates)))
+        for entry in updates[:NOTIFY_MAX_UPDATES]:
+            lines.append(tr("line.update", name=entry.name, local=entry.local_version or "?",
+                            latest=entry.latest_version or "?"))
+        if len(updates) > NOTIFY_MAX_UPDATES:
+            lines.append(tr("report.and_more", count=len(updates) - NOTIFY_MAX_UPDATES))
+
+    pending = report.awaiting_install
+    if pending:
+        lines.append(tr("check.in_game_awaiting", count=len(pending)))
+        for entry in pending[:NOTIFY_MAX_UPDATES]:
+            lines.append(tr("line.awaiting_install", name=entry.name,
+                            latest=entry.latest_version or "?"))
+        if len(pending) > NOTIFY_MAX_UPDATES:
+            lines.append(tr("report.and_more", count=len(pending) - NOTIFY_MAX_UPDATES))
+        lines.append(tr("check.in_game_awaiting_where"))
+
+    if not lines:
+        lines.append(tr("report.no_updates"))
     return lines
 
 

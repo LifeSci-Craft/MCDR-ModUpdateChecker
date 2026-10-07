@@ -23,6 +23,7 @@ import pytest
 from mod_update_checker.checker import CheckOptions, Checker, ResolveCache, normalise_name
 from mod_update_checker.i18n import make_translator
 from mod_update_checker.report import (
+    STATUS_AWAITING_INSTALL,
     STATUS_ERROR,
     STATUS_IGNORED,
     STATUS_LOCAL_AHEAD,
@@ -32,6 +33,7 @@ from mod_update_checker.report import (
     STATUS_UP_TO_DATE,
     STATUS_UPDATE_AVAILABLE,
     Report,
+    UpdateEntry,
     render_full,
     render_summary,
 )
@@ -798,6 +800,81 @@ def test_summary_says_so_when_there_is_nothing_to_do(tmp_path, upstream):
     summary = render_summary(report, make_translator("en_us"))
     assert any("No updates found" in line for line in summary)
     assert report.has_updates is False
+
+
+@pytest.mark.parametrize("language", ["en_us", "zh_cn"])
+def test_the_summary_separates_not_downloaded_from_waiting_to_install(language):
+    """Two groups, and a mod is in one or the other — never both, never neither.
+
+    The distinction is the whole point: the first group needs fetching, the second needs
+    copying into ``mods/``. Merged into a single "has an update" list, an admin re-reads mods
+    they fetched yesterday and cannot tell whether the download worked.
+    """
+    tr = make_translator(language)
+    report = Report(
+        generated_at="2026-01-01T00:00:00+00:00",
+        server=SERVER,
+        mods_directory="server/mods",
+        download_folder="config/mod_update_checker/downloads",
+        entries=[
+            UpdateEntry(mod_id="alpha", name="Alpha", file_name="alpha.jar",
+                        local_version="1.0.0", latest_version="1.1.0",
+                        status=STATUS_UPDATE_AVAILABLE),
+            UpdateEntry(mod_id="beta", name="Beta", file_name="beta.jar",
+                        local_version="1.0.0", latest_version="1.1.0",
+                        status=STATUS_AWAITING_INSTALL),
+            UpdateEntry(mod_id="gamma", name="Gamma", file_name="gamma.jar",
+                        local_version="2.0.0", status=STATUS_UP_TO_DATE),
+        ],
+    )
+
+    summary = render_summary(report, tr)
+    body = "\n".join(summary)
+
+    assert "Alpha" in body, "the mod still needing a download is listed"
+    assert "Beta" in body, "the fetched mod is listed too"
+    assert "downloads" in body, "the folder is named, or 'ready to install' is a dead end"
+
+    # Each mod appears once, under its own heading.
+    assert body.count("Beta") == 1
+    assert body.count("Alpha") == 1
+
+    # Ordering: the mod that still needs fetching comes before the one that is ready.
+    assert body.index("Alpha") < body.index("Beta")
+
+    # The tally accounts for both, so the numbers add up to the number of jars.
+    tally = next(line for line in summary if "1.1.0" not in line and "jar" in line.lower()
+                 and "Alpha" not in line and "Beta" not in line)
+    assert "1" in tally
+
+    # And the two are different statuses in the machine-readable report.
+    counts = report.counts()
+    assert counts[STATUS_UPDATE_AVAILABLE] == 1
+    assert counts[STATUS_AWAITING_INSTALL] == 1
+    assert report.actionable_count == 2
+
+
+def test_a_report_with_only_a_pending_install_is_still_worth_reporting(tmp_path, upstream):
+    """No new updates, but the admin has an outstanding step — that is not "nothing to do"."""
+    tr = make_translator("en_us")
+    report = Report(
+        generated_at="2026-01-01T00:00:00+00:00",
+        server=SERVER,
+        mods_directory="server/mods",
+        entries=[
+            UpdateEntry(mod_id="beta", name="Beta", file_name="beta.jar",
+                        local_version="1.0.0", latest_version="1.1.0",
+                        status=STATUS_AWAITING_INSTALL),
+        ],
+    )
+
+    summary = "\n".join(render_summary(report, tr))
+    assert "Beta" in summary
+    assert "No updates found" not in summary, (
+        "a pending install is not the same as nothing to do"
+    )
+    assert report.has_updates is True
+    assert report.actionable_count == 1
 
 
 # --------------------------------------------------------------------------------------
