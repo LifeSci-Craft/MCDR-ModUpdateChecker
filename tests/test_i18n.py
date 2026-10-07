@@ -33,9 +33,13 @@ MATCHED_BY_VALUES = ("hash", "fingerprint", "name")
 #: ``"command.help.list"``. Keys are matched by their leading family so that unrelated dotted
 #: strings (``"fabric.mod.json"``, ``"example.invalid"``) are not swept in; the dot-suffix is
 #: allowed to repeat, since three-segment keys are the norm for subcommands.
+#:
+#: A new key family has to be added here as well as to the catalogue, or its entries look
+#: stale and ``test_no_catalogue_entry_is_stale`` fails — which is the intended behaviour: the
+#: list is a deliberate allow-list of the dotted prefixes that mean something to this plugin.
 _KEY_IN_CODE = re.compile(
     r'"('
-    r'(?:line|note|advisory|report|command|console|check|help|language)'
+    r'(?:line|note|advisory|report|command|console|check|help|language|download)'
     r'\.[a-z_0-9]+(?:\.[a-z_0-9]+)*'
     r')"'
 )

@@ -205,6 +205,21 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_bytes(self, status: int, body: bytes, content_type: str = "application/java-archive",
+                    content_length: bool = True) -> None:
+        """Raw bytes, for the file-download route. Not JSON, so not ``_send``.
+
+        ``content_length=False`` omits the header, which is what a streaming proxy does. The
+        client then has no declared size to pre-check against and must bound the transfer from
+        the bytes themselves — the case the mid-stream limit exists for.
+        """
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        if content_length:
+            self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _record(self, method: str, path: str, body: Any) -> None:
         with self.upstream.lock:
             self.upstream.requests.append((method, path, body))
@@ -280,6 +295,22 @@ class _Handler(BaseHTTPRequestHandler):
             self.wfile.write(payload)
             return
 
+        if path.startswith("/cdn/"):
+            # The file-download route. Real bytes, so the auto-download feature can be tested
+            # end to end against something that actually hashes to what the API declared.
+            name = path[len("/cdn/"):]
+            blob = self.upstream.cdn_files.get(name)
+            if blob is None:
+                self._send(404, {"detail": "no such file"})
+                return
+            if name in self.upstream.fail_downloads:
+                # Bytes that do not match the declared hash, to prove the downloader verifies.
+                blob = blob + b"tampered"
+            self._send_bytes(
+                200, blob, content_length=name not in self.upstream.no_content_length
+            )
+            return
+
         handler = self.upstream.route(
             method, path, query, body, dict(self.headers.items())
         )
@@ -310,6 +341,13 @@ class FakeUpstream:
         #: Statuses to return for the next requests, in order, before normal routing.
         #: ``None`` in the list means "let this one through", for targeting a later request.
         self.scripted_responses: List[Optional[int]] = []
+        #: Bytes served for ``GET /cdn/<name>`` — the download route.
+        self.cdn_files: Dict[str, bytes] = {}
+        #: Names in here are served with an extra byte appended, so the body no longer matches
+        #: the hash the API declared. Used to prove the downloader actually verifies.
+        self.fail_downloads: set = set()
+        #: Names in here are served without a ``Content-Length``, like a streaming proxy.
+        self.no_content_length: set = set()
         self.lock = threading.Lock()
         self._server: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
@@ -364,6 +402,15 @@ class FakeUpstream:
     def add_cf_mod(self, mod: FakeCfMod) -> FakeCfMod:
         self.cf_mods[mod.id] = mod
         return mod
+
+    def file_url(self, name: str) -> str:
+        """The URL a declared ``FakeFile`` should point at to be downloadable."""
+        return "{}/cdn/{}".format(self.base, name)
+
+    def serve_file(self, name: str, data: bytes) -> str:
+        """Publish bytes on the download route and return the URL for them."""
+        self.cdn_files[name] = data
+        return self.file_url(name)
 
     def request_paths(self) -> List[str]:
         with self.lock:

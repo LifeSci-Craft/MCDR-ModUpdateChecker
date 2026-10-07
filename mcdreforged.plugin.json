@@ -1,6 +1,6 @@
 {
   "id": "mod_update_checker",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "name": "Mod Update Checker",
   "description": {
     "en_us": "Compare every jar in the server's mods folder against Modrinth and CurseForge, and tell the admin which ones have a newer build. Fabric has no native way to notice an outdated mod; this does.",

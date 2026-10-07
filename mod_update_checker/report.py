@@ -97,6 +97,13 @@ class UpdateEntry:
     matched_by: str = ""
     project_url: str = ""
     download_url: str = ""
+    #: Identity of the file behind ``download_url``, as the platform published it. Carried
+    #: through the report rather than re-fetched later, because the auto-download feature has
+    #: to verify what it fetched against a hash decided by the same lookup that chose the file.
+    download_filename: str = ""
+    download_sha1: str = ""
+    download_sha512: str = ""
+    download_size: int = 0
     released_at: str = ""
     release_channel: str = ""
     #: ``(translation key, format args)`` pairs, rendered only when the report is printed.

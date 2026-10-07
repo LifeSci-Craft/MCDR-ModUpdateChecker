@@ -31,8 +31,19 @@ from mcdreforged.api.all import (
 )
 
 from . import i18n
-from .checker import CheckOptions, Checker
+from .checker import USER_AGENT, CheckOptions, Checker
+from .downloads import (
+    STATUS_ALREADY_PRESENT,
+    STATUS_DOWNLOADED,
+    STATUS_FAILED,
+    STATUS_SKIPPED,
+    DownloadOptions,
+    DownloadOutcome,
+    Downloader,
+    resolve_folder as resolve_download_folder_path,
+)
 from .report import ALL_STATUSES, Report, render_entry_line, render_full, render_summary
+from .upstream import HttpClient
 from .scanner import (
     ScanResult,
     iter_mod_jars,
@@ -53,6 +64,10 @@ ROOT_LITERALS = ("!!modupdate", "!!muc")
 #: mods does not dump 150 lines into the chat every restart. The full list is one command
 #: away.
 NOTIFY_MAX_UPDATES = 15
+#: How many download outcomes to print individually before summarising the rest. The download
+#: folder is for a human to look at, so the lines are worth printing — but not two hundred
+#: of them on a big modpack.
+DOWNLOAD_LOG_LIMIT = 20
 
 
 class Config(Serializable):
@@ -103,6 +118,21 @@ class Config(Serializable):
 
     write_report_file: bool = True
     """把每次检查的结果写成 JSON / 文本文件，便于外部脚本或事后排查。"""
+
+    download_updates: bool = False
+    """发现更新时，自动把新版本从 Modrinth 下载到插件数据文件夹的子文件夹里。默认关闭。
+
+    只是**下载**，不会装进 ``mods/``——把没看过的 jar 直接塞进运行中的服务端，正是本插件
+    想避免的事。下载下来的文件由你自行检查后手动替换。"""
+
+    download_folder_name: str = "downloads"
+    """下载到哪个子文件夹。这里填的是**单个文件夹名，不是路径**（如 ``downloads``）。
+
+    刻意不允许填路径：这样无论如何配置都不可能写到插件数据文件夹之外，也就不可能被配置成
+    直接写进 ``server/mods``。"""
+
+    download_max_size_mb: int = 128
+    """单个文件的大小上限（MB）。超过就跳过并说明原因。"""
 
     include_beta: bool = False
     """是否把 beta 版本也算作「可用更新」。默认只认正式版。"""
@@ -331,11 +361,17 @@ def _run_check(
         report = checker.run(scan, context, cache_path=cache_path)
         _last_report = report
 
-        if config.write_report_file:
-            _write_report_files(server, report)
-
         _notify(server, report, source=source, announce_clean=announce_clean,
                 broadcast=broadcast)
+
+        # After the report, not before: a fetch can take a while, and the admin should not
+        # have to wait for it to see what was found. Its outcome is logged as its own block,
+        # and the report files are written afterwards so they carry the download notes too.
+        if config.download_updates:
+            _download_updated_mods(server, report, config)
+
+        if config.write_report_file:
+            _write_report_files(server, report)
         return report
     except Exception as error:  # noqa: BLE001 - a check must never take the server down
         server.logger.exception("mod update check failed")
@@ -395,6 +431,165 @@ def _notify(
 
     if broadcast and _config.notify_in_game and report.has_updates:
         _notify_in_game(server, report)
+
+
+def _download_updated_mods(
+    server: PluginServerInterface, report: Report, config: Config
+) -> None:
+    """Fetch the newer builds, if the admin asked for that.
+
+    Runs inside the check, on the check's own thread, and after the report has been announced.
+    That order matters: the admin sees the findings immediately instead of waiting for a few
+    hundred megabytes to arrive, and the download progress then shows up as its own log lines
+    rather than being folded into the report they already read.
+
+    Wholly self-contained. The check has already succeeded by the time this runs, so nothing in
+    here — a misconfigured folder, an unreachable host, a full disk, a bug in the summary
+    formatting — may turn a successful check into a reported failure.
+    """
+    http: Optional[HttpClient] = None
+    try:
+        folder, reason = resolve_download_folder(server, config)
+        if folder is None:
+            server.logger.warning(
+                tr("download.bad_folder", name=config.download_folder_name, reason=reason)
+            )
+            return
+
+        options = DownloadOptions(
+            folder=folder,
+            max_bytes=max(1, int(config.download_max_size_mb)) * 1024 * 1024,
+        )
+        http = _make_http_client(config)
+        outcomes = Downloader(http, options, logger=server.logger).run(report.entries)
+        _log_download_outcomes(server, report, outcomes, folder)
+    except Exception as error:  # noqa: BLE001 - see the docstring
+        server.logger.warning(tr("download.crashed", error="{}: {}".format(
+            type(error).__name__, error)))
+    finally:
+        if http is not None:
+            http.close()
+
+
+def resolve_download_folder(
+    server: PluginServerInterface, config: Config
+) -> Tuple[Optional[Path], str]:
+    """Where the downloads go, or ``None`` plus a reason.
+
+    The folder is always a single named subfolder of the plugin's own data folder — never a
+    path, and never inside the server directory. That is a deliberate constraint rather than a
+    limitation: it makes it impossible to configure this plugin into writing jars straight into
+    ``server/mods``, which would load code nobody has reviewed.
+    """
+    try:
+        base = Path(server.get_data_folder())
+    except Exception as error:  # noqa: BLE001 - an unusable data folder is worth reporting
+        return None, "no-data-folder: {}".format(error)
+    return resolve_download_folder_path(base, config.download_folder_name)
+
+
+def _make_http_client(config: Config) -> HttpClient:
+    """A client for the download host, mirroring the checker's settings.
+
+    Its own client, not the checker's, for two reasons: the checker closes its session when it
+    finishes, and the two want different tuning. A JSON call should give up in seconds; a
+    multi-megabyte transfer over a slow link should not be cut off at the same timeout.
+    ``retries=0`` because :meth:`HttpClient.download` does not retry mid-stream — a partial
+    transfer is discarded and the next check tries again.
+    """
+    return HttpClient(
+        user_agent=USER_AGENT,
+        timeout=max(30.0, float(config.http_timeout_seconds)),
+        retries=0,
+        logger=None,
+    )
+
+
+def _log_download_outcomes(
+    server: PluginServerInterface,
+    report: Report,
+    outcomes: Sequence[DownloadOutcome],
+    folder: Path,
+) -> None:
+    """Say what landed, what was already there, and what did not work — and why."""
+    if not outcomes:
+        return
+
+    counts = {status: 0 for status in (STATUS_DOWNLOADED, STATUS_ALREADY_PRESENT,
+                                      STATUS_SKIPPED, STATUS_FAILED)}
+    by_file: Dict[str, DownloadOutcome] = {}
+    for outcome in outcomes:
+        counts[outcome.status] = counts.get(outcome.status, 0) + 1
+        by_file[outcome.file_name] = outcome
+
+    server.logger.info(
+        tr(
+            "download.summary",
+            downloaded=counts[STATUS_DOWNLOADED],
+            existing=counts[STATUS_ALREADY_PRESENT],
+            failed=counts[STATUS_FAILED],
+            skipped=counts[STATUS_SKIPPED],
+            folder=str(folder),
+        )
+    )
+
+    shown = 0
+    for outcome in outcomes:
+        if outcome.status == STATUS_SKIPPED:
+            continue
+        if shown >= DOWNLOAD_LOG_LIMIT:
+            server.logger.info(
+                tr("download.and_more", count=len(outcomes) - shown)
+            )
+            break
+        shown += 1
+        if outcome.status == STATUS_DOWNLOADED:
+            server.logger.info(
+                tr("download.line_done", name=outcome.name, size=_format_size(outcome.bytes_written),
+                   path=outcome.path)
+            )
+        elif outcome.status == STATUS_ALREADY_PRESENT:
+            server.logger.info(tr("download.line_existing", name=outcome.name, path=outcome.path))
+        else:
+            server.logger.warning(
+                tr("download.line_failed", name=outcome.name, reason=outcome.detail)
+            )
+
+    # Skips are summarised rather than listed one by one: on a server where most mods are only
+    # on CurseForge, the list would otherwise be the bulk of the output.
+    skipped_reasons = sorted({outcome.detail for outcome in outcomes
+                              if outcome.status == STATUS_SKIPPED})
+    if skipped_reasons:
+        server.logger.info(tr("download.skipped_reasons", reasons=", ".join(skipped_reasons)))
+
+    for outcome in outcomes:
+        entry = _entry_for(report, outcome.file_name)
+        if entry is None:
+            continue
+        if outcome.status == STATUS_DOWNLOADED:
+            entry.add_note("note.downloaded", path=outcome.path)
+        elif outcome.status == STATUS_ALREADY_PRESENT:
+            entry.add_note("note.download_already_present", path=outcome.path)
+        elif outcome.status == STATUS_FAILED:
+            entry.add_note("note.download_failed", reason=outcome.detail)
+        else:
+            entry.add_note("note.download_skipped", reason=outcome.detail)
+
+
+def _entry_for(report: Report, file_name: str):
+    for entry in report.entries:
+        if entry.file_name == file_name:
+            return entry
+    return None
+
+
+def _format_size(count: int) -> str:
+    """Bytes as something a human reads at a glance."""
+    if count >= 1024 * 1024:
+        return "{:.1f} MB".format(count / (1024.0 * 1024.0))
+    if count >= 1024:
+        return "{:.0f} KB".format(count / 1024.0)
+    return "{} B".format(count)
 
 
 def _coloured_line(line: str) -> RText:

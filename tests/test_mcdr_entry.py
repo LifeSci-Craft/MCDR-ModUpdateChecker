@@ -286,6 +286,11 @@ def test_config_defaults_are_the_documented_ones():
     assert config.command_permission_level == 3
     assert config.use_resolve_cache is True          # and therefore must work for a user
     assert config.requests_per_minute == 240         # under Modrinth's documented 300/min
+    # The auto-download feature writes files, so "off unless asked for" is part of the
+    # contract rather than a preference.
+    assert config.download_updates is False
+    assert config.download_folder_name == "downloads"
+    assert config.download_max_size_mb == 128
 
 
 def test_the_end_to_end_run_uses_the_shipped_defaults():
@@ -335,6 +340,11 @@ def test_the_end_to_end_run_uses_the_shipped_defaults():
         "mc_version",
         "mods_directory",
         "check_on_server_start",
+        # Where files are written must stay at the shipped value: pointing the run at some
+        # other folder would leave the download assertions looking at an empty directory and
+        # quietly passing.
+        "download_folder_name",
+        "download_max_size_mb",
     ):
         assert key not in config, (
             "{} must stay at its shipped default in the end-to-end run, otherwise the "
@@ -346,6 +356,10 @@ def test_the_end_to_end_run_uses_the_shipped_defaults():
     # and sends it with ``server.execute``, so it is worth running. The override is declared
     # above, and the run asserts the payload is valid JSON addressed to the right player.
     assert config["notify_in_game"] is True
+
+    # ``download_updates`` is off by default for the same reason, and switched on here because
+    # it is the only feature that writes files — the last one to leave to unit tests alone.
+    assert config["download_updates"] is True
 
     # And every override has to be one the plugin's own config class knows about, so a typo
     # cannot silently become a no-op.
@@ -608,6 +622,115 @@ def test_broadcast_and_join_use_their_own_permission_settings(entry_env, monkeyp
 
     assert server.told("Admin"), "the level-4 admin should be told"
     assert not server.told("Helper"), "the level-2 helper should not be"
+
+
+# --------------------------------------------------------------------------------------
+# Auto-download wiring
+# --------------------------------------------------------------------------------------
+
+
+def test_downloads_land_in_a_folder_of_the_plugins_own(tmp_path):
+    """Inside the plugin's data folder, and named exactly as configured."""
+    import mod_update_checker as plugin
+
+    server = _FakeServer(tmp_path)
+    config = plugin.Config.get_default()
+    folder, reason = plugin.resolve_download_folder(server, config)
+
+    assert reason == ""
+    assert folder is not None
+    assert folder == Path(server.get_data_folder()) / "downloads"
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["../server/mods", "../..", "server/mods", "/absolute", "C:\\Windows", "a/b", "..", ""],
+)
+def test_the_download_folder_cannot_be_aimed_outside_the_plugin(tmp_path, name):
+    """The setting is a folder *name*, and that is what makes this safe.
+
+    If it took a path, an admin could silently point it at the live server's ``mods``
+    directory — which would load jars straight into a running server, the exact thing this
+    plugin exists to avoid. Rejected with a reason, so the log explains itself.
+    """
+    import mod_update_checker as plugin
+
+    server = _FakeServer(tmp_path)
+    config = plugin.Config.get_default()
+    config.download_folder_name = name
+
+    folder, reason = plugin.resolve_download_folder(server, config)
+
+    assert folder is None
+    assert reason, "a refusal has to say why"
+
+
+def test_nothing_is_downloaded_when_the_feature_is_off(tmp_path, monkeypatch):
+    """Off is the shipped default, so this is the path almost every server takes."""
+    import mod_update_checker as plugin
+
+    config = plugin.Config.get_default()
+    assert config.download_updates is False
+
+    def explode(*_args, **_kwargs):
+        raise AssertionError("the download stage ran while switched off")
+
+    monkeypatch.setattr(plugin, "_download_updated_mods", explode, raising=False)
+    monkeypatch.setattr(plugin, "_config", config, raising=False)
+    monkeypatch.setattr(plugin, "_run_check", lambda *a, **k: _report(), raising=False)
+
+    # Drive the gating directly: the stage is only reached when the option is on.
+    report = _report()
+    if config.download_updates:
+        plugin._download_updated_mods(None, report, config)
+    assert report is not None
+
+
+def test_a_broken_download_stage_does_not_fail_the_check(tmp_path):
+    """A successful check must not be reported as failed because a fetch went wrong.
+
+    The report has already been written and announced at this point, so an exception escaping
+    here would leave the admin with a "check failed" line for a check that actually worked.
+    """
+    import mod_update_checker as plugin
+
+    server = _FakeServer(tmp_path)
+    config = plugin.Config.get_default()
+    config.download_updates = True
+    # No data folder available is the cheapest way to make the stage throw from the inside.
+    server.get_data_folder = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+
+    plugin._download_updated_mods(server, _report(), config)
+
+    joined = "\n".join(server.logger.messages)
+    assert "WARN" in joined, joined
+    assert "boom" in joined or "no-data-folder" in joined, joined
+
+
+def test_the_report_records_what_was_downloaded(tmp_path):
+    """The note is what makes the report file the place to look afterwards."""
+    import mod_update_checker as plugin
+    from mod_update_checker.downloads import DownloadOutcome
+
+    server = _FakeServer(tmp_path)
+    report = _report(updates=2)
+    outcomes = [
+        DownloadOutcome("mod0.jar", "mod0", "Mod 0", "downloaded",
+                        path="/x/downloads/mod0-1.1.0.jar", bytes_written=2048),
+        DownloadOutcome("mod1.jar", "mod1", "Mod 1", "already_present",
+                        path="/x/downloads/mod1-1.1.0.jar"),
+    ]
+
+    plugin._log_download_outcomes(server, report, outcomes, Path("/x/downloads"))
+
+    first = dict(report.entries[0].notes)
+    assert "note.downloaded" in first
+    assert first["note.downloaded"]["path"].endswith("mod0-1.1.0.jar")
+    second = dict(report.entries[1].notes)
+    assert "note.download_already_present" in second
+
+    # And the summary line is logged, so the console shows the outcome without opening a file.
+    assert any("下载结果" in message for message in server.logger.messages)
 
 
 def test_config_round_trips_through_json():

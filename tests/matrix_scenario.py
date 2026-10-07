@@ -44,19 +44,50 @@ def build_scenario_jars(upstream: FakeUpstream, workdir: Path) -> List[Path]:
         jars.append(path)
         return path
 
+    def published(file_name: str, **metadata) -> dict:
+        """Build the *new* build's bytes, publish them, and describe the file.
+
+        The auto-download feature is only worth testing against bytes that really hash to what
+        the API declared — anything else would prove that the downloader accepts files it
+        should not. So the jar is built for real and its true digests are declared.
+        """
+        path = write_jar(directory / "published" / file_name,
+                         fabric=fabric_metadata(**metadata))
+        blob = path.read_bytes()
+        upstream.serve_file(file_name, blob)
+        return {
+            "sha1": hashlib.sha1(blob).hexdigest(),
+            "sha512": hashlib.sha512(blob).hexdigest(),
+            "size": len(blob),
+            "filename": file_name,
+            "url": upstream.file_url(file_name),
+        }
+
     def version(project_id, version_id, number, sha1, date, filename,
-                game_versions=(GAME_VERSION,)) -> FakeVersion:
+                game_versions=(GAME_VERSION,), **file_kwargs) -> FakeVersion:
+        if "url" not in file_kwargs:
+            # Point at the download route whenever those bytes have actually been published,
+            # so the auto-download path is exercised against a real transfer instead of a
+            # placeholder host that would only ever fail.
+            file_kwargs["url"] = (
+                upstream.file_url(filename)
+                if filename in upstream.cdn_files
+                else "https://cdn.example/" + filename
+            )
         return FakeVersion(
             id=version_id,
             project_id=project_id,
             version_number=number,
             game_versions=game_versions,
             date_published=date,
-            files=[FakeFile(sha1=sha1, filename=filename, url="https://cdn.example/" + filename)],
+            files=[FakeFile(sha1=sha1, filename=filename, **file_kwargs)],
         )
 
-    # 1. Has a newer build waiting.
+    # 1. Has a newer build waiting — and it is really downloadable, so the auto-download path
+    #    has something genuine to verify rather than a placeholder hash.
     outdated = add("outdated.jar", id="outdated", version="1.0.0", name="Outdated Mod")
+    new_outdated = published("outdated-1.1.0.jar", id="outdated", version="1.1.0",
+                            name="Outdated Mod")
     upstream.add_project(
         FakeProject(
             id="proj-outdated",
@@ -65,8 +96,9 @@ def build_scenario_jars(upstream: FakeUpstream, workdir: Path) -> List[Path]:
             versions=[
                 version("proj-outdated", "o-1", "1.0.0", sha1_of(outdated),
                         "2026-01-01T00:00:00Z", "outdated-1.0.0.jar"),
-                version("proj-outdated", "o-2", "1.1.0", "1" * 40,
-                        "2026-02-01T00:00:00Z", "outdated-1.1.0.jar"),
+                version("proj-outdated", "o-2", "1.1.0", new_outdated["sha1"],
+                        "2026-02-01T00:00:00Z", new_outdated["filename"],
+                        sha512=new_outdated["sha512"], size=new_outdated["size"]),
             ],
         )
     )
@@ -138,5 +170,26 @@ def build_scenario_jars(upstream: FakeUpstream, workdir: Path) -> List[Path]:
     library = directory / "library.jar"
     write_jar(library, fabric=None)
     jars.append(library)
+
+    # 6. Its download is served with the wrong bytes, so the declared hash does not match what
+    #    arrives. The downloader must refuse it and leave nothing behind — a jar that was
+    #    silently written despite failing verification is the one outcome worse than no file.
+    tampered = add("tampered.jar", id="tampered", version="1.0.0", name="Tampered Mod")
+    clean = published("tampered-1.1.0.jar", id="tampered", version="1.1.0", name="Tampered Mod")
+    upstream.fail_downloads.add(clean["filename"])
+    upstream.add_project(
+        FakeProject(
+            id="proj-tampered",
+            slug="tampered",
+            title="Tampered Mod",
+            versions=[
+                version("proj-tampered", "t-1", "1.0.0", sha1_of(tampered),
+                        "2026-01-01T00:00:00Z", "tampered-1.0.0.jar"),
+                version("proj-tampered", "t-2", "1.1.0", clean["sha1"],
+                        "2026-02-01T00:00:00Z", clean["filename"],
+                        sha512=clean["sha512"], size=clean["size"]),
+            ],
+        )
+    )
 
     return jars

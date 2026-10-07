@@ -272,6 +272,73 @@ class HttpClient:
             "POST", url, json_body=json_body, headers=headers, allow_404=allow_404
         )
 
+    def download(
+        self,
+        url: str,
+        write: Callable[[bytes], Any],
+        max_bytes: int,
+        chunk_size: int = 65536,
+    ) -> int:
+        """Stream ``url`` into ``write`` (a callable taking bytes). Returns the byte count.
+
+        Two deliberate differences from :meth:`_request`:
+
+        * **No retry.** Once the first chunk has been handed to ``write`` a retry cannot be
+          done correctly without asking the sink to rewind, and having this method own the
+          file instead would push file policy into an HTTP class. Retrying is also unnecessary
+          here: the caller verifies a hash and discards anything incomplete, and this is the
+          one operation that already repeats on a schedule.
+        * **The caller's size limit is enforced on the bytes that actually arrive**, not only
+          against the size the API declared. The declared size is upstream data; the point of
+          the limit is to bound what a hostile or broken response can do to the disk.
+        """
+        limit = max(0, int(max_bytes))
+        try:
+            response = self._session.get(url, stream=True, timeout=self.timeout)
+        except requests.RequestException as error:
+            raise UpstreamError(
+                "{}: {}".format(type(error).__name__, error), url=url
+            ) from error
+
+        with response:
+            status = response.status_code
+            if status == 404:
+                raise NotFound("file not found", status=status, url=url)
+            if status in (401, 403):
+                raise Unauthorised("not authorised to download", status=status, url=url)
+            if status >= 400:
+                raise UpstreamError("download failed", status=status, url=url)
+            # A cheap pre-flight when the server declares a length, so an oversized body is
+            # rejected before a single byte lands on disk.
+            declared = response.headers.get("Content-Length")
+            if declared and declared.isdigit() and int(declared) > limit:
+                raise UpstreamError(
+                    "the file is {} bytes, over the {} byte limit".format(declared, limit),
+                    status=status,
+                    url=url,
+                )
+
+            total = 0
+            try:
+                for chunk in response.iter_content(chunk_size=chunk_size):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > limit:
+                        raise UpstreamError(
+                            "the download passed the {} byte limit".format(limit),
+                            status=status,
+                            url=url,
+                        )
+                    write(chunk)
+            except requests.RequestException as error:
+                raise UpstreamError(
+                    "{}: {}".format(type(error).__name__, error),
+                    status=status,
+                    url=url,
+                ) from error
+            return total
+
     def close(self) -> None:
         try:
             self._session.close()

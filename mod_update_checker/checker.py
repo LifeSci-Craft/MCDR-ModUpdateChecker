@@ -494,9 +494,7 @@ class Checker:
         entry.latest_version = latest.version_number
         entry.release_channel = latest.version_type
         entry.released_at = latest.date_published
-        primary = latest.primary_file
-        if primary is not None:
-            entry.download_url = primary.url
+        _record_download(entry, latest)
 
         if local_version.id == latest.id or (
             mod.sha1 and mod.sha1 in latest.hashes()
@@ -879,12 +877,11 @@ class Checker:
             for version in versions
             if not server.mc_version or server.mc_version in version.game_versions
         ]
-        entry.latest_version = (compatible or versions)[0].version_number
-        entry.released_at = (compatible or versions)[0].date_published
-        entry.release_channel = (compatible or versions)[0].version_type
-        primary = (compatible or versions)[0].primary_file
-        if primary is not None:
-            entry.download_url = primary.url
+        newest = (compatible or versions)[0]
+        entry.latest_version = newest.version_number
+        entry.released_at = newest.date_published
+        entry.release_channel = newest.version_type
+        _record_download(entry, newest)
 
         if not compatible and server.mc_version:
             entry.status = STATUS_NO_COMPATIBLE_BUILD
@@ -1031,6 +1028,24 @@ def _parse_timestamp(text: str) -> Optional[float]:
         return datetime.fromisoformat(cleaned).timestamp()
     except ValueError:
         return None
+
+
+def _record_download(entry: UpdateEntry, version: ModrinthVersion) -> None:
+    """Copy the newest build's file identity onto the entry.
+
+    All four fields are set together on purpose. The download feature verifies what it
+    fetched against the hash recorded here, so a path that set the URL but not the hash would
+    produce a download that could not be checked — and the safe response to an unverifiable
+    jar is to refuse it, which would look like a bug rather than a missing field.
+    """
+    primary = version.primary_file
+    if primary is None:
+        return
+    entry.download_url = primary.url
+    entry.download_filename = primary.filename
+    entry.download_sha1 = primary.sha1
+    entry.download_sha512 = primary.sha512
+    entry.download_size = primary.size
 
 
 def _mark_undetermined(entry: UpdateEntry, platform: str) -> None:

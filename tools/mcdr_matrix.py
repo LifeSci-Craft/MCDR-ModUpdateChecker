@@ -33,6 +33,7 @@ user would install rather than the source tree.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -289,6 +290,11 @@ CONFIG_OVERRIDES = (
     # running rather than trusting — the fake server echoes the command back and the run
     # asserts the payload is valid JSON.
     "notify_in_game",
+    # Off by default too. Turned on here because it is the only feature that writes files, and
+    # therefore the last one to leave to unit tests: this run proves against a real MCDR that
+    # a verified file lands, that a tampered one is refused, and that nothing is written
+    # outside the plugin's own folder.
+    "download_updates",
 )
 
 
@@ -302,6 +308,7 @@ def plugin_config(upstream) -> dict:
         "requests_per_minute": 0,
         "http_retries": 0,
         "notify_in_game": True,
+        "download_updates": True,
     }
     unexpected = set(config) - set(CONFIG_OVERRIDES)
     assert not unexpected, "override not declared in CONFIG_OVERRIDES: {}".format(unexpected)
@@ -411,6 +418,17 @@ def run_one(python: str, plugin: Path, workdir: Path, scenario_builder) -> dict:
         upstream.stop()
 
 
+def _sha1_of(path: Path) -> str:
+    digest = hashlib.sha1()
+    try:
+        with open(path, "rb") as handle:
+            for block in iter(lambda: handle.read(65536), b""):
+                digest.update(block)
+    except OSError:
+        return ""
+    return digest.hexdigest()
+
+
 def _collect_tellraw(console: str) -> tuple:
     """Every ``tellraw`` the plugin sent to the test player, as parsed payloads.
 
@@ -487,6 +505,25 @@ def summarise(console: str, root: Path, version: str, python: str) -> dict:
     tellraws, tellraw_wrapper, tellraw_errors = _collect_tellraw(console)
     joined = "\n".join(tellraws)
 
+    # What the auto-download stage actually put on disk. The expected hash is read back from
+    # the report, so this compares the file against the identity the *check* recorded rather
+    # than against a constant baked into the test.
+    downloads = plugin_folder / "downloads"
+    downloaded = sorted(p.name for p in downloads.iterdir()) if downloads.is_dir() else []
+    expected_files = {
+        entry.get("download_filename"): entry.get("download_sha1")
+        for entry in report.get("entries", [])
+        if entry.get("status") == "update_available" and entry.get("download_sha1")
+    }
+    verified = {}
+    for name, expected in expected_files.items():
+        path = downloads / name
+        verified[name] = path.is_file() and _sha1_of(path) == expected
+    # The scenario serves one file with bytes that do not match its declared hash. Nothing may
+    # be left behind for it, and a partial ``.part`` file counts as left behind.
+    tampered_names = [name for name in expected_files if "tampered" in name]
+    leftovers = sorted(p.name for p in downloads.iterdir() if p.suffix != ".jar")
+
     return {
         "mcdr": version,
         "python": python,
@@ -514,6 +551,23 @@ def summarise(console: str, root: Path, version: str, python: str) -> dict:
         "notify_payloads": tellraws,
         "notify_wrapper": tellraw_wrapper,
         "notify_errors": tellraw_errors,
+        "downloads_written": downloaded,
+        "downloads_verified": verified,
+        "downloads_leftovers": leftovers,
+        "downloads_tampered_refused": bool(tampered_names)
+        and all(name not in downloaded for name in tampered_names),
+        # The three checks the run is judged on, reduced from the details above.
+        "download_written": bool(downloaded),
+        # Only the files expected to succeed. The tampered one is *meant* to fail verification,
+        # and it is asserted on its own below — folding it in here would make this check
+        # impossible to satisfy and hide which of the two behaviours regressed.
+        "download_hash_verified": bool(verified)
+        and all(
+            ok for name, ok in verified.items() if name not in tampered_names
+        ),
+        "download_tampered_refused": bool(tampered_names)
+        and all(name not in downloaded for name in tampered_names),
+        "download_no_leftovers": not leftovers,
         "statuses": statuses,
         "command_summary": COMMAND_EXPECTATIONS["summary"] in console,
         "command_help": COMMAND_EXPECTATIONS["help"] in console,
@@ -541,6 +595,10 @@ CHECK_KEYS = [
     "notify_in_game_sent",
     "admin_join_notified",
     "notify_payloads_valid",
+    "download_written",
+    "download_hash_verified",
+    "download_tampered_refused",
+    "download_no_leftovers",
     "command_summary",
     "command_help",
     "command_status",
