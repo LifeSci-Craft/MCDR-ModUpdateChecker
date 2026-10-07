@@ -61,6 +61,16 @@ PACKAGE_DATA_DIRS = {
     "lang": (".json",),
 }
 
+#: Entries packed as text, and therefore normalised to LF.
+#:
+#: ``.py`` is not listed because ``packaged_source`` already rebuilds it line by line. The rest
+#: are copied as bytes, and their line endings in the working tree depend on the operating
+#: system and on whether anything rewrote them outside git's ``.gitattributes`` filter — which
+#: is how a Windows pack and a Linux pack of the same tag end up with different hashes, and how
+#: "rebuild it from the tag and compare" quietly stops working. Normalising here means the
+#: artifact depends on the source, not on the machine that packed it.
+TEXT_SUFFIXES = (".json", ".md")
+
 
 def _is_package_payload(rel: Path) -> bool:
     """True for files inside the plugin package that belong in the artifact."""
@@ -171,6 +181,18 @@ def packaged_source(path: Path) -> bytes:
     return stripped.encode("utf-8")
 
 
+def packaged_bytes(path: Path) -> bytes:
+    """The bytes to ship for one non-Python file, with line endings normalised.
+
+    See :data:`TEXT_SUFFIXES` for why the normalisation has to happen here rather than being
+    left to the working tree.
+    """
+    data = path.read_bytes()
+    if path.suffix in TEXT_SUFFIXES:
+        return data.replace(b"\r\n", b"\n")
+    return data
+
+
 def build(out_path: Path) -> Path:
     files = collect()
     if not files:
@@ -191,7 +213,7 @@ def build(out_path: Path) -> Path:
     with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
         for path in files:
             rel = path.relative_to(SRC).as_posix()
-            data = packaged_source(path) if path.suffix == ".py" else path.read_bytes()
+            data = packaged_source(path) if path.suffix == ".py" else packaged_bytes(path)
             # Hand-built ZipInfo rather than archive.write(): mtime, permission bits and
             # host system all have to be pinned, or the same source packs into different
             # bytes on a different day (or a different OS).

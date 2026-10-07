@@ -4,9 +4,10 @@
 Four separate things are checked, because each has a different way of going wrong quietly:
 
 * **Reproducibility.** The packer pins zip timestamps and permission bits so that packing the
-  same source twice yields byte-identical output. That is what lets anyone verify a release by
-  rebuilding it from the tag and comparing a hash — a claim worth testing rather than
-  believing, since a single stray ``mtime`` silently destroys it.
+  same source twice yields byte-identical output, and normalises every shipped text file to LF
+  so that the *same tag* packs identically on Windows and on Linux. Both are what lets anyone
+  verify a release by rebuilding it from the tag and comparing a hash — a claim worth testing
+  rather than believing, since a single stray ``mtime`` or a CRLF silently destroys it.
 * **Contents.** Only the plugin payload, the metadata, the licence and the changelog ship. A
   deny-list packer would eventually sweep in ``tests/`` or a stray ``conftest.py``, and MCDR
   refuses to load an archive with a root-level module — so the absence is asserted.
@@ -21,7 +22,7 @@ Four separate things are checked, because each has a different way of going wron
 Usage::
 
     python tools/check_artifact.py            # build twice into a temp dir and check
-    python tools/check_artifact.py path.mcdr  # check an existing artifact
+    python tools/check_artifact.py path.mcdr  # check an existing artifact (no rebuild)
 """
 
 import argparse
@@ -81,6 +82,42 @@ def check_reproducible(workdir: Path) -> Path:
     return first
 
 
+def check_line_endings_are_normalised(workdir: Path) -> None:
+    """Packing CRLF sources must produce the same bytes as packing LF ones.
+
+    The working tree's line endings depend on the operating system and on whether some tool
+    rewrote a file outside git's ``.gitattributes`` filter. If the artifact inherited them, the
+    same tag would hash differently on Windows and on Linux, and "rebuild it and compare the
+    sha256" would stop being a verification. So the shipped text files are rewritten to CRLF
+    here, packed again, and the two artifacts are required to be identical — then put back.
+
+    Asserted rather than described because it is not a hypothetical: the language catalogues
+    were written out with CRLF while fixing a message, and nothing else in this repository
+    would have noticed until a release had been published with an unreproducible signature.
+    """
+    baseline = sha256(pack.build(workdir / "lf.mcdr"))
+
+    targets = [path for path in pack.collect() if path.suffix in pack.TEXT_SUFFIXES]
+    assert targets, "no text files are shipped, so this check would pass vacuously"
+    saved = {path: path.read_bytes() for path in targets}
+    try:
+        for path in targets:
+            ending = saved[path].replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+            assert b"\r\n" in ending, str(path)
+            path.write_bytes(ending)
+        crlf_digest = sha256(pack.build(workdir / "crlf.mcdr"))
+    finally:
+        for path, data in saved.items():
+            path.write_bytes(data)
+
+    assert baseline == crlf_digest, (
+        "the artifact depends on the source's line endings:\n"
+        "  LF   {}\n  CRLF {}\n"
+        "packaged_bytes() is supposed to normalise them away.".format(baseline, crlf_digest)
+    )
+    print("line endings    : CRLF sources pack identically")
+
+
 def check_contents(archive_path: Path) -> None:
     """Only the payload ships, and only from inside the plugin package."""
     with zipfile.ZipFile(archive_path) as archive:
@@ -107,6 +144,16 @@ def check_contents(archive_path: Path) -> None:
         # its raw key.
         catalogues = [name for name in names if name.startswith("mod_update_checker/lang/")]
         assert catalogues, "no language catalogues in the archive"
+
+        # And no shipped text may carry a CRLF. The working tree's line endings depend on the
+        # operating system, so an artifact that inherited them would hash differently when
+        # rebuilt from the same tag on another machine — which is the one thing the
+        # reproducibility claim is for.
+        for name in names:
+            if not name.endswith((".json", ".md", ".py")):
+                continue
+            body = archive.read(name)
+            assert b"\r\n" not in body, "{} ships CRLF line endings".format(name)
 
         print("files           : {}".format(len(names)))
         for name in names:
@@ -192,6 +239,7 @@ def main() -> int:
         with tempfile.TemporaryDirectory(prefix="muc_artifact_") as folder:
             workdir = Path(folder)
             path = check_reproducible(workdir)
+            check_line_endings_are_normalised(workdir)
             check_contents(path)
             check_stripped(path)
             check_loadable(path)

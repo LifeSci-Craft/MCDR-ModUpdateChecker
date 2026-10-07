@@ -680,6 +680,61 @@ def test_the_ledger_is_kept_outside_the_download_folder(tmp_path):
 
 
 # --------------------------------------------------------------------------------------
+# Authorising one download for the next install
+#
+# ``!!muc install <编号>`` marks a single record. Two things have to hold, and neither is
+# obvious: an unrelated check must not drop the mark, and a mark must not survive onto bytes
+# nobody agreed to install.
+# --------------------------------------------------------------------------------------
+
+
+def test_an_approval_survives_a_check_that_records_the_same_file(tmp_path):
+    """Every check re-records what is on disk — including the one that re-observes this file.
+
+    Without this, ``!!muc install 3`` would be silently undone by the next automatic check,
+    and the admin would find out at the next stop, when nothing happened.
+    """
+    ledger = _ledger(tmp_path)
+    ledger.record("sodium", "sodium-1.1.0.jar", "a" * 40, "1.1.0", "then",
+                  installed_file="sodium.jar", name="Sodium")
+    assert ledger.approve("sodium") is True
+
+    ledger.record("sodium", "sodium-1.1.0.jar", "a" * 40, "1.1.0", "now",
+                  installed_file="sodium.jar", name="Sodium")
+
+    assert ledger.approved_keys() == ["sodium"]
+
+
+def test_an_approval_does_not_follow_the_file_it_was_given_for(tmp_path):
+    """A different build is bytes nobody agreed to, so the approval is dropped."""
+    ledger = _ledger(tmp_path)
+    ledger.record("sodium", "sodium-1.1.0.jar", "a" * 40, "1.1.0", "then")
+    ledger.approve("sodium")
+
+    ledger.record("sodium", "sodium-1.2.0.jar", "b" * 40, "1.2.0", "now")
+
+    assert ledger.approved_keys() == []
+    assert "approved" not in ledger.get("sodium"), "the mark was carried onto other bytes"
+
+
+def test_approving_a_record_that_does_not_exist_is_refused(tmp_path):
+    """Said rather than stored: a mark on nothing would install nothing, silently."""
+    ledger = _ledger(tmp_path)
+    assert ledger.approve("ghost") is False
+    assert ledger.approved_keys() == []
+
+
+def test_an_approval_is_written_to_disk_and_read_back(tmp_path):
+    """The install runs from the stop event, possibly after a reload, so it must persist."""
+    ledger = _ledger(tmp_path)
+    ledger.record("sodium", "sodium-1.1.0.jar", "a" * 40, "1.1.0", "now")
+    ledger.approve("sodium")
+    ledger.save()
+
+    assert _ledger(tmp_path).approved_keys() == ["sodium"]
+
+
+# --------------------------------------------------------------------------------------
 # Replacing a superseded download
 # --------------------------------------------------------------------------------------
 

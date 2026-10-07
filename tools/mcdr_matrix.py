@@ -46,6 +46,20 @@ from pathlib import Path
 from typing import Optional
 
 REPO = Path(__file__).resolve().parent.parent
+
+
+def plugin_badge() -> str:
+    """``[Mod Update Checker]`` — read from the plugin's own metadata.
+
+    Read rather than written down, because five separate assertions below look for it and a
+    rename that misses one of them fails the run in a way that reads like a real defect. That
+    is not hypothetical: this tool carried the old Chinese spelling after the plugin stopped
+    using it, and the failure looked like "the check never ran".
+    """
+    metadata = json.loads((REPO / "mcdreforged.plugin.json").read_text(encoding="utf-8"))
+    return "[{}]".format(metadata["name"])
+
+
 PLUGIN_ID = "mod_update_checker"
 ROOT_COMMANDS = ("!!modupdate", "!!muc")
 
@@ -132,6 +146,12 @@ write_server_output_to_log_file: false
 """
 
 #: Commands fed to MCDR's console once the automatic check has had time to finish, in order.
+#:
+#: The numbering is derived from the scenario, and the three numbers used here are the ones
+#: whose status is pinned by ``tests/test_e2e.py``: with the automatic check and download done,
+#: ``1`` is Tampered Mod (an update whose file never verifies), ``2`` is Flaky Mod (downloaded,
+#: waiting) and ``5`` is Blocked Mod (nothing published for this loader). A change to the
+#: scenario that moves them fails these assertions loudly, which is the point.
 COMMANDS = [
     "!!modupdate",
     "!!modupdate help",
@@ -142,13 +162,30 @@ COMMANDS = [
     "!!modupdate info 1",
     "!!modupdate reload",
     "!!muc help",
+    # --- the on-demand pair, staged and confirmed -------------------------------------
+    # 1 is an update whose bytes never match, so the confirm below really does open a socket
+    # and really is refused — and nothing lands in the download folder either way.
+    "!!muc download 1",
+    "!!muc confirm",
+    # Not downloaded: must point at ``download`` rather than stage anything.
+    "!!muc install 1",
+    "!!muc install 5",
+    # Staged and deliberately NOT confirmed in the default run: confirming it would authorise
+    # an install, which would move the file the download assertions above are looking at.
+    "!!muc install 2",
     "!!modupdate check",
 ]
+
+#: The extra step the install run takes: confirm the staged authorisation.
+#:
+#: Appended rather than part of ``COMMANDS`` because it changes what the stop replaces, and the
+#: two modes ask different questions about the download folder — see ``DOWNLOAD_KEYS``.
+MANUAL_INSTALL_COMMAND = "!!muc confirm"
 
 #: Substrings that must appear in the console for each command to count as answered. Chinese,
 #: because the MCDR instance is pinned to zh_cn and the plugin follows it.
 COMMAND_EXPECTATIONS = {
-    "summary": "Mod 更新检查",
+    "summary": plugin_badge(),
     "help": "!!modupdate list",
     # ASCII colon: the separator is part of the translated label, not hardcoded.
     "status_mc": "服务端: 26.3",
@@ -163,6 +200,16 @@ COMMAND_EXPECTATIONS = {
     # proving anything about the alias. Only the ``!!muc`` help says ``!!muc list``.
     "alias": "!!muc list",
     "check_started": "已在后台开始检查",
+    # The staged plan, and the sentence that asks for the confirmation. The timeout itself is
+    # left out of the assertion: it is a constant in the plugin, and pinning the number here
+    # would make changing it fail a run for no reason.
+    "download_staged": "内输入 !!muc confirm 确认",
+    # The confirm really fetched and really gave up: the served bytes never match their hash.
+    "download_refused": "失败",
+    "install_wants_download": "还没下载。请先输入 !!muc download 1",
+    "install_refused_status": "当前状态是「无适配构建」",
+    "install_staged": "即将安排安装",
+    "install_authorised": "已授权",
 }
 
 
@@ -351,7 +398,7 @@ def plugin_config(upstream, install: bool = False) -> dict:
 #: on an install that never announced itself.
 #: The marker both install messages carry, so the check does not depend on which of the two
 #: a given run happens to print.
-INSTALL_LOG_HEADER = "[Mod 更新检查] 已自动替换"
+INSTALL_LOG_HEADER = plugin_badge() + " 已自动替换"
 
 #: What the prefixed mod's jar should be called once its note has been carried over.
 PREFIXED_INSTALLED_NAME = "[测试-前缀]prefixed-fabric-1.1.0.jar"
@@ -412,12 +459,16 @@ def build_tree(root: Path, python: str, plugin: Path, upstream, jars, install: b
     seed_stale_download(root)
 
 
-def feed_commands(process, delay: float) -> None:
+def feed_commands(process, delay: float, install: bool = False) -> None:
     """Write console commands into MCDR's stdin, spaced out so ordering is observable."""
+    commands = list(COMMANDS)
+    if install:
+        commands.append(MANUAL_INSTALL_COMMAND)
+
     def run() -> None:
         try:
             time.sleep(delay)
-            for command in COMMANDS:
+            for command in commands:
                 process.stdin.write(command + "\n")
                 process.stdin.flush()
                 time.sleep(COMMAND_INTERVAL)
@@ -467,7 +518,7 @@ def run_one(python: str, plugin: Path, workdir: Path, scenario_builder,
             bufsize=1,
             env=_child_env(python),
         )
-        feed_commands(process, delay=RUN_SECONDS - 25)
+        feed_commands(process, delay=RUN_SECONDS - 25, install=install)
 
         lines = []
         started = time.time()
@@ -664,9 +715,9 @@ def summarise(
         # "已加载" proves both that the plugin loaded and that `language: auto` followed MCDR.
         "loaded": "Mod Update Checker] 已加载" in console,
         "refused_cleanly": "不满足版本约束" in console,
-        "spoke_chinese": "Mod Update Checker] 已加载" in console
+        "spoke_chinese": plugin_badge() + " 已加载" in console
         and "[Mod Update Checker] loaded" not in console,
-        "check_ran": "Mod 更新检查 — 服务端 26.3" in console,
+        "check_ran": plugin_badge() + " 服务端 26.3" in console,
         "detected_version": "服务端: 26.3" in console,
         "found_update": updates >= 1,
         "reported_up_to_date": "已是最新" in console or "没有发现更新" in console,
@@ -678,8 +729,8 @@ def summarise(
         "cache_records": cache_records,
         # Two distinct notifications are expected, and their markers differ, so a regression
         # that stops sending one of them cannot be masked by the other still arriving.
-        "notify_in_game_sent": "Mod 更新：有" in joined,
-        "admin_join_notified": "[Mod 更新检查] 服务端" in joined,
+        "notify_in_game_sent": plugin_badge() + " 有" in joined,
+        "admin_join_notified": plugin_badge() + " 服务端" in joined,
         "notify_payloads_valid": not tellraw_errors,
         "notify_payloads": tellraws,
         "notify_wrapper": tellraw_wrapper,
@@ -750,6 +801,15 @@ def summarise(
         "command_reload": COMMAND_EXPECTATIONS["reload"] in console,
         "command_alias": COMMAND_EXPECTATIONS["alias"] in console,
         "command_check": COMMAND_EXPECTATIONS["check_started"] in console,
+        "command_download_staged": COMMAND_EXPECTATIONS["download_staged"] in console,
+        "command_download_refused": COMMAND_EXPECTATIONS["download_refused"] in console,
+        "command_install_wants_download":
+            COMMAND_EXPECTATIONS["install_wants_download"] in console,
+        "command_install_refused":
+            COMMAND_EXPECTATIONS["install_refused_status"] in console,
+        "command_install_staged": COMMAND_EXPECTATIONS["install_staged"] in console,
+        "command_install_authorised":
+            COMMAND_EXPECTATIONS["install_authorised"] in console,
         "mode": "install" if install else "download",
         "modrinth_used": any(entry["platform"] == "modrinth" for entry in report.get("entries", [])),
         "tracebacks": console.count("Traceback (most recent call last)"),
@@ -779,6 +839,11 @@ CHECK_KEYS = [
     "command_reload",
     "command_alias",
     "command_check",
+    "command_download_staged",
+    "command_download_refused",
+    "command_install_wants_download",
+    "command_install_refused",
+    "command_install_staged",
     "modrinth_used",
     "spoke_chinese",
 ]
@@ -809,6 +874,10 @@ INSTALL_KEYS = [
     "install_prefix_kept",
     "install_left_a_single_jar",
     "install_untouched_mods_intact",
+    # Only this mode runs ``!!muc install <编号>`` followed by ``!!muc confirm``: the default
+    # run stages the same plan and stops short, because carrying it out would authorise an
+    # install and move the file its download assertions are inspecting.
+    "command_install_authorised",
 ]
 
 

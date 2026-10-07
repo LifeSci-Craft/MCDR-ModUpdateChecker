@@ -5,6 +5,9 @@ anywhere else and each one exists to make a specific mistake impossible:
 
 * **Only files this plugin downloaded.** The ledger is the list of work to do; nothing else in
   ``mods/`` is looked at. A jar the admin installed by hand is invisible to this module.
+* **Only the records this run is meant to touch.** With ``download.install_on_stop`` on that is
+  the whole ledger; with it off it is exactly the ones named by ``!!muc install``. See
+  :func:`pending_records`.
 * **The server is stopped.** The caller runs this from the stop event. Writing a jar into a
   running server's mods folder is how a modpack breaks itself.
 * **The old jar is never deleted**, only renamed to ``<name>.old``. An update that turns out
@@ -38,6 +41,7 @@ __all__ = [
     "InstallOptions",
     "InstallResult",
     "install_pending",
+    "pending_records",
     "split_prefix",
     "backup_name",
     "target_name",
@@ -46,6 +50,18 @@ __all__ = [
 STATUS_INSTALLED = "installed"
 STATUS_SKIPPED = "skipped"
 STATUS_FAILED = "failed"
+
+#: Why a downloaded build was not installed. Short codes rather than sentences, because the
+#: renderer words them and ``!!muc install`` shows the same ones; the sentence for each lives in
+#: the catalogue under ``install.reason.<code>``, and ``tests/test_i18n.py`` checks that set
+#: against these constants in both directions — a code with no sentence would reach a player
+#: verbatim, and a sentence with no code is a leftover.
+REASON_NOT_DOWNLOADED = "not-downloaded"
+REASON_NO_HASH = "no-hash-to-verify"
+REASON_HASH_MISMATCH = "hash-mismatch"
+REASON_NOT_IN_MODS = "not-in-mods"
+REASON_NAME_TAKEN = "name-taken"
+REASON_BACKUP_NAMES_TAKEN = "backup-names-taken"
 
 #: Leading bracket groups on a file name — where an admin puts their own note. Both the ASCII
 #: and the full-width bracket, because a Chinese-language admin uses either.
@@ -139,10 +155,28 @@ def _locate_installed(mods: Path, recorded: str) -> Optional[Path]:
 
 @dataclass
 class InstallOptions:
-    """Where the two folders are. The only configuration this module needs."""
+    """Where the two folders are, and how much of the ledger to act on."""
 
     mods_folder: Path
     downloads_folder: Path
+    #: Install only the records an admin explicitly authorised with ``!!muc install``.
+    #:
+    #: The switch exists because the ledger is shared: with ``download.install_on_stop`` on,
+    #: every download is meant to be installed, so the whole ledger is the work list. With it
+    #: off, the plugin must touch only what it was asked to touch — installing the rest would
+    #: turn a per-mod instruction into a blanket one.
+    approved_only: bool = False
+
+
+def pending_records(ledger: DownloadLedger, approved_only: bool) -> List[str]:
+    """The ledger keys this run should act on, in a stable order.
+
+    Separated from :func:`install_pending` so the caller can ask "is there anything to do?"
+    without doing it — the install runs from the stop event, and a stop with nothing to install
+    must not write an install report claiming otherwise.
+    """
+    keys = ledger.approved_keys() if approved_only else sorted(ledger.records())
+    return [key for key in keys if str((ledger.get(key) or {}).get("file") or "")]
 
 
 @dataclass
@@ -179,33 +213,33 @@ def _install_one(record: Dict[str, Any], options: InstallOptions) -> InstallResu
     local_name = str(record.get("local") or "")
 
     if not source.is_file():
-        return _skip(record, "not-downloaded")
+        return _skip(record, REASON_NOT_DOWNLOADED)
 
     expected = str(record.get("sha1") or "").lower()
     if not expected:
-        return _skip(record, "no-hash-to-verify")
+        return _skip(record, REASON_NO_HASH)
     try:
         found = _sha1_of(source)
     except OSError as error:
         return InstallResult(name=name, status=STATUS_FAILED, version=version,
                              detail="unreadable: {}".format(error))
     if found != expected:
-        return _skip(record, "hash-mismatch")
+        return _skip(record, REASON_HASH_MISMATCH)
 
     installed = _locate_installed(options.mods_folder, local_name)
     if installed is None:
         # No jar to replace means the admin removed it, or renamed it beyond recognition.
         # Adding it back would undo a decision they made, so this is left alone.
-        return _skip(record, "not-in-mods")
+        return _skip(record, REASON_NOT_IN_MODS)
 
     wanted = target_name(installed.name, source.name)
     destination = options.mods_folder / wanted
     if destination.name != installed.name and destination.exists():
-        return _skip(record, "name-taken")
+        return _skip(record, REASON_NAME_TAKEN)
 
     backup = backup_name(installed)
     if backup is None:
-        return _skip(record, "backup-names-taken")
+        return _skip(record, REASON_BACKUP_NAMES_TAKEN)
 
     try:
         os.replace(installed, backup)
@@ -245,22 +279,19 @@ def _install_one(record: Dict[str, Any], options: InstallOptions) -> InstallResu
 def install_pending(
     ledger: DownloadLedger, options: InstallOptions, logger: Optional[Any] = None
 ) -> List[InstallResult]:
-    """Install every download the ledger still lists. Returns one result per record.
+    """Install the downloads this run is allowed to act on. One result per handled record.
 
     Records are processed in a stable order and the ledger is written after each one, so a
     crash part-way leaves the bookkeeping matching the disk rather than claiming work that was
     already done.
+
+    Which records those are is :func:`pending_records`' decision, and it is the same list the
+    caller used to decide whether to run at all — an admin who authorised one mod must not get
+    the other four instalments as a side effect of the others merely being downloaded.
     """
     results: List[InstallResult] = []
-    for key in sorted(ledger.records()):
+    for key in pending_records(ledger, options.approved_only):
         record = ledger.get(key) or {}
-
-        # A download that is not for this mods folder is not this module's business. The
-        # ledger only ever holds files this plugin wrote, so this is a guard against a
-        # hand-edited ledger rather than against a normal case.
-        if not str(record.get("file") or ""):
-            continue
-
         result = _install_one(record, options)
         results.append(result)
         if result.status == STATUS_INSTALLED:

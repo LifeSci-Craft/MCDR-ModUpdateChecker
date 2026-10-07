@@ -1,6 +1,6 @@
 # Mod Update Checker
 
-> 给 MCDR 用的 **Mod 更新检查插件**：扫一遍服务端 `mods/` 里的每个 jar，拿去 **Modrinth** 比对，
+> 给 MCDR 用的 **Mod Update Checker 插件**：扫一遍服务端 `mods/` 里的每个 jar，拿去 **Modrinth** 比对，
 > 告诉你哪些 Mod 有新版本、哪些没有适配当前加载器/游戏版本的构建、哪些压根查不到来源。
 
 **不需要任何 API key，不需要额外依赖，从不动 `mods/`。**
@@ -84,6 +84,9 @@ Fabric 服务端**没有任何原生手段**能发现 Mod 过期。加载器只�
 !!muc check        -- 立即检查一次
 !!muc list         -- 列出所有 Mod（可在后面加一个状态来筛选）
 !!muc info         -- 查看某个 Mod 的详情
+!!muc download     -- 下载某个 Mod 的新版本
+!!muc install      -- 安排关服时安装某个已下载的 Mod
+!!muc confirm      -- 确认上一条 download / install
 !!muc status       -- 显示识别到的服务端版本、加载器与下载设置
 !!muc reload       -- 重新读取配置文件
 !!muc help         -- 显示本帮助
@@ -99,16 +102,63 @@ Fabric 服务端**没有任何原生手段**能发现 Mod 过期。加载器只�
 | `!!modupdate list` | 列出全部 Mod（编号 + 名称 + 状态），每行带可点的 `[详细信息]` |
 | `!!modupdate list <状态>` | 只看某个状态，例如 `!!modupdate list update_available` |
 | `!!modupdate info <编号>` | 某个 Mod 的详情：版本变更、项目页与下载链接。也接受 mod id 或 jar 文件名 |
+| `!!modupdate download <编号>` | 从 Modrinth 下载这一个 Mod 的新版本（见下） |
+| `!!modupdate install <编号>` | 安排下次关服时把它装进 `mods/`（见下） |
+| `!!modupdate confirm` | 确认上一条 `download` / `install` |
 | `!!modupdate status` | 显示识别到的服务端版本、加载器、上游开关、上次检查时间、已排除的 Mod |
 | `!!modupdate reload` | 重载配置文件 |
 | `!!modupdate help` | 帮助页（每行可点击） |
+
+上面的 `<编号>` 就是 `!!modupdate list` 里那个编号，它也接受 mod id 或 jar 文件名。
+
+### 手动下载与安装：两步确认
+
+`download` 与 `install` **都不依赖任何自动开关**。`download.enabled` / `install_on_stop` 回答的是
+「发现了就全都抓下来」「抓下来的全都装上」，而这两个命令回答的是「我只要这一个」——
+后者不该逼你先去把前者打开。
+
+两个命令都会先把**将要发生什么**列出来，再等你输入 `!!modupdate confirm`：
+
+```
+> !!modupdate download 1
+即将从 Modrinth 下载 1 个：
+Sodium  1.0.0 -> 1.1.0
+文件名：sodium-fabric-1.1.0.jar（1.2 MB）
+请在 120 秒内输入 !!modupdate confirm 确认；重新输入本命令可替换这次待确认的操作。
+
+> !!modupdate confirm
+[Mod Update Checker] 已开始下载 Sodium 1.1.0，完成后在这里告诉你结果。
+[Mod Update Checker] Sodium 1.1.0 已下载到 …/downloads/sodium-fabric-1.1.0.jar。要装进 mods/ 请输入 !!modupdate install 1。
+
+> !!modupdate install 1
+即将安排安装（下次关服时执行）：
+把 mods/ 里的 sodium.jar 换成 sodium-fabric-1.1.0.jar，旧文件改名为 .old 保留
+请在 120 秒内输入 !!modupdate confirm 确认。
+
+> !!modupdate confirm
+[Mod Update Checker] 已授权：下次关服时把 Sodium 1.1.0 装进 mods/，旧 jar 保留为 .old。用 !!modupdate status 查看。
+```
+
+几条刻意定下的规则：
+
+- **`install` 要求文件已经下载好。** 没下载就提示你先用 `download`——把「抓」和「装」合成一步会让
+  「确认的是什么」变得含糊。
+- **只有发起这条操作的人能 `confirm`。** 别人输入 `confirm` 会被拒绝并说明是谁发起的。
+- **确认 120 秒内有效。** 过期作废，需要重新输入原命令；重载配置也会让待确认的操作作废
+  （配置里的文件大小上限、重试次数都会影响执行结果，不能拿改动前的计划去执行）。
+- **检查跑过一次之后，旧的确认也会作废。** 编号是「当时那份报告」的映射，报告换了，同一个编号
+  可能已经是另一个 Mod——与其猜，不如让它作废。
+- **`install` 只授权你点名的那一个。** 一台服可能挂着五个已下载的版本，授权记录是逐条的，
+  不会顺手把其余四个也装进去。
+- `!!modupdate info <编号>` 的详情页底部会出现对应的 `[下载此版本]` / `[安排安装]`，点一下
+  就等于输入了上面的命令。
 
 ### 列表与详情是分开的
 
 `!!modupdate list` 只给**一行一个 Mod**，因为它要在一页聊天框内读完：
 
 ```
-Mod 更新检查 — 服务端 26.3 / Fabric（版本来源：server_info）
+[Mod Update Checker] 服务端 26.3 / Fabric（版本来源：server_info）
 共 7 个 Mod。点 [详细信息] 看版本变更与链接：
   [ 1] Sodium  1.0.0 -> 1.1.0  (可更新)  [详细信息]
   [ 2] Lithium  1.0.0 -> 1.1.0  (可更新)  [详细信息]
@@ -128,6 +178,7 @@ Sodium
   项目页: [点击打开]
   下载: [点击下载]
   声明支持 Minecraft >=26.1 <27
+[下载此版本]
 ```
 
 两个链接都是**可点的**（点开浏览器），完整地址在鼠标悬停时显示——所以不必把 URL 摊在聊天里。
@@ -259,13 +310,13 @@ Sodium
 并把被替换的旧 jar 改名为 `<原名>.old` 保留下来。
 
 ```
-[Mod 更新检查] 已自动替换 3 个 Mod，详情见下次启动日志。
+[Mod Update Checker] 已自动替换 3 个 Mod，详情见下次启动日志。
 ```
 
 下次启动时列出明细，第一位上线的管理员也会收到同样的内容（各只发一次）：
 
 ```
-[Mod 更新检查] 已自动替换 3 个 Mod（2026-10-08T10:12:03+08:00）：
+[Mod Update Checker] 已自动替换 3 个 Mod（2026-10-08T10:12:03+08:00）：
   Lithium 0.15.0 —— 旧 jar 已保留为 [锂-性能优化]Lithium.jar.old
   Sodium 0.6.0 —— 旧 jar 已保留为 sodium.jar.old
   Outdated Mod 1.1.0 —— 旧 jar 已保留为 outdated.jar.old
@@ -318,7 +369,7 @@ Sodium
 检查结果把更新分成**两组**，因为下一步动作完全不同：
 
 ```
-Mod 更新检查 — 服务端 26.3 / Fabric（版本来源：server_info）
+[Mod Update Checker] 服务端 26.3 / Fabric（版本来源：server_info）
 有 2 个 Mod 存在更新，但尚未下载：
   Some Mod  1.0.0 -> 1.1.0 for Fabric 26.3  (可更新, …)
   Another Mod  1.0.0 -> 1.1.0  (可更新, …)

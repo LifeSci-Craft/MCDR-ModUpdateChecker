@@ -1144,8 +1144,10 @@ def test_a_truncated_listing_says_how_many_it_held_back():
     assert match is not None, body
     omitted = int(match.group(1))
     # Every mod is either printed as a row or counted in that number, never both and never
-    # neither — which is the arithmetic the line is claiming.
-    printed = [line for line in body.splitlines() if line.strip().startswith("[")]
+    # neither — which is the arithmetic the line is claiming. The row shape is matched rather
+    # than "starts with a bracket": the header opens with the ``[Mod Update Checker]`` badge,
+    # so a looser test counted it as a row.
+    printed = [line for line in body.splitlines() if re.match(r"^  \[\s*\d+\] ", line)]
     assert omitted > 0
     assert len(printed) + omitted == len(report.entries)
 
