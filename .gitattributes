@@ -1,0 +1,11 @@
+# 统一使用 LF 换行，避免 Windows / macOS / Linux 之间出现换行符差异
+* text=auto eol=lf
+
+# 产物与二进制按二进制处理，不要做任何换行转换
+*.mcdr binary
+*.jar binary
+*.png binary
+*.zip binary
+
+# 语言目录里是给翻译者看的 JSON，diff 时值得按行显示
+mod_update_checker/lang/*.json text eol=lf

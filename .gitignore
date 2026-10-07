@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Test dependencies, installed with `pip install --target .testlibs` (see tests/README.md).
+# They are a local copy of MCDR and pytest, not part of the plugin.
+.testlibs/
+
+# Build output
+dist/
+*.mcdr
+*.pyz
+
+# Anything a developer points at their own server
+server/
+logs/
+config/

@@ -1,0 +1,23 @@
+# Test-only dependencies for Mod Update Checker.
+#
+# The plugin itself needs nothing beyond MCDR: `requests` is already a hard dependency of
+# MCDR, and everything else it uses is in the standard library. This file exists because the
+# *test suite* needs pytest, and the end-to-end test boots a real MCDR.
+#
+# Install into a local directory, so nothing touches the environment you run the server with:
+#
+#     python -m pip install --target .testlibs -r tests/requirements-test.txt
+#
+# Then run the suite with .testlibs on the path:
+#
+#     PYTHONPATH=.testlibs python -m pytest -m "not e2e"   # fast
+#     PYTHONPATH=.testlibs python -m pytest                # includes the real-MCDR end-to-end
+#
+# Pinned to the versions the suite is verified against.
+#
+# `mcdreforged` is pinned here so a local run is reproducible, but it is NOT a claim about the
+# minimum the plugin supports — that is `>=2.13.0` in mcdreforged.plugin.json, and it is
+# verified for real by `tools/mcdr_matrix.py`, which installs each version in turn and runs
+# the plugin inside it. See tests/README.md.
+pytest==9.1.1
+mcdreforged==2.16.0

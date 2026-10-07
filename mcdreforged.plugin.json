@@ -1,0 +1,24 @@
+{
+  "id": "mod_update_checker",
+  "version": "1.0.0",
+  "name": "Mod Update Checker",
+  "description": {
+    "en_us": "Compare every jar in the server's mods folder against Modrinth and CurseForge, and tell the admin which ones have a newer build. Fabric has no native way to notice an outdated mod; this does.",
+    "zh_cn": "把服务端 mods 目录里的每个 jar 与 Modrinth、CurseForge 上的版本逐一比对，告诉管理员哪些 Mod 有新版本。Fabric 服务端本身没有任何办法发现 Mod 过期，这个插件补上这一环。"
+  },
+  "authors": [
+    {
+      "name": "Pau1am",
+      "link": "https://github.com/Pau1am"
+    }
+  ],
+  "links": {
+    "homepage": "https://github.com/Pau1am/MCDR-ModUpdateChecker",
+    "source": "https://github.com/Pau1am/MCDR-ModUpdateChecker",
+    "issues": "https://github.com/Pau1am/MCDR-ModUpdateChecker/issues"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "mcdreforged": ">=2.13.0"
+  }
+}
