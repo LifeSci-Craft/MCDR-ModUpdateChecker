@@ -20,3 +20,10 @@ dist/
 server/
 logs/
 config/
+
+# A personal access token, if one is kept in the repository rather than in ~/.workbuddy.
+# ``tools/publish.py`` and ``tools/release.py`` both look here, and their docstrings claimed this
+# entry existed long before it did — so anyone who followed those instructions and put a token in
+# ``.secrets/gh_token`` had it sitting untracked-but-not-ignored, one ``git add -A`` away from
+# being pushed. Kept as a directory pattern so a stray editor backup is covered too.
+.secrets/
