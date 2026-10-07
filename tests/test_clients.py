@@ -1,4 +1,4 @@
-"""The two upstream clients, driven against the local fake.
+"""The Modrinth client, driven against the local fake.
 
 These tests are about protocol shape rather than logic: which requests are sent, with what
 bodies, and how the several "nothing matches" answers are told apart. That is where the
@@ -10,7 +10,6 @@ as having no compatible build.
 import pytest
 
 from mod_update_checker import modrinth as modrinth_module
-from mod_update_checker.curseforge import CurseForgeClient
 from mod_update_checker.modrinth import ModrinthClient
 from mod_update_checker.upstream import (
     HttpClient,
@@ -19,7 +18,7 @@ from mod_update_checker.upstream import (
     UpstreamError,
 )
 
-from fake_upstream import FakeCfFile, FakeCfMod, FakeFile, FakeProject, FakeUpstream, FakeVersion
+from fake_upstream import FakeFile, FakeProject, FakeUpstream, FakeVersion
 
 
 @pytest.fixture
@@ -219,170 +218,6 @@ def test_version_helpers():
     assert parsed.supports("26.3") is True
     assert parsed.supports("1.7.10") is False
     assert parsed.page_url().endswith("/version/v")
-
-
-# --------------------------------------------------------------------------------------
-# CurseForge
-# --------------------------------------------------------------------------------------
-
-
-def cf_mod_with_files():
-    return FakeCfMod(
-        id=238222,
-        slug="jei",
-        name="Just Enough Items",
-        files=[
-            FakeCfFile(
-                id=1,
-                mod_id=238222,
-                file_name="jei-1.20.1-fabric-15.2.0.jar",
-                display_name="15.2.0 for Fabric 1.20.1",
-                fingerprint=111,
-                game_versions=("1.20.1", "Fabric"),
-                file_date="2026-01-01T00:00:00Z",
-            ),
-            FakeCfFile(
-                id=2,
-                mod_id=238222,
-                file_name="jei-26.3-fabric-19.0.0.jar",
-                display_name="19.0.0 for Fabric 26.3",
-                fingerprint=222,
-                game_versions=("26.3", "Fabric"),
-                file_date="2026-03-01T00:00:00Z",
-            ),
-        ],
-    )
-
-
-def test_curseforge_is_disabled_without_a_key_and_sends_nothing(upstream, http):
-    upstream.add_cf_mod(cf_mod_with_files())
-    client = CurseForgeClient(http, api_key="", base_url=upstream.curseforge_base)
-
-    assert client.enabled is False
-    assert client.files_by_fingerprints([111]) == {}
-    assert client.mods([238222]) == {}
-    assert client.search("jei") == []
-    assert client.mod_files(238222) == []
-    assert upstream.requests == []
-
-
-def test_files_by_fingerprints_maps_only_the_hashes_we_sent(upstream, http):
-    upstream.add_cf_mod(cf_mod_with_files())
-    client = CurseForgeClient(http, api_key="test-key", base_url=upstream.curseforge_base)
-
-    found = client.files_by_fingerprints([111, 999999])
-
-    assert list(found) == [111]
-    assert found[111].id == 1
-    assert found[111].mod_id == 238222
-    assert found[111].file_name == "jei-1.20.1-fabric-15.2.0.jar"
-
-
-def test_files_by_fingerprints_drops_a_match_that_does_not_echo_our_hash(upstream, http):
-    """A match whose ``fileFingerprint`` is not one we asked about is discarded rather than
-    attributed, because attributing the wrong project gives a confidently wrong report."""
-    upstream.add_cf_mod(cf_mod_with_files())
-
-    original = FakeUpstream._fingerprints
-
-    def tampered(self, body):
-        payload = original(self, body)
-        for match in payload["data"]["exactMatches"]:
-            match["file"]["fileFingerprint"] = 12345
-        return payload
-
-    FakeUpstream._fingerprints = tampered
-    try:
-        client = CurseForgeClient(http, api_key="test-key", base_url=upstream.curseforge_base)
-        assert client.files_by_fingerprints([111]) == {}
-    finally:
-        FakeUpstream._fingerprints = original
-
-
-def test_mod_files_filters_by_game_version_and_loader(upstream, http):
-    upstream.add_cf_mod(cf_mod_with_files())
-    client = CurseForgeClient(http, api_key="test-key", base_url=upstream.curseforge_base)
-
-    newest = client.mod_files(238222, game_version="26.3", loader_type=4)
-
-    assert [item.id for item in newest] == [2]
-    assert newest[0].download_url is not None
-
-    everything = client.mod_files(238222)
-    assert [item.id for item in everything] == [2, 1]  # newest first
-
-
-def test_mod_files_respects_release_channel_filters(upstream, http):
-    mod = cf_mod_with_files()
-    mod.files[1].release_type = 2  # beta
-    upstream.add_cf_mod(mod)
-    client = CurseForgeClient(http, api_key="test-key", base_url=upstream.curseforge_base)
-
-    assert [item.id for item in client.mod_files(238222, release_types=[1])] == [1]
-    assert [item.id for item in client.mod_files(238222, release_types=[1, 2])] == [2, 1]
-
-
-def test_curseforge_mods_and_search(upstream, http):
-    upstream.add_cf_mod(cf_mod_with_files())
-    client = CurseForgeClient(http, api_key="test-key", base_url=upstream.curseforge_base)
-
-    assert client.mods([238222])[238222].slug == "jei"
-    assert [item.slug for item in client.search("jei")] == ["jei"]
-    assert client.search("somethingelse") == []
-    assert client.mod(238222).name == "Just Enough Items"
-    assert client.mod(999) is None
-
-
-def test_a_rejected_key_raises_unauthorised(upstream, http):
-    upstream.add_cf_mod(cf_mod_with_files())
-    client = CurseForgeClient(http, api_key="wrong-key", base_url=upstream.curseforge_base)
-
-    with pytest.raises(Unauthorised):
-        client.files_by_fingerprints([111])
-    with pytest.raises(Unauthorised):
-        client.mods([238222])
-    with pytest.raises(Unauthorised):
-        client.search("jei")
-
-
-def test_download_url_none_is_preserved(upstream, http):
-    """An author can opt out of third-party downloads; the client must not invent a link."""
-    mod = cf_mod_with_files()
-    mod.files[1].download_url = None
-    upstream.add_cf_mod(mod)
-    client = CurseForgeClient(http, api_key="test-key", base_url=upstream.curseforge_base)
-
-    newest = client.mod_files(238222, game_version="26.3", loader_type=4)
-
-    assert newest[0].download_url is None
-
-
-def test_loader_type_mapping():
-    client = CurseForgeClient(HttpClient("test/1.0"), api_key="k")
-    assert client.loader_type_for("fabric") == 4
-    assert client.loader_type_for("quilt") == 5
-    assert client.loader_type_for("neoforge") == 6
-    assert client.loader_type_for("forge") == 1
-    assert client.loader_type_for("nonsense") is None
-    assert client.loader_label("fabric") == "Fabric"
-
-
-def test_cf_file_helpers():
-    file = FakeCfFile(
-        id=2,
-        mod_id=1,
-        file_name="x.jar",
-        game_versions=("26.3", "Fabric"),
-    ).to_dict()
-    from mod_update_checker.curseforge import CfFile
-
-    parsed = CfFile.from_dict(file)
-    assert parsed.release_channel == "release"
-    assert parsed.supports_game_version("26.3") is True
-    assert parsed.supports_game_version("1.7.10") is False
-    assert parsed.supports_loader("fabric") is True
-    assert parsed.supports_loader("quilt") is False
-    assert parsed.page_url("jei").endswith("/jei/files/2")
 
 
 # --------------------------------------------------------------------------------------

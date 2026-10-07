@@ -272,10 +272,7 @@ def test_config_defaults_are_the_documented_ones():
 
     config = plugin.Config.get_default()
     assert config.modrinth_api_base == ""          # official endpoint
-    assert config.curseforge_api_base == ""
-    assert config.curseforge_api_key == ""         # so CurseForge is skipped, not fatal
     assert config.use_modrinth is True
-    assert config.use_curseforge is True
     assert config.mc_version == "auto"
     assert config.loader == "fabric"
     assert config.language == "auto"
@@ -322,7 +319,6 @@ def test_the_end_to_end_run_uses_the_shipped_defaults():
 
     class _Upstream:
         modrinth_base = "http://127.0.0.1:1/v2"
-        curseforge_base = "http://127.0.0.1:1/v1"
 
     config = tool.plugin_config(_Upstream())
 

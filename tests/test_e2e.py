@@ -94,7 +94,7 @@ def test_the_packed_plugin_works_inside_a_real_mcdr(tmp_path):
     assert result["found_update"], detail
     assert result["no_compatible_build_reported"], detail
     assert result["report_file_written"] and result["report_has_entries"], detail
-    assert result["modrinth_used"] and result["curseforge_used"], detail
+    assert result["modrinth_used"], detail
 
     # Both channels resolved the mods they were supposed to.
     #
@@ -106,8 +106,8 @@ def test_the_packed_plugin_works_inside_a_real_mcdr(tmp_path):
     # because the retry budget was honoured — and its per-attempt hash state was reset, or the
     # third attempt would have failed verification forever.
     assert result["statuses"].get("flaky.jar") == "awaiting_install", detail
-    # ``cfonly.jar`` is on CurseForge only, so its download is skipped and it stays an update.
-    assert result["statuses"].get("cfonly.jar") == "update_available", detail
+    # ``ignored.jar`` has a newer build upstream that the admin asked not to be told about.
+    assert result["statuses"].get("ignored.jar") == "ignored", detail
     # ``tampered.jar`` is served with bytes that never match, so it stays an update to fetch
     # however many times it is retried.
     assert result["statuses"].get("tampered.jar") == "update_available", detail

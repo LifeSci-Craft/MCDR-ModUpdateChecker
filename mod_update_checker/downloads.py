@@ -437,11 +437,6 @@ class Downloader:
             if not entry.download_url:
                 skip(entry, "no-download-url")
                 continue
-            # CurseForge's download URLs need the API key and are not reliably direct, so this
-            # stage is Modrinth-only. Said explicitly rather than silently doing nothing.
-            if entry.platform and entry.platform != "modrinth":
-                skip(entry, "not-modrinth")
-                continue
             if not entry.download_sha1:
                 skip(entry, "no-hash-to-verify")
                 continue

@@ -232,7 +232,6 @@ def test_eligibility_and_the_reason_for_each_skip(tmp_path):
             _entry(),
             _entry(file_name="a.jar", status="up_to_date"),
             _entry(file_name="b.jar", download_url=""),
-            _entry(file_name="c.jar", platform="curseforge"),
             _entry(file_name="d.jar", download_sha1=""),
             _entry(file_name="e.jar", download_size=99 * MEGABYTE),
         ]
@@ -245,7 +244,6 @@ def test_eligibility_and_the_reason_for_each_skip(tmp_path):
     assert "a.jar" not in reasons
     assert reasons == {
         "b.jar": "no-download-url",
-        "c.jar": "not-modrinth",
         "d.jar": "no-hash-to-verify",
         "e.jar": "declared-too-large",
     }

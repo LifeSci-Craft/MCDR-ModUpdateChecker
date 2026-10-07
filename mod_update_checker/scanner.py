@@ -7,11 +7,11 @@ produces useful output instead of a row of "unknown".
 
 What each jar contributes:
 
-* the three digests an upstream lookup needs (SHA-1/SHA-512 for Modrinth, the MurmurHash2
-  fingerprint for CurseForge), computed in one pass;
+* the digests a lookup needs (SHA-1 to search by, SHA-512 to verify with), computed in one
+  pass;
 * the mod id, display name and version, which are the only things available for a jar whose
-  bytes do **not** exist upstream — the common case for anything downloaded from CurseForge,
-  since CurseForge and Modrinth repackage the same release into different bytes;
+  bytes do **not** exist upstream — the common case for anything built from source or
+  re-signed;
 * the ``depends.minecraft`` range, so the report can say "built for 1.21.x, your server is
   26.3" — often the actual reason a mod misbehaves after an upgrade;
 * the ``environment``, so a client-only mod sitting in a *server* folder can be flagged;
@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from .fingerprint import digests_of_file
+from .digests import digests_of_file
 from .versioning import RangeSpec, normalize_spec
 
 __all__ = [
@@ -107,7 +107,6 @@ class ScannedMod:
     mtime: float = 0.0
     sha1: str = ""
     sha512: str = ""
-    fingerprint: int = 0
     metadata: Optional[ModMetadata] = None
     error: Optional[str] = None
 
@@ -510,7 +509,7 @@ def scan_jar(path: Path) -> ScannedMod:
     try:
         mod.mtime = path.stat().st_mtime
         with open(path, "rb") as handle:
-            mod.sha1, mod.sha512, mod.fingerprint, mod.size = digests_of_file(handle)
+            mod.sha1, mod.sha512, mod.size = digests_of_file(handle)
     except OSError as error:
         mod.error = "{}: {}".format(type(error).__name__, error)
         return mod

@@ -1,22 +1,22 @@
 """Turning "here are the jars" into "here is what needs updating".
 
-The run happens in four stages, cheapest and most reliable first, and each stage only ever
+The run happens in three stages, cheapest and most reliable first, and each stage only ever
 deals with what the previous ones could not answer:
 
 1. **Modrinth by SHA-1.** One or two batched requests identify every jar whose bytes exist
    on Modrinth and return the newest build for the configured loader and game version. This
-   alone resolves the large majority of a Fabric server.
-2. **CurseForge by MurmurHash2 fingerprint.** The same idea for jars that came from
-   CurseForge, which repackages releases into different bytes, so their SHA-1 is not on
-   Modrinth. Needs an API key; skipped cleanly without one.
-3. **Name search on both platforms.** Some jars are built from source, re-signed, or simply
-   old. Matching the mod id against the project slug is a guess, so it is only accepted on an
-   exact (normalised) slug or title match, and every entry resolved this way is labelled
-   ``matched_by=name`` in the report. A wrong guess that leads an admin to overwrite a good
-   jar is worse than an honest "unresolved".
-4. **Advisories.** Duplicate mod ids, client-only mods sitting in a server folder, and mods
+   alone resolves the large majority of a Fabric server, and it needs no credentials.
+2. **Name search.** Some jars are built from source, re-signed, or simply old, so their bytes
+   are not published anywhere. Matching the mod id against the project slug is a guess, so it
+   is only accepted on an exact (normalised) slug or title match, and every entry resolved
+   this way is labelled ``matched_by=name`` in the report. A wrong guess that leads an admin to
+   overwrite a good jar is worse than an honest "unresolved".
+3. **Advisories.** Duplicate mod ids, client-only mods sitting in a server folder, and mods
    whose declared Minecraft range excludes the running version. None of these is an update,
    but all three explain far more breakage than a stale jar does.
+
+Jars that cannot be identified at all are still reported, as ``unresolved`` — which is a
+useful answer in itself, since it means Modrinth has never seen those exact bytes.
 
 A jar is identified in the report by its **file name**, not its mod id, because two jars of
 the same mod in one folder is a real and common situation that would otherwise be
@@ -40,7 +40,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
-from .curseforge import CfFile, CurseForgeClient, RELEASE_TYPES
 from .modrinth import ModrinthClient, ModrinthProject, ModrinthVersion
 from .report import (
     STATUS_ERROR,
@@ -88,10 +87,9 @@ class CheckOptions:
     include_beta: bool = False
     include_alpha: bool = False
     use_modrinth: bool = True
-    use_curseforge: bool = True
     modrinth_base: str = ""
-    curseforge_base: str = ""
-    curseforge_api_key: str = ""
+    #: Mod ids, file names or file stems to leave alone entirely — no lookup, no report entry
+    #: beyond ``ignored``. See ``_select_active``.
     ignored_mods: Sequence[str] = field(default_factory=list)
     timeout: float = 20.0
     retries: int = 3
@@ -99,16 +97,6 @@ class CheckOptions:
     requests_per_minute: int = 240
     use_cache: bool = True
     cache_ttl_hours: float = 24.0
-
-    @property
-    def release_types(self) -> List[int]:
-        """CurseForge ``FileReleaseType`` values to accept."""
-        types = [RELEASE_TYPES["release"]]
-        if self.include_beta:
-            types.append(RELEASE_TYPES["beta"])
-        if self.include_alpha:
-            types.append(RELEASE_TYPES["alpha"])
-        return types
 
     def modrinth_channels(self) -> Tuple[str, ...]:
         """Modrinth ``version_type`` values to accept, newest-stable-first."""
@@ -213,13 +201,11 @@ class Checker:
         self.logger = logger or _LOGGER
         self._http: Optional[HttpClient] = None
         self._modrinth: Optional[ModrinthClient] = None
-        self._curseforge: Optional[CurseForgeClient] = None
         self._cache = ResolveCache(None, options.cache_ttl_hours, enabled=False)
 
     # -- lifecycle ---------------------------------------------------------------------
 
     def _setup(self, cache_path: Union[str, Path, None]) -> None:
-        from .curseforge import DEFAULT_BASE_URL as CF_BASE
         from .modrinth import DEFAULT_BASE_URL as MR_BASE
 
         limiter = RateLimiter(self.options.requests_per_minute)
@@ -232,11 +218,6 @@ class Checker:
         )
         self._modrinth = ModrinthClient(
             self._http, base_url=self.options.modrinth_base or MR_BASE
-        )
-        self._curseforge = CurseForgeClient(
-            self._http,
-            api_key=self.options.curseforge_api_key,
-            base_url=self.options.curseforge_base or CF_BASE,
         )
         self._cache = ResolveCache(
             cache_path, self.options.cache_ttl_hours, enabled=self.options.use_cache
@@ -274,28 +255,10 @@ class Checker:
         for mod in scan.mods:
             entries[mod.file_name] = entry_from_scan(mod)
 
-        if not self.options.use_curseforge:
-            report.upstream_notes.append(("note.curseforge_disabled_by_config", {}))
-        elif not (self.options.curseforge_api_key or "").strip():
-            report.upstream_notes.append(("note.curseforge_no_key", {}))
-
-        ignored = {normalise_name(value) for value in self.options.ignored_mods if value}
-        active: List[ScannedMod] = []
-        for mod in scan.mods:
-            entry = entries[mod.file_name]
-            if ignored and (
-                normalise_name(mod.mod_id) in ignored
-                or normalise_name(mod.file_name) in ignored
-                or normalise_name(Path(mod.file_name).stem) in ignored
-            ):
-                entry.status = STATUS_IGNORED
-                continue
-            active.append(mod)
+        active = self._select_active(scan, entries)
 
         try:
             remaining = self._stage_modrinth(active, entries, report, server)
-            if remaining:
-                remaining = self._stage_curseforge(remaining, entries, report, server)
             if remaining:
                 self._stage_name_search(remaining, entries, report, server)
         finally:
@@ -312,6 +275,38 @@ class Checker:
         ]
         report.duration_seconds = time.monotonic() - started
         return report
+
+    def _select_active(
+        self, scan: ScanResult, entries: Dict[str, UpdateEntry]
+    ) -> List[ScannedMod]:
+        """Split the scanned jars into those worth looking up and those the admin excluded.
+
+        An excluded jar is marked ``ignored`` and **never reaches a lookup stage**, which is the
+        whole point of the setting: it is for mods the admin does not want updating, or wrote
+        themselves. Leaving it in the queue and discarding the answer would still spend the
+        request, still show up in the request budget, and still be one bad cache entry away
+        from a spurious report.
+
+        Three spellings are accepted — mod id, file name, and file name without ``.jar`` —
+        because all three are what an admin actually has in front of them, and both sides are
+        normalised (lowercased, non-alphanumerics stripped) so ``Fabric-API`` and ``fabricapi``
+        are the same entry.
+        """
+        if not self.options.ignored_mods:
+            return list(scan.mods)
+
+        ignored = {normalise_name(value) for value in self.options.ignored_mods if value}
+        active: List[ScannedMod] = []
+        for mod in scan.mods:
+            if (
+                normalise_name(mod.mod_id) in ignored
+                or normalise_name(mod.file_name) in ignored
+                or normalise_name(Path(mod.file_name).stem) in ignored
+            ):
+                entries[mod.file_name].status = STATUS_IGNORED
+                continue
+            active.append(mod)
+        return active
 
     # -- stage 1: Modrinth -----------------------------------------------------------
 
@@ -574,196 +569,7 @@ class Checker:
             targets=", ".join(newest.game_versions[-6:]) or "?",
         )
 
-    # -- stage 2: CurseForge -----------------------------------------------------------
-
-    def _stage_curseforge(
-        self,
-        mods: Sequence[ScannedMod],
-        entries: Dict[str, UpdateEntry],
-        report: Report,
-        server: ServerContext,
-    ) -> List[ScannedMod]:
-        assert self._curseforge is not None
-        if not self.options.use_curseforge or not self._curseforge.enabled:
-            return list(mods)
-
-        fingerprints = [mod.fingerprint for mod in mods if mod.fingerprint]
-        if not fingerprints:
-            return list(mods)
-
-        try:
-            matched = self._curseforge.files_by_fingerprints(fingerprints)
-        except UpstreamError as error:
-            report.upstream_notes.append(
-                ("note.curseforge_unavailable", {"error": str(error)})
-            )
-            return list(mods)
-
-        by_fingerprint: Dict[int, Tuple[ScannedMod, CfFile]] = {}
-        for mod in mods:
-            file = matched.get(mod.fingerprint)
-            if file is not None:
-                by_fingerprint[mod.fingerprint] = (mod, file)
-
-        projects: Dict[int, Any] = {}
-        mod_ids = [file.mod_id for _, file in by_fingerprint.values() if file.mod_id]
-        if mod_ids:
-            try:
-                projects = self._curseforge.mods(mod_ids)
-            except UpstreamError as error:
-                report.upstream_notes.append(
-                    ("note.curseforge_unavailable", {"error": str(error)})
-                )
-
-        latest_files, latest_failures = self._curseforge_latest_files(by_fingerprint, server)
-
-        leftover: List[ScannedMod] = []
-        for mod in mods:
-            pair = by_fingerprint.get(mod.fingerprint)
-            if pair is None:
-                leftover.append(mod)
-                continue
-            _, local_file = pair
-            entry = entries[mod.file_name]
-            project = projects.get(local_file.mod_id)
-            self._apply_curseforge(
-                mod,
-                entry,
-                local_file,
-                project,
-                latest_files.get(local_file.mod_id),
-                local_file.mod_id in latest_failures,
-                server,
-            )
-        return leftover
-
-    def _curseforge_latest_files(
-        self,
-        by_fingerprint: Dict[int, Tuple[ScannedMod, CfFile]],
-        server: ServerContext,
-    ) -> Tuple[Dict[int, Optional[CfFile]], Set[int]]:
-        """Newest compatible file per project id, plus the ids whose lookup failed.
-
-        Failure is tracked rather than folded into ``None`` for the same reason as on the
-        Modrinth side: "this project has no Fabric build" and "the request failed" must not
-        reach the admin as the same sentence.
-        """
-        assert self._curseforge is not None
-        loader_type = self._curseforge.loader_type_for(self.options.loader)
-        release_types = self.options.release_types
-        wanted = sorted({file.mod_id for _, file in by_fingerprint.values() if file.mod_id})
-        if not wanted:
-            return {}, set()
-
-        def newest(mod_id: int) -> Tuple[int, Optional[CfFile], bool]:
-            try:
-                files = self._curseforge.mod_files(  # type: ignore[union-attr]
-                    mod_id,
-                    game_version=server.mc_version,
-                    loader_type=loader_type,
-                    release_types=release_types,
-                )
-                if files:
-                    return mod_id, files[0], False
-                if server.mc_version:
-                    # Nothing for our game version: ask again unfiltered so the report can
-                    # name what the project *does* publish.
-                    fallback = self._curseforge.mod_files(  # type: ignore[union-attr]
-                        mod_id, loader_type=loader_type, release_types=release_types
-                    )
-                    return mod_id, (fallback[0] if fallback else None), False
-                return mod_id, None, False
-            except UpstreamError as error:
-                self.logger.debug("curseforge files for %s failed: %s", mod_id, error)
-                return mod_id, None, True
-
-        workers = min(_MAX_WORKERS, max(1, self.options.workers), len(wanted))
-        files: Dict[int, Optional[CfFile]] = {}
-        failures: Set[int] = set()
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            for mod_id, found, failed in pool.map(newest, wanted):
-                files[mod_id] = found
-                if failed:
-                    failures.add(mod_id)
-        return files, failures
-
-    def _apply_curseforge(
-        self,
-        mod: ScannedMod,
-        entry: UpdateEntry,
-        local_file: CfFile,
-        project: Any,
-        latest_file: Optional[CfFile],
-        latest_failed: bool,
-        server: ServerContext,
-    ) -> None:
-        entry.platform = "curseforge"
-        entry.matched_by = "fingerprint"
-        if project is not None:
-            entry.project_url = project.page_url
-            _prefer_name(entry, project.name)
-
-        if latest_file is None:
-            if latest_failed:
-                _mark_undetermined(entry, "curseforge")
-                return
-            entry.status = STATUS_NO_COMPATIBLE_BUILD
-            entry.add_note("note.no_build_for_loader", loader=self.options.loader)
-            return
-
-        entry.latest_version = latest_file.display_name or latest_file.file_name
-        entry.release_channel = latest_file.release_channel
-        entry.released_at = latest_file.file_date
-        if latest_file.download_url:
-            entry.download_url = latest_file.download_url
-        else:
-            entry.add_note("note.no_api_download")
-        if entry.project_url and latest_file.id:
-            entry.add_note("note.latest_file", file=latest_file.file_name)
-
-        # CurseForge file rows carry no version string, so the decision is made on file
-        # identity first and upload timestamps second. Comparing the *display names* as
-        # versions would be nonsense — "11.68.0.1086 for Fabric 1.19.2" is not a version.
-        if latest_file.id == local_file.id or (
-            local_file.fingerprint and latest_file.fingerprint == local_file.fingerprint
-        ):
-            entry.status = STATUS_UP_TO_DATE
-            return
-
-        local_stamp = _parse_timestamp(local_file.file_date)
-        latest_stamp = _parse_timestamp(latest_file.file_date)
-        if local_stamp is not None and latest_stamp is not None and local_stamp != latest_stamp:
-            entry.status = (
-                STATUS_UPDATE_AVAILABLE if local_stamp < latest_stamp else STATUS_LOCAL_AHEAD
-            )
-            return
-
-        # Fallback for an unparseable timestamp: compare the strings. CurseForge emits one
-        # consistent UTC format so this agrees with the branch above in practice, but it is
-        # only correct for strings in a single format, which is why it is the fallback.
-        local_date = local_file.file_date or ""
-        latest_date = latest_file.file_date or ""
-        if local_date and latest_date and local_date != latest_date:
-            if local_date < latest_date:
-                entry.status = STATUS_UPDATE_AVAILABLE
-            else:
-                entry.status = STATUS_LOCAL_AHEAD
-            return
-
-        if not latest_file.supports_game_version(server.mc_version or ""):
-            entry.status = STATUS_NO_COMPATIBLE_BUILD
-            entry.add_note(
-                "note.no_build_for_game_version",
-                version=server.mc_version or "?",
-                newest=entry.latest_version,
-                targets=", ".join(latest_file.game_versions[-6:]) or "?",
-            )
-            return
-
-        entry.status = STATUS_UPDATE_AVAILABLE
-        entry.add_note("note.different_build_same_date")
-
-    # -- stage 3: name search ----------------------------------------------------------
+    # -- stage 2: name search ----------------------------------------------------------
 
     def _stage_name_search(
         self,
@@ -778,15 +584,15 @@ class Checker:
         a jar that is actually something else would have an admin download the wrong mod,
         which is strictly worse than the report saying it could not tell.
 
-        This is the one stage whose failures are worth remembering: proving that a jar is on
-        neither platform costs three requests (a search on each, plus a version lookup), and
-        the answer will not have changed by tomorrow. So a negative verdict is cached, and the
-        TTL is what bounds how long a newly published mod stays invisible.
+        This is the one stage whose failures are worth remembering: proving that Modrinth does
+        not know a jar costs a search plus a version lookup, and the answer will not have
+        changed by tomorrow. So a negative verdict is cached, and the TTL is what bounds how
+        long a newly published mod stays invisible.
 
-        Only a *established* negative verdict is cached. If an enabled platform could not be
-        asked at all, "neither platform knows this jar" is not something that was learned, and
-        caching it would hide the mod from every check for the whole TTL — a transient outage
-        promoted into a day-long blind spot.
+        Only an *established* negative verdict is cached. If the search could not be made at
+        all, "Modrinth does not know this jar" is not something that was learned, and caching
+        it would hide the mod from every check for the whole TTL — a transient outage promoted
+        into a day-long blind spot.
         """
         for mod in mods:
             entry = entries[mod.file_name]
@@ -815,20 +621,8 @@ class Checker:
             if by_modrinth:
                 continue
 
-            asked_curseforge = bool(self.options.use_curseforge and self._curseforge.enabled)
-            by_curseforge = (
-                self._match_on_curseforge(mod, entry, query, server)
-                if asked_curseforge
-                else False
-            )
-            if by_curseforge:
-                continue
-
             entry.status = STATUS_UNRESOLVED
-            incomplete = (asked_modrinth and by_modrinth is None) or (
-                asked_curseforge and by_curseforge is None
-            )
-            if incomplete:
+            if asked_modrinth and by_modrinth is None:
                 entry.add_note("note.search_incomplete")
             elif mod.sha1:
                 self._cache.put(mod.sha1, {"resolved": False})
@@ -896,60 +690,6 @@ class Checker:
         self._decide_by_string(entry)
         return True
 
-    def _match_on_curseforge(
-        self, mod: ScannedMod, entry: UpdateEntry, query: str, server: ServerContext
-    ) -> Optional[bool]:
-        """``True`` resolved, ``False`` asked and not found, ``None`` could not ask."""
-        assert self._curseforge is not None
-        if not self._curseforge.enabled:
-            return False
-        try:
-            results = self._curseforge.search(query)
-        except UpstreamError as error:
-            self.logger.debug("curseforge search for %s failed: %s", query, error)
-            return None
-
-        wanted = normalise_name(query)
-        accepted = [
-            project
-            for project in results
-            if normalise_name(project.slug) == wanted or normalise_name(project.name) == wanted
-        ]
-        if not accepted:
-            return False
-
-        project = accepted[0]
-        entry.platform = "curseforge"
-        entry.matched_by = "name"
-        entry.project_url = project.page_url
-        _prefer_name(entry, project.name)
-        entry.add_note("note.matched_by_name", slug=project.slug)
-        files = self._curseforge.mod_files(
-            project.id,
-            game_version=server.mc_version,
-            loader_type=self._curseforge.loader_type_for(self.options.loader),
-            release_types=self.options.release_types,
-        )
-        if not files:
-            entry.status = STATUS_NO_COMPATIBLE_BUILD
-            entry.add_note("note.no_build_for_loader", loader=self.options.loader)
-            return True
-
-        newest = files[0]
-        entry.latest_version = newest.display_name or newest.file_name
-        entry.release_channel = newest.release_channel
-        entry.released_at = newest.file_date
-        if newest.download_url:
-            entry.download_url = newest.download_url
-        else:
-            entry.add_note("note.no_api_download")
-
-        if entry.local_version and newest.file_name.startswith(entry.local_version):
-            entry.status = STATUS_UP_TO_DATE
-            return True
-        self._decide_by_string(entry)
-        return True
-
     @staticmethod
     def _decide_by_string(entry: UpdateEntry) -> None:
         """Compare two version strings that came from different naming schemes."""
@@ -1008,26 +748,6 @@ class Checker:
         if entry.status == STATUS_NOT_A_MOD:
             return "not-a-mod"
         return ""
-
-
-def _parse_timestamp(text: str) -> Optional[float]:
-    """Best-effort epoch seconds for an ISO-8601 timestamp, or ``None``.
-
-    Used instead of comparing the strings directly: string comparison is only correct while
-    both sides share one format and one UTC offset, and "correct by accident" is the kind of
-    thing that breaks the day an upstream changes how it writes a date.
-    """
-    if not text:
-        return None
-    cleaned = str(text).strip()
-    if cleaned.endswith(("Z", "z")):
-        # ``datetime.fromisoformat`` only learned to accept a bare ``Z`` in 3.11, and MCDR
-        # still supports 3.8.
-        cleaned = cleaned[:-1] + "+00:00"
-    try:
-        return datetime.fromisoformat(cleaned).timestamp()
-    except ValueError:
-        return None
 
 
 def _record_download(entry: UpdateEntry, version: ModrinthVersion) -> None:

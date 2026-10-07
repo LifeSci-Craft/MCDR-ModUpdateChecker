@@ -16,7 +16,7 @@ one:
 * ``last_report.json`` is written and contains what the console claimed;
 * no traceback comes out of the plugin.
 
-The upstream (Modrinth and CurseForge) is not contacted: the plugin's API base URLs are
+The upstream (Modrinth) is not contacted: the plugin's API base URL is
 pointed at a local fake, so a run needs no network and cannot be rate-limited.
 
 Usage::
@@ -278,8 +278,6 @@ def version_tuple(text: str):
 CONFIG_OVERRIDES = (
     # The fake upstream is not reachable at the real URLs.
     "modrinth_api_base",
-    "curseforge_api_base",
-    "curseforge_api_key",
     # Waiting the shipped 60 seconds would make every job three times as long.
     "start_check_delay_seconds",
     # A test must not sit in the self-imposed rate limiter, and the retry path is covered by
@@ -296,6 +294,10 @@ CONFIG_OVERRIDES = (
     # a verified file lands, that a tampered one is refused, and that nothing is written
     # outside the plugin's own folder.
     "download_updates",
+    # Not off, but a non-default *value*: this is how the run proves that a mod the admin
+    # excluded is genuinely left alone. The scenario plants one with a newer build upstream,
+    # so if the exclusion were ignored it would show up as an update.
+    "ignored_mods",
 )
 
 
@@ -303,13 +305,12 @@ def plugin_config(upstream) -> dict:
     """The config for one MCDR instance: the shipped defaults, plus the allow-list."""
     config = {
         "modrinth_api_base": upstream.modrinth_base,
-        "curseforge_api_base": upstream.curseforge_base,
-        "curseforge_api_key": "matrix-key",
         "start_check_delay_seconds": 2,
         "requests_per_minute": 0,
         "http_retries": 0,
         "notify_in_game": True,
         "download_updates": True,
+        "ignored_mods": ["ignored"],
     }
     unexpected = set(config) - set(CONFIG_OVERRIDES)
     assert not unexpected, "override not declared in CONFIG_OVERRIDES: {}".format(unexpected)
@@ -456,9 +457,11 @@ def run_one(python: str, plugin: Path, workdir: Path, scenario_builder) -> dict:
                 name: hashlib.sha1(blob).hexdigest()
                 for name, blob in upstream.cdn_files.items()
                 if name not in upstream.fail_downloads
+                and name not in upstream.unwanted_downloads
             },
-            forbidden_downloads=set(upstream.fail_downloads),
+            forbidden_downloads=set(upstream.fail_downloads) | set(upstream.unwanted_downloads),
             flaky_downloads=set(upstream.flaky_downloads),
+            unwanted_downloads=set(upstream.unwanted_downloads),
         )
         result["root"] = str(root)
         result["upstream_requests"] = len(upstream.request_paths())
@@ -531,6 +534,7 @@ def summarise(
     expected_downloads: Optional[dict] = None,
     forbidden_downloads: Optional[set] = None,
     flaky_downloads: Optional[set] = None,
+    unwanted_downloads: Optional[set] = None,
 ) -> dict:
     plugin_folder = root / "config" / PLUGIN_ID
     report_path = plugin_folder / "last_report.json"
@@ -574,7 +578,14 @@ def summarise(
         for name, digest in expected_downloads.items()
     }
     forbidden_present = sorted(name for name in forbidden_downloads if name in downloaded)
+    # Published but not wanted: a mod the config excluded. Named separately from the
+    # verification failures, because "we refused a bad file" and "we correctly ignored a mod"
+    # are different behaviours and a regression in one should not read as the other.
+    ignored_not_fetched = sorted(
+        name for name in unwanted_downloads if name not in downloaded
+    )
     flaky_downloads = set(flaky_downloads or set())
+    unwanted_downloads = set(unwanted_downloads or set())
     # A build that has been fetched is no longer an update to fetch. Asserted on the file name
     # level so that a regression which puts it back into the "not downloaded" list is caught
     # even if the download itself still works.
@@ -634,6 +645,10 @@ def summarise(
         "download_flaky_recovered": bool(flaky_downloads)
         and all(verified.get(name) for name in flaky_downloads),
         "download_no_leftovers": not leftovers,
+        # A mod the admin excluded is not fetched even though its build is published: that is
+        # the whole point of the setting, and with downloading on it is the observable part.
+        "download_ignored_not_fetched": bool(unwanted_downloads)
+        and len(ignored_not_fetched) == len(unwanted_downloads),
         # The downloaded build must have left the "update to fetch" list, and the notification
         # must say both things: what still needs fetching, and what is fetched but not installed.
         "download_reclassified": bool(awaiting) and not announced_updates,
@@ -658,7 +673,6 @@ def summarise(
         "command_reload": COMMAND_EXPECTATIONS["reload"] in console,
         "command_alias": COMMAND_EXPECTATIONS["alias"] in console,
         "command_check": COMMAND_EXPECTATIONS["check_started"] in console,
-        "curseforge_used": any(entry["platform"] == "curseforge" for entry in report.get("entries", [])),
         "modrinth_used": any(entry["platform"] == "modrinth" for entry in report.get("entries", [])),
         "tracebacks": console.count("Traceback (most recent call last)"),
         "plugin_errors": console.count("[Mod Update Checker] 检查失败"),
@@ -681,6 +695,7 @@ CHECK_KEYS = [
     "download_tampered_refused",
     "download_flaky_recovered",
     "download_no_leftovers",
+    "download_ignored_not_fetched",
     "download_reclassified",
     "stale_download_removed",
     "stale_download_replaced",
@@ -693,7 +708,6 @@ CHECK_KEYS = [
     "command_reload",
     "command_alias",
     "command_check",
-    "curseforge_used",
     "modrinth_used",
     "spoke_chinese",
 ]

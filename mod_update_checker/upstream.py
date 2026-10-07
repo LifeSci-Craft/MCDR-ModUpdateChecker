@@ -1,4 +1,4 @@
-"""The HTTP plumbing shared by the Modrinth and CurseForge clients.
+"""The HTTP plumbing used to talk to Modrinth.
 
 Three things a plugin talking to a public API for a live game server has to get right, and
 that are therefore implemented once here rather than twice:
@@ -6,9 +6,9 @@ that are therefore implemented once here rather than twice:
 * **It must never hang the server.** Every request carries a timeout, and a check run is
   driven from a worker thread.
 * **It must not get the admin rate-limited or banned.** Modrinth publishes a hard limit of
-  300 requests per minute per IP and a ``429`` that carries ``X-Ratelimit-Reset``;
-  CurseForge rate-limits per key. :class:`RateLimiter` throttles proactively and the retry
-  loop honours whatever the server tells us to wait.
+  300 requests per minute per IP and a ``429`` that carries ``X-Ratelimit-Reset``.
+  :class:`RateLimiter` throttles proactively and the retry loop honours whatever the server
+  tells us to wait.
 * **It must survive a flaky or censored network.** ``429``/``5xx`` and transport errors are
   retried with exponential backoff; a mirror or proxy can be pointed at through the
   configurable base URL / proxy settings, which matters a lot for players reaching

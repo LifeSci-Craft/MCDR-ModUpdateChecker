@@ -158,7 +158,6 @@ def test_scan_jar_records_the_three_digests(tmp_path):
     assert mod.sha1 == hashlib.sha1(raw).hexdigest()
     assert mod.sha512 == hashlib.sha512(raw).hexdigest()
     assert mod.size == len(raw)
-    assert 0 <= mod.fingerprint <= 0xFFFFFFFF
     assert mod.mtime > 0
 
 

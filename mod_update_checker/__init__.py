@@ -2,8 +2,8 @@
 
 Fabric has no native notion of "is this mod out of date". The loader reads ``mods/``,
 launches, and never asks whether a newer build exists — so the answer has to come from
-outside, by comparing each jar against the two places mods actually live: Modrinth and
-CurseForge.
+outside, by comparing each jar against Modrinth, where a mod can be identified by the exact
+bytes of its file and so needs no guesswork.
 
 This module is the MCDR-facing shell: configuration, commands, scheduling, notification, and
 the translation of a :class:`~mod_update_checker.report.Report` into console lines and
@@ -157,20 +157,16 @@ class Config(Serializable):
     use_modrinth: bool = True
     """启用 Modrinth 查询（不需要 API key，按文件哈希精确匹配）。"""
 
-    use_curseforge: bool = True
-    """启用 CurseForge 查询（需要 API key，按指纹精确匹配）。"""
-
     modrinth_api_base: str = ""
     """Modrinth API 地址。留空 = 官方 ``https://api.modrinth.com/v2``；可改成镜像。"""
 
-    curseforge_api_base: str = ""
-    """CurseForge API 地址。留空 = 官方 ``https://api.curseforge.com/v1``。"""
-
-    curseforge_api_key: str = ""
-    """CurseForge API key（https://console.curseforge.com 免费申请）。留空则跳过 CurseForge。"""
-
     ignored_mods: List[str] = []
-    """要忽略的 Mod：可填 mod id、jar 文件名或去掉扩展名的文件名（不区分大小写）。"""
+    """**完全不做更新检测**的 Mod。可填 mod id、jar 文件名，或去掉 ``.jar`` 的文件名，不区分大小写、
+    忽略空格与符号（``Fabric-API`` 与 ``fabricapi`` 等价）。
+
+    适合：自己写的 Mod、打算长期固定在某个版本的 Mod、明确不需要更新提醒的 Mod。
+    被列出的 Mod **不会产生任何网络查询**，也不会出现在「有更新」或「已下载」列表里；
+    报告中仅标注为「已忽略」，便于你确认配置确实生效了。"""
 
     http_timeout_seconds: int = 20
     """单次 HTTP 请求超时（秒）。"""
@@ -282,10 +278,7 @@ def _check_options(config: Config, mc_version: Optional[str], loader: str) -> Ch
         include_beta=config.include_beta,
         include_alpha=config.include_alpha,
         use_modrinth=config.use_modrinth,
-        use_curseforge=config.use_curseforge,
         modrinth_base=config.modrinth_api_base,
-        curseforge_base=config.curseforge_api_base,
-        curseforge_api_key=config.curseforge_api_key,
         ignored_mods=list(config.ignored_mods),
         timeout=max(1.0, float(config.http_timeout_seconds)),
         retries=max(0, int(config.http_retries)),
@@ -608,7 +601,7 @@ def _log_download_outcomes(
             )
 
     # Skips are summarised rather than listed one by one: on a server where most mods are only
-    # on CurseForge, the list would otherwise be the bulk of the output.
+    # that were not eligible, the list would otherwise be the bulk of the output.
     skipped_reasons = sorted({outcome.detail for outcome in outcomes
                               if outcome.status == STATUS_SKIPPED})
     if skipped_reasons:
@@ -955,18 +948,13 @@ def _show_status(source: CommandSource) -> None:
                     loader=context.loader, source=context.mc_version_source))
     source.reply(tr("command.status.mods_dir", directory=scan.directory,
                     count=len(scan.mods)))
-    if _config.use_modrinth:
-        modrinth_state = tr("command.status.enabled")
-    else:
-        modrinth_state = tr("command.status.disabled")
-    if not _config.use_curseforge:
-        curseforge_state = tr("command.status.disabled")
-    elif (_config.curseforge_api_key or "").strip():
-        curseforge_state = tr("command.status.enabled")
-    else:
-        curseforge_state = tr("command.status.disabled_no_key")
-    source.reply(tr("command.status.upstream", modrinth=modrinth_state,
-                    curseforge=curseforge_state))
+    modrinth_state = (
+        tr("command.status.enabled") if _config.use_modrinth else tr("command.status.disabled")
+    )
+    source.reply(tr("command.status.upstream", modrinth=modrinth_state))
+    if _config.ignored_mods:
+        source.reply(tr("command.status.ignored", count=len(_config.ignored_mods),
+                        names=", ".join(_config.ignored_mods[:8])))
     if _last_report is None:
         source.reply(tr("command.status.never_checked"))
     else:
@@ -1125,8 +1113,9 @@ def on_load(server: PluginServerInterface, prev_module: Any) -> None:
     except Exception as error:  # noqa: BLE001 - a broken mods folder is not fatal
         server.logger.warning("could not inspect the mods folder: {}".format(error))
 
-    if _config.use_curseforge and not (_config.curseforge_api_key or "").strip():
-        server.logger.info(tr("console.curseforge_hint"))
+    if _config.ignored_mods:
+        server.logger.info(tr("console.ignored_mods", count=len(_config.ignored_mods),
+                              names=", ".join(_config.ignored_mods[:8])))
 
     _log_cache_summary(server, _config)
 

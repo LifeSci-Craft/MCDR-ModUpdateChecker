@@ -3,11 +3,11 @@
 Kept apart from ``mcdr_matrix.py`` so the tool stays readable, and importable on its own so
 the pytest end-to-end test can plant exactly the same scenario.
 
-The scenario is small but complete: one mod with a pending update, one already current, one
-whose project publishes nothing for this Minecraft version, one CurseForge-only mod
-identified by fingerprint rather than by hash, and one jar that is not a mod at all. Every
-outcome the console can print should occur at least once, otherwise a regression that stops
-printing one of them would still pass.
+The scenario is small but complete: mods with a pending update, one already current, one whose
+project publishes nothing for this Minecraft version, one whose transfer fails verification,
+one whose transfer is flaky enough to need the retry budget, one the admin asked to ignore, and
+one jar that is not a mod at all. Every outcome the console can print should occur at least
+once, otherwise a regression that stops printing one of them would still pass.
 """
 
 import hashlib
@@ -15,8 +15,6 @@ from pathlib import Path
 from typing import List
 
 from fake_upstream import (
-    FakeCfFile,
-    FakeCfMod,
     FakeFile,
     FakeProject,
     FakeUpstream,
@@ -26,7 +24,6 @@ from support import fabric_metadata, write_jar
 
 #: Fixed so the matrix's expectations are stable.
 GAME_VERSION = "26.3"
-CF_MOD_ID = 555001
 
 
 def sha1_of(path: Path) -> str:
@@ -132,36 +129,23 @@ def build_scenario_jars(upstream: FakeUpstream, workdir: Path) -> List[Path]:
         )
     )
 
-    # 4. CurseForge only: its hash is not on Modrinth, only its fingerprint is known.
-    cf_only = add("cfonly.jar", id="cfonly", version="1.0.0", name="CurseForge Only Mod")
-    from mod_update_checker.scanner import scan_jar
-
-    fingerprint = scan_jar(cf_only).fingerprint
-    upstream.add_cf_mod(
-        FakeCfMod(
-            id=CF_MOD_ID,
-            slug="cfonly",
-            name="CurseForge Only Mod",
-            files=[
-                FakeCfFile(
-                    id=1,
-                    mod_id=CF_MOD_ID,
-                    file_name="cfonly-1.0.0.jar",
-                    display_name="1.0.0 for Fabric " + GAME_VERSION,
-                    fingerprint=fingerprint,
-                    game_versions=(GAME_VERSION, "Fabric"),
-                    file_date="2026-01-01T00:00:00Z",
-                ),
-                FakeCfFile(
-                    id=2,
-                    mod_id=CF_MOD_ID,
-                    file_name="cfonly-1.1.0.jar",
-                    display_name="1.1.0 for Fabric " + GAME_VERSION,
-                    fingerprint=424242,
-                    game_versions=(GAME_VERSION, "Fabric"),
-                    file_date="2026-03-01T00:00:00Z",
-                    download_url="https://edge.example/cfonly-1.1.0.jar",
-                ),
+    # 4. Excluded from checking by config. It has a newer build upstream, so if the ignore
+    #    were not honoured it would show up as an update — and, with downloading on, it would
+    #    also be fetched. Both are asserted.
+    ignored = add("ignored.jar", id="ignored", version="1.0.0", name="Ignored Mod")
+    ignored_new = published("ignored-1.1.0.jar", id="ignored", version="1.1.0", name="Ignored Mod")
+    upstream.unwanted_downloads.add(ignored_new["filename"])
+    upstream.add_project(
+        FakeProject(
+            id="proj-ignored",
+            slug="ignored",
+            title="Ignored Mod",
+            versions=[
+                version("proj-ignored", "i-1", "1.0.0", sha1_of(ignored),
+                        "2026-01-01T00:00:00Z", "ignored-1.0.0.jar"),
+                version("proj-ignored", "i-2", "1.1.0", ignored_new["sha1"],
+                        "2026-02-01T00:00:00Z", ignored_new["filename"],
+                        sha512=ignored_new["sha512"], size=ignored_new["size"]),
             ],
         )
     )

@@ -1,4 +1,4 @@
-"""A local stand-in for Modrinth and CurseForge, used by the test suite.
+"""A local stand-in for the Modrinth API, used by the test suite.
 
 Why a fake server instead of mocking the client: the interesting failures in this plugin are
 protocol-level, not logic-level. Does an empty filter array mean "no filter" or "match
@@ -13,9 +13,7 @@ The behaviour reproduced here was read off the live services before being writte
   against a deliberately impossible game version) and, importantly, treats an empty
   ``game_versions`` array as "no filter" — which is exactly why the client omits empty
   filters rather than sending them;
-* ``GET /project/{id}`` and ``/project/{id}/version`` answer ``404`` for unknown ids;
-* the CurseForge host answers ``401`` on ``/v1/fingerprints`` without an ``x-api-key``
-  header, and ``403`` elsewhere.
+* ``GET /project/{id}`` and ``/project/{id}/version`` answer ``404`` for unknown ids.
 
 Everything is served from one in-memory catalogue, and every request is recorded so tests can
 assert on request counts (a batch lookup of 200 mods must not become 200 requests).
@@ -32,8 +30,6 @@ __all__ = [
     "FakeFile",
     "FakeVersion",
     "FakeProject",
-    "FakeCfFile",
-    "FakeCfMod",
     "FakeUpstream",
 ]
 
@@ -116,60 +112,6 @@ class FakeProject:
 
     def versions_newest_first(self) -> List[FakeVersion]:
         return sorted(self.versions, key=lambda item: item.date_published, reverse=True)
-
-
-@dataclass
-class FakeCfFile:
-    """One CurseForge file row."""
-
-    id: int
-    mod_id: int
-    file_name: str
-    display_name: str = ""
-    release_type: int = 1
-    file_date: str = "2026-01-01T00:00:00Z"
-    game_versions: Sequence[str] = ("26.3", "Fabric")
-    fingerprint: int = 0
-    download_url: Optional[str] = "https://edge.example/mod.jar"
-    file_length: int = 1024
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "id": self.id,
-            "modId": self.mod_id,
-            "fileName": self.file_name,
-            "displayName": self.display_name or self.file_name,
-            "releaseType": self.release_type,
-            "fileDate": self.file_date,
-            "fileLength": self.file_length,
-            "downloadUrl": self.download_url,
-            "gameVersions": list(self.game_versions),
-            "fileFingerprint": self.fingerprint,
-        }
-
-
-@dataclass
-class FakeCfMod:
-    """One CurseForge project."""
-
-    id: int
-    slug: str
-    name: str = ""
-    files: List[FakeCfFile] = field(default_factory=list)
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "id": self.id,
-            "name": self.name or self.slug,
-            "slug": self.slug,
-            "summary": "a test project",
-            "downloadCount": 42,
-            "links": {
-                "websiteUrl": "https://www.curseforge.com/minecraft/mc-mods/{}".format(self.slug),
-                "sourceUrl": "",
-            },
-            "latestFiles": [item.to_dict() for item in self.files[:1]],
-        }
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -336,7 +278,6 @@ class FakeUpstream:
 
     def __init__(self) -> None:
         self.projects: Dict[str, FakeProject] = {}
-        self.cf_mods: Dict[int, FakeCfMod] = {}
         #: Answers ``GET /v2/tag/game_version``; newest first, as the real API returns them.
         self.tag_game_versions: List[str] = ["26.3", "26.2", "26.1", "1.21.4", "1.21.1"]
         self.api_key_required = True
@@ -358,6 +299,10 @@ class FakeUpstream:
         self.fail_downloads: set = set()
         #: Names in here are served without a ``Content-Length``, like a streaming proxy.
         self.no_content_length: set = set()
+        #: Published and perfectly downloadable, but the run must *not* fetch them — a mod the
+        #: admin excluded from checking, for instance. Declared by the scenario rather than
+        #: inferred, because "published" and "should be downloaded" are different questions.
+        self.unwanted_downloads: set = set()
         #: name -> how many more requests to answer with corrupted bytes before serving the
         #: file properly. Drives the "a retry recovers from a flaky link" test.
         self.flaky_downloads: Dict[str, int] = {}
@@ -402,19 +347,11 @@ class FakeUpstream:
     def modrinth_base(self) -> str:
         return "{}/v2".format(self.base)
 
-    @property
-    def curseforge_base(self) -> str:
-        return "{}/v1".format(self.base)
-
     # -- catalogue helpers -------------------------------------------------------------
 
     def add_project(self, project: FakeProject) -> FakeProject:
         self.projects[project.id] = project
         return project
-
-    def add_cf_mod(self, mod: FakeCfMod) -> FakeCfMod:
-        self.cf_mods[mod.id] = mod
-        return mod
 
     def file_url(self, name: str) -> str:
         """The URL a declared ``FakeFile`` should point at to be downloadable."""
@@ -449,8 +386,6 @@ class FakeUpstream:
         headers = {key.lower(): value for key, value in (headers or {}).items()}
         if path.startswith("/v2/"):
             return self._route_modrinth(method, path, query, body)
-        if path.startswith("/v1/"):
-            return self._route_curseforge(method, path, query, body, headers)
         return None
 
     # -- Modrinth ----------------------------------------------------------------------
@@ -594,94 +529,3 @@ class FakeUpstream:
                 }
             )
         return {"hits": hits, "offset": 0, "limit": 10, "total_hits": len(hits)}
-
-    # -- CurseForge --------------------------------------------------------------------
-
-    def _route_curseforge(
-        self,
-        method: str,
-        path: str,
-        query: Dict[str, List[str]],
-        body: Any,
-        headers: Dict[str, str],
-    ) -> Optional[Tuple[int, Any]]:
-        if self.api_key_required and headers.get("x-api-key") != self.api_key:
-            # Matches the live service: 401 on the fingerprint endpoint, 403 elsewhere.
-            if path == "/v1/fingerprints":
-                return 401, {"error": "unauthorised"}
-            return 403, {"error": "Forbidden: API Key missing or invalid"}
-        if method == "POST" and path == "/v1/fingerprints":
-            return 200, self._fingerprints(body)
-        if method == "POST" and path == "/v1/mods":
-            return 200, self._cf_mods(body)
-        if method == "GET" and path == "/v1/mods/search":
-            slug = (query.get("slug") or [""])[0].lower()
-            found = [
-                mod.to_dict()
-                for mod in self.cf_mods.values()
-                if not slug or mod.slug.lower() == slug
-            ]
-            return 200, {"data": found}
-        if method == "GET" and path.startswith("/v1/mods/"):
-            parts = path[len("/v1/mods/"):].split("/")
-            try:
-                mod_id = int(parts[0])
-            except ValueError:
-                return None
-            mod = self.cf_mods.get(mod_id)
-            if mod is None:
-                return 404, {"error": "mod not found"}
-            if len(parts) == 2 and parts[1] == "files":
-                return 200, {"data": self._cf_files(mod, query)}
-            if len(parts) == 1:
-                return 200, {"data": mod.to_dict()}
-        return None
-
-    def _fingerprints(self, body: Any) -> Dict[str, Any]:
-        if not isinstance(body, dict):
-            return {"data": {"exactMatches": [], "unmatchedFingerprints": []}}
-        wanted = [int(item) for item in (body.get("fingerprints") or [])]
-        index = {
-            file.fingerprint: (mod, file)
-            for mod in self.cf_mods.values()
-            for file in mod.files
-            if file.fingerprint
-        }
-        matches = []
-        unmatched = []
-        for fingerprint in wanted:
-            found = index.get(fingerprint)
-            if found is None:
-                unmatched.append(fingerprint)
-                continue
-            mod, file = found
-            matches.append(
-                {
-                    "id": file.id,
-                    "file": file.to_dict(),
-                    "latestFiles": [item.to_dict() for item in mod.files[:3]],
-                }
-            )
-        return {"data": {"exactMatches": matches, "unmatchedFingerprints": unmatched}}
-
-    def _cf_mods(self, body: Any) -> Dict[str, Any]:
-        if not isinstance(body, dict):
-            return {"data": []}
-        ids = [int(item) for item in (body.get("modIds") or [])]
-        return {"data": [self.cf_mods[i].to_dict() for i in ids if i in self.cf_mods]}
-
-    def _cf_files(self, mod: FakeCfMod, query: Dict[str, List[str]]) -> List[Dict[str, Any]]:
-        game_version = (query.get("gameVersion") or [""])[0]
-        loader_type = (query.get("modLoaderType") or [""])[0]
-        loader_names = {"1": "Forge", "4": "Fabric", "5": "Quilt", "6": "NeoForge"}
-        wanted_loader = loader_names.get(loader_type)
-
-        files = []
-        for file in sorted(mod.files, key=lambda item: item.file_date, reverse=True):
-            versions = {item.lower() for item in file.game_versions}
-            if game_version and game_version.lower() not in versions:
-                continue
-            if wanted_loader and wanted_loader.lower() not in versions:
-                continue
-            files.append(file.to_dict())
-        return files

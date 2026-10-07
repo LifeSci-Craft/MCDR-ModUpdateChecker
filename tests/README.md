@@ -25,18 +25,19 @@ PYTHONPATH=.testlibs python -m pytest -m "not e2e"   # 跳过端到端，约 50 
 | 文件 | 覆盖 |
 |---|---|
 | `test_versioning.py` | 版本比较（数值比较、预发布、`+build`、`1.19.2-0.5.3`）、MC 版本范围匹配（`>=1.21 <1.22`、`~`、`^`、通配、区间、OR 列表），以及「垃圾输入不抛异常」 |
-| `test_fingerprint.py` | CurseForge 指纹（固定向量 + **与独立 JavaScript 实现的跨语言比对**）、单次遍历的三个摘要 |
+| `test_digests.py` | 单次遍历算出的 SHA-1 / SHA-512 / 大小；对整块缓冲区用 `hashlib` 交叉验证，并有一条断言证明内存不随文件大小增长 |
 | `test_scanner.py` | 真 jar 的元数据解析（fabric / quilt / forge / neoforge 四种格式）、宽容 JSON、无法读取的文件降级、重复 mod id、仅客户端 Mod |
 | `test_serverinfo.py` | MC 版本与加载器的推断顺序：配置覆盖 → MCDR ServerInformation → 日志 → Mod 元数据投票 |
-| `test_clients.py` | 两个上游客户端的协议形状：批量哈希、**空过滤数组不发送**、chunk 分段、429/5xx 重试、401/403 与 404 处理、CurseForge 无 key 时不发任何请求 |
+| `test_clients.py` | Modrinth 客户端的协议形状：批量哈希、**空过滤数组不发送**、chunk 分段、429/5xx 重试、401/403 与 404 处理 |
 | `test_checker.py` | 完整检查流程对本地假上游的判定结果、**请求预算**、缓存复用、报告序列化与中英渲染 |
 | `test_i18n.py` | 两份语言目录键集一致、代码里用到的键都在、没有失效键、占位符对齐 |
 | `test_e2e.py` | 用 `pack.py` 打出 `.mcdr`，放进**真实 MCDR**里跑：加载、自动检查、命令树、别名、报告落盘 |
 
-`tests/fake_upstream.py` 是 Modrinth + CurseForge 的本地假实现。它的回答形状是照着线上实测抄的
-（例如：`version_files` 只返回认识的哈希；`version_files/update` 无匹配时返回 `{}`；
-CurseForge 匿名访问 `/v1/fingerprints` 返回 401、其他端点返回 403），所以它测的是真实的协议路径，
-而不是一个想当然的替身。
+`tests/fake_upstream.py` 是 Modrinth 的本地假实现。它的回答形状是照着线上实测抄的
+（例如：`version_files` 只返回认识的哈希；`version_files/update` 无匹配时返回 `{}`），所以它测的是
+真实的协议路径，而不是一个想当然的替身。下载用的假 CDN 还会额外提供三种「坏情况」——校验必定失败的
+字节、前 N 次损坏随后正常的抖动、以及不带 `Content-Length` 的流式响应——用来证明拒绝与重试两条路径
+都真的会被走到。
 
 ## 跨 MCDR 版本
 
@@ -60,14 +61,15 @@ MCDR_TEST_PYTHON=/path/to/mcdr-2.14/python PYTHONPATH=.testlibs python -m pytest
 
 ## 无法在仓库内闭环的部分
 
-CurseForge 的**真实**指纹匹配需要 API key，仓库里没有也不该有。因此：
+插件只依赖 Modrinth，而 Modrinth **不需要任何凭据**，所以这一版没有「需要外部 key 才能验证」的环节了。
+（此前存在的 CurseForge 指纹匹配整条路径，正是因为无法在无 key 的情况下闭环验证而被移除。）
 
-- 指纹算法本身用跨语言的独立实现交叉验证（`tools/murmur2_cf.js`，转写自 CurseForge 生态内的 C# 客户端）；
-- 拿到 key 之后，用 `tools/cf_verify.py` 对真实的 jar 做一次端到端确认：
+仍然依赖线上行为、只能靠探测确认的，是 Modrinth 本身的回答形状：
 
 ```bash
-python tools/cf_verify.py --api-key '$2a$10$...' --mods-dir /path/to/server/mods
+python tools/probe_upstream.py
 ```
+
 
 ## 产物校验
 

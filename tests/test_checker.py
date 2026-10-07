@@ -41,8 +41,6 @@ from mod_update_checker.scanner import scan_jar, scan_mods
 from mod_update_checker.serverinfo import ServerContext
 
 from fake_upstream import (
-    FakeCfFile,
-    FakeCfMod,
     FakeFile,
     FakeProject,
     FakeUpstream,
@@ -52,9 +50,6 @@ from support import fabric_metadata, write_jar
 
 SERVER = ServerContext(mc_version="26.3", mc_version_source="config", loader="fabric")
 
-DELTA_CF_MOD_ID = 424242
-DELTA_NEW_FILE_ID = 9001
-DELTA_OLD_FILE_ID = 9000
 
 
 @pytest.fixture
@@ -168,38 +163,7 @@ def build_scenario(tmp_path, upstream):
         )
     )
 
-    # 5. A CurseForge-only mod, identified by fingerprint rather than by hash.
-    delta = scenario.add_jar("delta.jar", id="delta", version="1.0.0", name="Delta")
-    upstream.add_cf_mod(
-        FakeCfMod(
-            id=DELTA_CF_MOD_ID,
-            slug="delta",
-            name="Delta Mod",
-            files=[
-                FakeCfFile(
-                    id=DELTA_OLD_FILE_ID,
-                    mod_id=DELTA_CF_MOD_ID,
-                    file_name="delta-1.0.0.jar",
-                    display_name="1.0.0 for Fabric 26.3",
-                    fingerprint=delta.fingerprint,
-                    game_versions=("26.3", "Fabric"),
-                    file_date="2026-01-01T00:00:00Z",
-                ),
-                FakeCfFile(
-                    id=DELTA_NEW_FILE_ID,
-                    mod_id=DELTA_CF_MOD_ID,
-                    file_name="delta-1.1.0.jar",
-                    display_name="1.1.0 for Fabric 26.3",
-                    fingerprint=987654,
-                    game_versions=("26.3", "Fabric"),
-                    file_date="2026-03-01T00:00:00Z",
-                    download_url="https://edge.example/delta-1.1.0.jar",
-                ),
-            ],
-        )
-    )
-
-    # 6. Only findable by name: not on Modrinth by hash, not on CurseForge at all.
+    # 5. Only findable by name: its bytes are not on Modrinth at all.
     scenario.add_jar("epsilon.jar", id="epsilon", version="1.0.0", name="Epsilon")
     upstream.add_project(
         FakeProject(
@@ -245,8 +209,6 @@ def make_options(upstream, **overrides):
         "loader": "fabric",
         "mc_version": "26.3",
         "modrinth_base": upstream.modrinth_base,
-        "curseforge_base": upstream.curseforge_base,
-        "curseforge_api_key": "test-key",
         "ignored_mods": ["ignored"],
         "workers": 4,
         "requests_per_minute": 0,
@@ -364,16 +326,6 @@ def test_no_compatible_build_when_the_project_has_no_build_for_this_loader(repor
     assert "note.no_build_for_game_version" not in notes
 
 
-def test_curseforge_mod_is_identified_by_fingerprint_and_has_an_update(report):
-    entry = entry_for(report, "delta")
-    assert entry.status == STATUS_UPDATE_AVAILABLE
-    assert entry.platform == "curseforge"
-    assert entry.matched_by == "fingerprint"
-    assert entry.download_url == "https://edge.example/delta-1.1.0.jar"
-    assert "1.1.0" in entry.latest_version
-    assert entry.project_url.endswith("/delta")
-
-
 def test_name_match_is_labelled_as_a_guess(report):
     entry = entry_for(report, "epsilon")
     assert entry.status == STATUS_UPDATE_AVAILABLE
@@ -398,18 +350,137 @@ def test_a_jar_that_is_not_a_mod_is_reported_as_such(report):
     assert entry.status == STATUS_NOT_A_MOD
 
 
+def test_an_ignored_mod_costs_no_requests_at_all(tmp_path, upstream):
+    """Excluding a mod must mean "do not look it up", not "hide the answer".
+
+    This is the difference that matters to someone who maintains a mod they never want updated,
+    or who has pinned one on purpose. Looking it up anyway would still spend the request, still
+    count against the budget a 200-mod server is trying to stay inside, and still depend on the
+    resolve cache being right — none of which was asked for.
+
+    Set up so the answer is unambiguous: one jar, excluded, whose bytes are *not* registered on
+    Modrinth but whose project exists there by name. Left to itself it would take a hash lookup
+    and then a name search, so any request at all means the exclusion leaked.
+    """
+    scenario = Scenario(tmp_path, upstream)
+    jar = scenario.add_jar("pinned.jar", id="pinned", version="1.0.0", name="Pinned Mod")
+    upstream.add_project(
+        FakeProject(
+            id="proj-pinned",
+            slug="pinned",
+            title="Pinned Mod",
+            versions=[
+                # Deliberately not ``jar.sha1``: a hash match would resolve it without a
+                # search, and then the search could not be used as the signal.
+                _version("proj-pinned", "p-1", "1.0.0", "a" * 40),
+                _version("proj-pinned", "p-2", "2.0.0", "b" * 40, date="2026-02-01T00:00:00Z"),
+            ],
+        )
+    )
+
+    report = run_check(upstream, scenario, tmp_path, ignored_mods=["pinned"])
+
+    assert entry_for(report, "pinned").status == STATUS_IGNORED
+    assert upstream.request_paths() == [], upstream.request_paths()
+
+
+def test_ignoring_matches_the_mod_id_the_file_name_and_the_stem(tmp_path, upstream):
+    """All three spellings an admin might have in front of them, matched loosely.
+
+    Written so a lookup that only checked one of the three would fail: one jar is named for its
+    id, one has a file name that differs from its id, and the third is matched on its stem. The
+    configured values are also spelled differently from the files (``BY-ID`` against
+    ``by-id.jar``), because the normalisation is the part that is easy to get wrong.
+    """
+    scenario = Scenario(tmp_path, upstream)
+    by_id = scenario.add_jar("by-id.jar", id="by-id", version="1.0.0", name="By Id")
+    by_file = scenario.add_jar("Different-File.jar", id="byfile", version="1.0.0", name="By File")
+    by_stem = scenario.add_jar("by-stem.jar", id="bystem", version="1.0.0", name="By Stem")
+    for jar in (by_id, by_file, by_stem):
+        upstream.add_project(
+            FakeProject(
+                id="proj-" + jar.file_name,
+                slug=jar.file_name,
+                title=jar.file_name,
+                versions=[
+                    _version("proj-" + jar.file_name, "x-1", "1.0.0", jar.sha1),
+                    _version("proj-" + jar.file_name, "x-2", "2.0.0", jar.sha1 + "0",
+                             date="2026-02-01T00:00:00Z"),
+                ],
+            )
+        )
+
+    report = run_check(
+        upstream, scenario, tmp_path,
+        ignored_mods=["BY-ID", "different-file", "by stem"],
+    )
+
+    statuses = {(entry.mod_id or entry.file_name): entry.status for entry in report.entries}
+    assert statuses.get("by-id") == STATUS_IGNORED, "the mod id spelling did not match"
+    assert statuses.get("byfile") == STATUS_IGNORED, "the file name spelling did not match"
+    assert statuses.get("bystem") == STATUS_IGNORED, "the stem spelling did not match"
+    assert upstream.request_paths() == [], "an ignored mod was still looked up"
+
+
+def test_an_ignored_mod_is_still_listed_so_the_admin_can_see_the_setting_worked(tmp_path, upstream):
+    """Silently dropping it would make a typo in the config invisible.
+
+    "I excluded it and it vanished" and "I excluded it and I mistyped the name" have to look
+    different, so the entry survives in the report with an explicit status.
+    """
+    scenario = Scenario(tmp_path, upstream)
+    scenario.add_jar("kept.jar", id="kept", version="1.0.0", name="Kept")
+
+    report = run_check(upstream, scenario, tmp_path, ignored_mods=["kept"])
+
+    assert [entry.mod_id for entry in report.entries] == ["kept"]
+    assert report.entries[0].status == STATUS_IGNORED
+    assert report.actionable_count == 0
+
+
+def test_an_ignored_mod_is_not_downloaded(tmp_path, upstream, monkeypatch):
+    """The exclusion has to hold for the download stage too.
+
+    Downloading is a different code path from checking, and a mod someone pinned on purpose is
+    exactly the one that must not have a new jar fetched for it.
+    """
+    scenario = Scenario(tmp_path, upstream)
+    jar = scenario.add_jar("pinned.jar", id="pinned", version="1.0.0", name="Pinned")
+    upstream.add_project(
+        FakeProject(
+            id="proj-pinned",
+            slug="pinned",
+            title="Pinned",
+            versions=[
+                _version("proj-pinned", "p-1", "1.0.0", jar.sha1),
+                _version("proj-pinned", "p-2", "2.0.0", "c" * 40, date="2026-02-01T00:00:00Z",
+                         filename="pinned-2.0.0.jar"),
+            ],
+        )
+    )
+
+    report = run_check(upstream, scenario, tmp_path, ignored_mods=["pinned"])
+
+    from mod_update_checker.downloads import classify_downloaded
+
+    assert report.updates == [], "an ignored mod was queued for download"
+    # And it is not reported as "waiting to be installed" either — it is simply out of scope.
+    moved = classify_downloaded(report.entries, tmp_path / "downloads", ledger=None)
+    assert moved == []
+
+
 def test_report_counts_and_lists(report):
     counts = report.counts()
-    assert counts[STATUS_UPDATE_AVAILABLE] == 3  # alpha, delta, epsilon
+    assert counts[STATUS_UPDATE_AVAILABLE] == 2  # alpha, epsilon
     assert counts[STATUS_UP_TO_DATE] == 1        # beta
     assert counts[STATUS_NO_COMPATIBLE_BUILD] == 2  # gamma, eta
     assert counts[STATUS_UNRESOLVED] == 3        # zeta, hud, hud-copy
     assert counts[STATUS_NOT_A_MOD] == 1
     assert counts[STATUS_IGNORED] == 1
-    assert len(report.entries) == 11
-    assert report.total_jars == 11
+    assert len(report.entries) == 10
+    assert report.total_jars == 10
     assert report.has_updates is True
-    assert report.actionable_count == 5
+    assert report.actionable_count == 4
 
 
 def test_updates_are_sorted_before_everything_else(report):
@@ -504,31 +575,6 @@ def test_per_project_fallbacks_are_only_asked_for_the_mods_that_need_them(report
     ]
 
 
-def test_curseforge_is_queried_with_its_own_batches(report, upstream):
-    assert upstream.count_path("/v1/fingerprints") == 1
-    assert upstream.count_path("/v1/mods") == 1
-    assert upstream.count_path("/v1/mods/{}/files".format(DELTA_CF_MOD_ID)) == 1
-
-
-def test_curseforge_is_skipped_entirely_without_a_key(tmp_path, upstream):
-    scenario = build_scenario(tmp_path, upstream)
-    report = run_check(upstream, scenario, tmp_path, curseforge_api_key="")
-
-    assert entry_for(report, "delta").status == STATUS_UNRESOLVED
-    assert upstream.count_path("/v1/fingerprints") == 0
-    assert "note.curseforge_no_key" in dict(report.upstream_notes)
-
-
-def test_modrinth_can_be_switched_off(tmp_path, upstream):
-    scenario = build_scenario(tmp_path, upstream)
-    report = run_check(upstream, scenario, tmp_path, use_modrinth=False)
-
-    assert upstream.count_path("/v2/version_files") == 0
-    assert "note.modrinth_disabled_by_config" in dict(report.upstream_notes)
-    # CurseForge still resolves what it can.
-    assert entry_for(report, "delta").status == STATUS_UPDATE_AVAILABLE
-
-
 def test_an_unreachable_upstream_is_reported_and_not_fatal(tmp_path, upstream):
     scenario = build_scenario(tmp_path, upstream)
     upstream.fail_all = True
@@ -540,7 +586,7 @@ def test_an_unreachable_upstream_is_reported_and_not_fatal(tmp_path, upstream):
     keys = dict(report.upstream_notes)
     assert "note.modrinth_unavailable" in keys
     # Every mod is still accounted for, and nothing claims to have an update.
-    assert len(report.entries) == 11
+    assert len(report.entries) == 10
     assert report.updates == []
 
 
@@ -758,8 +804,8 @@ def test_report_serialises_to_json(report):
     payload = json.loads(report.to_json())
 
     assert payload["server"]["mc_version"] == "26.3"
-    assert payload["counts"][STATUS_UPDATE_AVAILABLE] == 3
-    assert payload["actionable_count"] == 5
+    assert payload["counts"][STATUS_UPDATE_AVAILABLE] == 2
+    assert payload["actionable_count"] == 4
     assert payload["mods_directory"].endswith("mods")
     assert payload["duplicate_ids"] == {"hud": ["hud-copy.jar", "hud.jar"]}
 
@@ -894,41 +940,6 @@ def test_a_report_with_only_a_pending_install_is_still_worth_reporting(tmp_path,
 )
 def test_normalise_name(text, expected):
     assert normalise_name(text) == expected
-
-
-@pytest.mark.parametrize(
-    "text,expected",
-    [
-        ("2026-01-01T00:00:00Z", 1767225600.0),
-        ("2026-01-01T00:00:00.000Z", 1767225600.0),
-        ("2026-01-01T08:00:00+08:00", 1767225600.0),
-        # Different offsets for the same instant must compare equal, which is the whole point
-        # of parsing instead of comparing the strings.
-        ("2026-03-01T00:00:00Z", 1772323200.0),
-        ("", None),
-        ("not a date", None),
-        ("2026-13-45T99:99:99Z", None),
-    ],
-)
-def test_parse_timestamp(text, expected):
-    from mod_update_checker.checker import _parse_timestamp
-
-    result = _parse_timestamp(text)
-    if expected is None:
-        assert result is None
-    else:
-        assert result == expected
-
-
-def test_timestamps_with_different_offsets_compare_correctly():
-    """A lexical comparison would order these wrongly; a parsed one does not."""
-    from mod_update_checker.checker import _parse_timestamp
-
-    earlier = _parse_timestamp("2026-01-01T23:00:00-05:00")   # 2026-01-02T04:00Z
-    later = _parse_timestamp("2026-01-02T01:00:00Z")          # 2026-01-02T01:00Z
-    assert earlier > later, "the -05:00 stamp is the later instant"
-    # The raw strings would have said the opposite.
-    assert "2026-01-01T23:00:00-05:00" < "2026-01-02T01:00:00Z"
 
 
 def test_local_ahead_is_reported_as_such(tmp_path, upstream):

@@ -27,7 +27,8 @@ CATALOGUES = sorted(PACKAGE.glob("lang/*.json"))
 DYNAMIC_PREFIXES = ("status.", "matched_by.")
 
 #: Values the dynamic families are built from.
-MATCHED_BY_VALUES = ("hash", "fingerprint", "name")
+#: How an entry was tied to a project. ``fingerprint`` went with CurseForge.
+MATCHED_BY_VALUES = ("hash", "name")
 
 #: A message key used literally in the source, e.g. ``"note.declared_mc"`` or
 #: ``"command.help.list"``. Keys are matched by their leading family so that unrelated dotted

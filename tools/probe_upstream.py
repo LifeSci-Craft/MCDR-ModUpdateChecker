@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Probe the live Modrinth and CurseForge APIs and print what they actually do.
+"""Probe the live Modrinth API and print what it actually does.
 
 This started as a throwaway script to answer questions the docs do not, and it is kept
 because those questions come back every time an upstream changes something:
@@ -8,7 +8,6 @@ because those questions come back every time an upstream changes something:
 * what does ``POST /version_files/update`` return when nothing matches the filter — ``{}``, or
   the raw hash with a null version? And does an empty ``game_versions`` array mean "no filter"
   or "match nothing"?
-* does the CurseForge host really reject anonymous callers on every endpoint, or is there an
   unauthenticated path worth using?
 * is the website's own ``/api/v1/`` reachable, which would make a key unnecessary?
 
@@ -21,7 +20,7 @@ Usage::
     python tools/probe_upstream.py
 
 Needs an interpreter with ``requests`` (any MCDR environment has it). Read-only apart from one
-mod download; no API key required for the Modrinth half, while the CurseForge half exists
+mod download; no credentials are needed anywhere in it
 precisely to document what a key is needed *for*.
 """
 
@@ -178,39 +177,9 @@ def probe_modrinth() -> None:
         response.status_code, response.json()))
 
 
-def probe_curseforge() -> None:
-    """Document exactly what a key is needed for, and that there is no way around it."""
-    heading("CurseForge — is there any unauthenticated path?")
-    probes = [
-        ("api  /v1/games", "GET", "https://api.curseforge.com/v1/games", None, {}),
-        ("api  /v1/mods/238222", "GET", "https://api.curseforge.com/v1/mods/238222", None, {}),
-        ("api  /v1/mods/search?slug=jei", "GET",
-         "https://api.curseforge.com/v1/mods/search?gameId=432&slug=jei", None, {}),
-        ("api  /v1/fingerprints", "POST", "https://api.curseforge.com/v1/fingerprints",
-         {"fingerprints": [123456789]}, {}),
-        ("www  /api/v1/mods/search", "GET",
-         "https://www.curseforge.com/api/v1/mods/search?gameId=432&index=0&pageSize=3&slug=jei",
-         None, {}),
-    ]
-    for label, method, url, body, headers in probes:
-        try:
-            response = SESSION.request(method, url, json=body, headers=headers, timeout=30)
-            snippet = response.text[:150].replace("\n", " ")
-            print("  {:<32} {:<4} {}".format(label, response.status_code, snippet))
-        except requests.RequestException as error:
-            print("  {:<32} EXC  {}".format(label, error))
-    print(
-        "\n  -> every official endpoint needs a key (403, or 401 on /fingerprints), and the\n"
-        "     website's own /api/v1/ sits behind a Cloudflare challenge. There is therefore no\n"
-        "     unauthenticated CurseForge channel, which is why the plugin gates it on a key\n"
-        "     and points the admin at https://console.curseforge.com instead of failing per mod."
-    )
-
-
 def main() -> int:
     demo_headers()
     probe_modrinth()
-    probe_curseforge()
     print()
     return 0
 

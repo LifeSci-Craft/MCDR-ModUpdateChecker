@@ -13,7 +13,7 @@ import zipfile
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from mod_update_checker.fingerprint import curseforge_fingerprint, digests_of_file
+from mod_update_checker.digests import digests_of_file
 
 __all__ = [
     "fabric_metadata",
@@ -84,19 +84,14 @@ def write_plain_file(path: Path, payload: bytes = b"not a zip at all\n") -> Path
     return path
 
 
-def digests_of(path: Path) -> Tuple[str, str, int, int]:
-    """``(sha1, sha512, curseforge fingerprint, size)`` for a file on disk."""
+def digests_of(path: Path) -> Tuple[str, str, int]:
+    """``(sha1, sha512, size)`` for a file on disk."""
     with open(path, "rb") as handle:
         return digests_of_file(handle)
 
 
 def sha1_of(path: Path) -> str:
     return hashlib.sha1(path.read_bytes()).hexdigest()
-
-
-def fingerprint_of(path: Path) -> int:
-    """The CurseForge fingerprint of a file, computed independently of ``digests_of``."""
-    return curseforge_fingerprint(path.read_bytes())
 
 
 def make_mods_directory(
