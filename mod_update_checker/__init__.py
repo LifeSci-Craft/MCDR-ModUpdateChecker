@@ -18,7 +18,7 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import Any, List, Optional, Sequence, Set, Tuple
+from typing import Any, ClassVar, Dict, List, Optional, Sequence, Set, Tuple, Type
 
 from mcdreforged.api.all import (
     CommandSource,
@@ -91,12 +91,29 @@ NOTIFY_MAX_UPDATES = 15
 DOWNLOAD_LOG_LIMIT = 20
 
 
-class Config(Serializable):
-    language: str = i18n.AUTO
-    """消息语言。``auto`` = 跟随 MCDR 的 language 设置；也可写 zh_cn / en_us。"""
+class _Grouped(Serializable):
+    """A config section whose subsections are rebuilt on every construction.
 
-    enabled: bool = True
-    """总开关。关掉后只保留命令，不做任何自动检查。"""
+    MCDR materialises a nested default with ``copy.copy``, which is shallow: two ``Config``
+    objects would *share the contents* of every nested list, and appending to one would change
+    the other — and the class attribute, and therefore every config built afterwards. A
+    section that owns a list has to therefore build it again per instance.
+
+    ``_NESTED`` names the subsections to rebuild. Nothing else needs to be listed: a scalar or
+    a list declared directly on a class is already copied field-by-field.
+    """
+
+    #: Field name -> the class to construct for it.
+    _NESTED: ClassVar[Dict[str, Type[Serializable]]] = {}
+
+    def __init__(self) -> None:
+        super().__init__()
+        for name, section in type(self)._NESTED.items():
+            setattr(self, name, section())
+
+
+class ServerConfig(_Grouped):
+    """What to look at: which folder, for which loader and game version."""
 
     mods_directory: str = ""
     """mods 目录。留空 = 服务端工作目录下的 ``mods``。相对路径按服务端目录解析。"""
@@ -107,62 +124,18 @@ class Config(Serializable):
     mc_version: str = "auto"
     """Minecraft 版本。``auto`` = 从服务端输出、日志、Mod 元数据依次推断。"""
 
-    check_on_server_start: bool = True
-    """服务端启动完成后自动检查一次。"""
 
-    start_check_delay_seconds: int = 60
+class CheckConfig(_Grouped):
+    """When a check runs, and what counts as an update."""
+
+    on_server_start: bool = True
+    """服务端启动完成后自动检查一次，结果写进控制台日志。"""
+
+    start_delay_seconds: int = 60
     """开服后延迟多少秒再检查，避免和 Mod 加载抢资源。"""
 
-    check_interval_hours: int = 0
+    interval_hours: int = 0
     """定时检查间隔（小时）。``0`` = 关闭定时检查。"""
-
-    notify_on_updates_only: bool = True
-    """自动检查时只在「有需要处理的项」时才输出完整提醒，否则只留一行。"""
-
-    notify_in_game: bool = False
-    """是否在游戏内向在线管理员发 tellraw。默认关闭，避免打扰玩家。"""
-
-    notify_in_game_permission: int = 3
-    """游戏内提醒的最低 MCDR 权限等级。"""
-
-    check_on_admin_join: bool = True
-    """管理员上线时自动检查一次，并把结果发给他。"""
-
-    admin_join_permission: int = 3
-    """多少权限等级算「管理员」。MCDR 等级 3 = admin，2 = helper。"""
-
-    admin_join_max_report_age_minutes: int = 1440
-    """管理员上线时，多久以内的上次检查结果可以直接复用而不重新查。
-
-    ``0`` = 每次都重新检查。默认 24 小时：一位管理员上线时想要的是**立刻看到结论**，而不是等一次
-    完整扫描；而且几个管理员接连上线时，这个窗口能避免反复打接口。
-    想每次都重查就设为 ``0``。"""
-
-    write_report_file: bool = True
-    """把每次检查的结果写成 JSON / 文本文件，便于外部脚本或事后排查。"""
-
-    download_updates: bool = False
-    """发现更新时，自动把新版本从 Modrinth 下载到插件数据文件夹的子文件夹里。默认关闭。
-
-    只是**下载**，不会装进 ``mods/``——把没看过的 jar 直接塞进运行中的服务端，正是本插件
-    想避免的事。下载下来的文件由你自行检查后手动替换。"""
-
-    download_folder_name: str = "downloads"
-    """下载到哪个子文件夹。这里填的是**单个文件夹名，不是路径**（如 ``downloads``）。
-
-    刻意不允许填路径：这样无论如何配置都不可能写到插件数据文件夹之外，也就不可能被配置成
-    直接写进 ``server/mods``。"""
-
-    download_max_size_mb: int = 128
-    """单个文件的大小上限（MB）。超过就跳过并说明原因。"""
-
-    download_retries: int = 3
-    """下载失败后**额外**重试几次。总尝试次数 = 1 + 该值（默认 3 → 最多尝试 4 次）。
-
-    与 ``http_retries`` 同一套语义。会重试的：传输中断、5xx、空响应、超过大小限制、哈希不符
-    （传输过程中被损坏是哈希不符最常见的原因，重试是标准做法）。不会重试的：404、401/403
-    （文件不在或没权限，重试改变不了结果，反复打一个 403 只会招来封禁）、本地写盘失败。
-    设为 ``0`` 即不重试。"""
 
     include_beta: bool = False
     """是否把 beta 版本也算作「可用更新」。默认只认正式版。"""
@@ -170,25 +143,110 @@ class Config(Serializable):
     include_alpha: bool = False
     """是否把 alpha 版本也算作「可用更新」。"""
 
-    use_modrinth: bool = True
-    """启用 Modrinth 查询（不需要 API key，按文件哈希精确匹配）。"""
-
-    modrinth_api_base: str = ""
-    """Modrinth API 地址。留空 = 官方 ``https://api.modrinth.com/v2``；可改成镜像。"""
-
     ignored_mods: List[str] = []
-    """**完全不做更新检测**的 Mod。可填 mod id、jar 文件名，或去掉 ``.jar`` 的文件名，不区分大小写、
-    忽略空格与符号（``Fabric-API`` 与 ``fabricapi`` 等价）。
+    """**完全不做更新检测**的 Mod。可填 mod id、jar 文件名，或去掉 ``.jar`` 的文件名，
+    不区分大小写，忽略空格与符号（``Fabric-API`` 与 ``fabricapi`` 等价）。
 
     适合：自己写的 Mod、打算长期固定在某个版本的 Mod、明确不需要更新提醒的 Mod。
     被列出的 Mod **不会产生任何网络查询**，也不会出现在「有更新」或「已下载」列表里；
     报告中仅标注为「已忽略」，便于你确认配置确实生效了。"""
 
-    http_timeout_seconds: int = 20
+
+class ReportConfig(_Grouped):
+    """How a result reaches you. The checks below never change what is scanned."""
+
+    updates_only: bool = True
+    """自动检查时只在「有需要处理的项」时才输出完整提醒，否则只留一行。"""
+
+    on_admin_join: bool = True
+    """管理员上线时把结果单独发给他（必要时先查一次）。"""
+
+    admin_permission: int = 3
+    """多少权限等级算「管理员」，即上面那条通知的收件人。MCDR 等级 3 = admin，2 = helper。"""
+
+    reuse_report_minutes: int = 1440
+    """管理员上线时，多久以内的上次检查结果可以直接复用而不重新查。
+
+    ``0`` = 每次都重新检查。默认 24 小时：一位管理员上线时想要的是**立刻看到结论**，而不是等一次
+    完整扫描；而且几个管理员接连上线时，这个窗口能避免反复打接口。"""
+
+    in_game: bool = False
+    """发现更新时，是否在游戏内**广播**给在线管理员。默认关闭，避免打扰玩家。"""
+
+    in_game_permission: int = 3
+    """游戏内广播的最低 MCDR 权限等级。
+
+    与上面的 ``admin_permission`` 是**两件事**：那个决定「谁算管理员」，这个决定「谁能收到广播」。
+    分开是因为一个服可以既想让管理员上线时收到结果，又不想让广播打扰到所有人。"""
+
+    write_file: bool = True
+    """把每次检查的结果写成 JSON / 文本文件，便于外部脚本或事后排查。"""
+
+
+class ModrinthConfig(_Grouped):
+    enabled: bool = True
+    """是否查询 Modrinth。"""
+
+    api_base: str = ""
+    """API 地址。留空 = 官方 ``https://api.modrinth.com/v2``；可改成镜像。"""
+
+
+class SourcesConfig(_Grouped):
+    """Where updates are looked up."""
+
+    _NESTED: ClassVar[Dict[str, Type[Serializable]]] = {"modrinth": ModrinthConfig}
+
+    modrinth: ModrinthConfig = ModrinthConfig()
+
+
+class DownloadConfig(_Grouped):
+    """The optional half: fetching newer builds into the plugin's own folder.
+
+    Off by default, and it never writes to ``mods/`` — see the README.
+    """
+
+    enabled: bool = False
+    """发现更新时，自动把新版本从 Modrinth 下载到插件数据文件夹的子文件夹里。
+
+    只是**下载**，不会装进 ``mods/``——把没看过的 jar 直接塞进运行中的服务端，正是本插件
+    想避免的事。下载下来的文件由你自行检查后手动替换。"""
+
+    folder_name: str = "downloads"
+    """下载到哪个子文件夹。这里填的是**单个文件夹名，不是路径**（如 ``downloads``）。
+
+    刻意不允许填路径：这样无论如何配置都不可能写到插件数据文件夹之外，也就不可能被配置成
+    直接写进 ``server/mods``。"""
+
+    max_size_mb: int = 128
+    """单个文件的大小上限（MB）。超过就跳过并说明原因。"""
+
+    retries: int = 3
+    """下载失败后**额外**重试几次。总尝试次数 = 1 + 该值（默认 3 → 最多尝试 4 次）。
+
+    与 ``network.retries`` 同一套语义。会重试的：传输中断、5xx、空响应、超过大小限制、哈希不符
+    （传输过程中被损坏是哈希不符最常见的原因，重试是标准做法）。不会重试的：404、401/403
+    （文件不在或没权限，重试改变不了结果，反复打一个 403 只会招来封禁）、本地写盘失败。
+    设为 ``0`` 即不重试。"""
+
+
+class CacheConfig(_Grouped):
+    enabled: bool = True
+    """缓存「某个哈希属于哪个项目」，避免每次开服重复解析。"""
+
+    ttl_hours: int = 24
+    """识别缓存的有效期（小时）。``0`` = 永不过期；要彻底关闭请用 ``enabled``。"""
+
+
+class NetworkConfig(_Grouped):
+    """HTTP tuning. The defaults are deliberately conservative."""
+
+    _NESTED: ClassVar[Dict[str, Type[Serializable]]] = {"cache": CacheConfig}
+
+    timeout_seconds: int = 20
     """单次 HTTP 请求超时（秒）。"""
 
-    http_retries: int = 3
-    """失败重试次数（含 429 限流与网络错误）。"""
+    retries: int = 3
+    """单次查询失败重试次数（含 429 限流与网络错误）。"""
 
     concurrent_requests: int = 4
     """并发请求数。调大更快也更容易触发上游限流。"""
@@ -196,14 +254,53 @@ class Config(Serializable):
     requests_per_minute: int = 240
     """自限速：每分钟最多多少次请求。Modrinth 官方上限是 300，留出余量。"""
 
-    use_resolve_cache: bool = True
-    """缓存「某个哈希属于哪个项目」，避免每次开服重复解析。"""
+    cache: CacheConfig = CacheConfig()
 
-    resolve_cache_ttl_hours: int = 24
-    """识别缓存的有效期（小时）。0 表示永不过期；要彻底关闭请用 ``use_resolve_cache``。"""
+
+class Config(_Grouped):
+    """The plugin's config file.
+
+    Deliberately shallow at the top: the three settings almost everybody touches — on/off,
+    language, and who may run the command — sit at the root, and everything else is grouped by
+    the feature it belongs to. ``check`` and ``download`` in particular are separate sections,
+    because they are separate decisions: what to look for, and whether to fetch it.
+    """
+
+    _NESTED: ClassVar[Dict[str, Type[Serializable]]] = {
+        "server": ServerConfig,
+        "check": CheckConfig,
+        "report": ReportConfig,
+        "sources": SourcesConfig,
+        "download": DownloadConfig,
+        "network": NetworkConfig,
+    }
+
+    enabled: bool = True
+    """总开关。关掉后只保留命令，不做任何自动检查。"""
+
+    language: str = i18n.AUTO
+    """消息语言。``auto`` = 跟随 MCDR 的 language 设置；也可写 zh_cn / en_us。"""
 
     command_permission_level: int = 3
     """执行 ``!!modupdate`` 所需的最低 MCDR 权限等级。"""
+
+    server: ServerConfig = ServerConfig()
+    """扫描对象：目录、加载器、游戏版本。"""
+
+    check: CheckConfig = CheckConfig()
+    """更新检测：什么时候查、什么算更新、哪些 Mod 不查。"""
+
+    report: ReportConfig = ReportConfig()
+    """结果怎么送到你手上：控制台、报告文件、游戏内通知。"""
+
+    sources: SourcesConfig = SourcesConfig()
+    """去哪里查更新（目前只有 Modrinth）。"""
+
+    download: DownloadConfig = DownloadConfig()
+    """可选：把新版本下载到插件自己的文件夹（默认关闭，且从不写入 mods/）。"""
+
+    network: NetworkConfig = NetworkConfig()
+    """HTTP 超时、重试、并发与限速、识别缓存。"""
 
 
 # --------------------------------------------------------------------------------------
@@ -240,6 +337,63 @@ def _config_path(server: PluginServerInterface) -> str:
     return os.path.join(server.get_data_folder(), CONFIG_FILE_NAME)
 
 
+#: Where each option used to live, before the config was grouped into sections. Kept so an
+#: admin who already had a config file can be told what happened to it, rather than watching
+#: their settings quietly revert.
+#:
+#: This matters because MCDR says nothing about keys it does not recognise: it accepts them,
+#: loads the defaults for everything else, and rewrites the file without them. From the
+#: outside that is indistinguishable from the config having been reset for no reason.
+_LEGACY_FLAT_OPTIONS: Dict[str, str] = {
+    "mods_directory": "server.mods_directory",
+    "loader": "server.loader",
+    "mc_version": "server.mc_version",
+    "check_on_server_start": "check.on_server_start",
+    "start_check_delay_seconds": "check.start_delay_seconds",
+    "check_interval_hours": "check.interval_hours",
+    "include_beta": "check.include_beta",
+    "include_alpha": "check.include_alpha",
+    "ignored_mods": "check.ignored_mods",
+    "notify_on_updates_only": "report.updates_only",
+    "check_on_admin_join": "report.on_admin_join",
+    "admin_join_permission": "report.admin_permission",
+    "admin_join_max_report_age_minutes": "report.reuse_report_minutes",
+    "notify_in_game": "report.in_game",
+    "notify_in_game_permission": "report.in_game_permission",
+    "write_report_file": "report.write_file",
+    "use_modrinth": "sources.modrinth.enabled",
+    "modrinth_api_base": "sources.modrinth.api_base",
+    "download_updates": "download.enabled",
+    "download_folder_name": "download.folder_name",
+    "download_max_size_mb": "download.max_size_mb",
+    "download_retries": "download.retries",
+    "http_timeout_seconds": "network.timeout_seconds",
+    "http_retries": "network.retries",
+    "concurrent_requests": "network.concurrent_requests",
+    "requests_per_minute": "network.requests_per_minute",
+    "use_resolve_cache": "network.cache.enabled",
+    "resolve_cache_ttl_hours": "network.cache.ttl_hours",
+}
+
+
+def _warn_about_flat_legacy_options(
+    server: PluginServerInterface, raw: Dict[str, Any]
+) -> None:
+    """Say so if the file still uses the old flat option names.
+
+    Only a warning: the file is left alone and MCDR regenerates it in the new shape, so the
+    plugin still starts. The point is that the admin is told which options moved where, instead
+    of finding that their settings appear to have been forgotten.
+    """
+    found = [name for name in _LEGACY_FLAT_OPTIONS if name in raw]
+    if not found:
+        return
+    moves = ", ".join(
+        "{} -> {}".format(name, _LEGACY_FLAT_OPTIONS[name]) for name in sorted(found)
+    )
+    server.logger.warning(tr("console.config_flat_legacy", count=len(found), moves=moves))
+
+
 def _load_config(server: PluginServerInterface) -> Config:
     """Load the config, keeping a backup if the file had to be rebuilt.
 
@@ -254,6 +408,7 @@ def _load_config(server: PluginServerInterface) -> Config:
                 raw = json.load(handle)
             if not isinstance(raw, dict):
                 raise ValueError("config root must be a JSON object")
+            _warn_about_flat_legacy_options(server, raw)
         except (OSError, ValueError) as error:
             backup = "{}.broken.{}".format(path, time.strftime("%Y%m%d-%H%M%S"))
             try:
@@ -291,24 +446,24 @@ def _check_options(config: Config, mc_version: Optional[str], loader: str) -> Ch
     return CheckOptions(
         loader=loader,
         mc_version=mc_version,
-        include_beta=config.include_beta,
-        include_alpha=config.include_alpha,
-        use_modrinth=config.use_modrinth,
-        modrinth_base=config.modrinth_api_base,
-        ignored_mods=list(config.ignored_mods),
-        timeout=max(1.0, float(config.http_timeout_seconds)),
-        retries=max(0, int(config.http_retries)),
-        workers=max(1, int(config.concurrent_requests)),
-        requests_per_minute=max(0, int(config.requests_per_minute)),
-        use_cache=bool(config.use_resolve_cache),
-        cache_ttl_hours=max(0.0, float(config.resolve_cache_ttl_hours)),
+        include_beta=config.check.include_beta,
+        include_alpha=config.check.include_alpha,
+        use_modrinth=config.sources.modrinth.enabled,
+        modrinth_base=config.sources.modrinth.api_base,
+        ignored_mods=list(config.check.ignored_mods),
+        timeout=max(1.0, float(config.network.timeout_seconds)),
+        retries=max(0, int(config.network.retries)),
+        workers=max(1, int(config.network.concurrent_requests)),
+        requests_per_minute=max(0, int(config.network.requests_per_minute)),
+        use_cache=bool(config.network.cache.enabled),
+        cache_ttl_hours=max(0.0, float(config.network.cache.ttl_hours)),
     )
 
 
 def _scan_current(server: PluginServerInterface, config: Config) -> Tuple[ScanResult, Any]:
     """Scan the mods folder and resolve the server context. Reads only."""
     working_directory = _working_directory(server)
-    directory = resolve_mods_directory(working_directory, config.mods_directory)
+    directory = resolve_mods_directory(working_directory, config.server.mods_directory)
     scan = scan_mods(directory, logger=server.logger)
 
     information_version = None
@@ -319,8 +474,8 @@ def _scan_current(server: PluginServerInterface, config: Config) -> Tuple[ScanRe
 
     context = detect_server_context(
         working_directory=working_directory,
-        configured_version=config.mc_version,
-        configured_loader=config.loader,
+        configured_version=config.server.mc_version,
+        configured_loader=config.server.loader,
         server_information_version=information_version,
         scan=scan,
     )
@@ -378,7 +533,7 @@ def _run_check(
         # explicit at the boundary rather than left to whatever the join returned.
         cache_path = (
             Path(server.get_data_folder()) / CACHE_FILE_NAME
-            if config.use_resolve_cache
+            if config.network.cache.enabled
             else None
         )
         report = checker.run(scan, context, cache_path=cache_path)
@@ -394,7 +549,7 @@ def _run_check(
         _notify(server, report, source=source, announce_clean=announce_clean,
                 broadcast=broadcast)
 
-        if config.write_report_file:
+        if config.report.write_file:
             _write_report_files(server, report)
         return report
     except Exception as error:  # noqa: BLE001 - a check must never take the server down
@@ -453,7 +608,7 @@ def _notify(
     if source is not None:
         _reply_lines(source, lines)
 
-    if broadcast and _config.notify_in_game and report.has_updates:
+    if broadcast and _config.report.in_game and report.has_updates:
         _notify_in_game(server, report)
 
 
@@ -469,15 +624,15 @@ def _sync_download_state(
     """
     folder, reason = resolve_download_folder(server, config)
     if folder is None:
-        if config.download_updates:
+        if config.download.enabled:
             server.logger.warning(
-                tr("download.bad_folder", name=config.download_folder_name, reason=reason)
+                tr("download.bad_folder", name=config.download.folder_name, reason=reason)
             )
         return None, None
 
     # Recorded on the report so the summary can name the folder: "ready to be installed"
     # without saying where is only half an answer.
-    if config.download_updates or folder.is_dir():
+    if config.download.enabled or folder.is_dir():
         report.download_folder = str(folder)
 
     ledger = DownloadLedger(Path(server.get_data_folder()) / DOWNLOAD_LEDGER_FILE_NAME,
@@ -503,7 +658,7 @@ def _reconcile_downloads(
     http: Optional[HttpClient] = None
     try:
         folder, ledger = _sync_download_state(server, report, config)
-        if folder is None or not config.download_updates:
+        if folder is None or not config.download.enabled:
             return
 
         waiting = report.updates
@@ -512,8 +667,8 @@ def _reconcile_downloads(
 
         options = DownloadOptions(
             folder=folder,
-            max_bytes=max(1, int(config.download_max_size_mb)) * 1024 * 1024,
-            retries=max(0, int(config.download_retries)),
+            max_bytes=max(1, int(config.download.max_size_mb)) * 1024 * 1024,
+            retries=max(0, int(config.download.retries)),
         )
         http = _make_http_client(config)
         outcomes = Downloader(http, options, logger=server.logger, ledger=ledger).run(
@@ -544,7 +699,7 @@ def resolve_download_folder(
         base = Path(server.get_data_folder())
     except Exception as error:  # noqa: BLE001 - an unusable data folder is worth reporting
         return None, "no-data-folder: {}".format(error)
-    return resolve_download_folder_path(base, config.download_folder_name)
+    return resolve_download_folder_path(base, config.download.folder_name)
 
 
 def _make_http_client(config: Config) -> HttpClient:
@@ -560,7 +715,7 @@ def _make_http_client(config: Config) -> HttpClient:
     """
     return HttpClient(
         user_agent=USER_AGENT,
-        timeout=max(30.0, float(config.http_timeout_seconds)),
+        timeout=max(30.0, float(config.network.timeout_seconds)),
         retries=0,
         logger=None,
     )
@@ -740,7 +895,7 @@ def _notify_in_game(server: PluginServerInterface, report: Report) -> None:
 
     lines = _notification_lines(report)
     permitted = _permitted_players(
-        server, sorted(_online_players), _config.notify_in_game_permission
+        server, sorted(_online_players), _config.report.in_game_permission
     )
     for name in permitted:
         _tell_player(server, name, lines)
@@ -789,14 +944,14 @@ def _admin_join_worker(server: PluginServerInterface, player: str) -> None:
         return
 
     report = _last_report
-    window_minutes = max(0, int(_config.admin_join_max_report_age_minutes))
+    window_minutes = max(0, int(_config.report.reuse_report_minutes))
     age = report.age_seconds() if report is not None else None
     reused = age is not None and 0 < age <= window_minutes * 60
 
     if not reused:
         # No broadcast here: the admin who just joined is about to get the same figures in
         # their own message, and everyone else online was told when the previous check ran.
-        fresh = _run_check(server, announce_clean=not _config.notify_on_updates_only,
+        fresh = _run_check(server, announce_clean=not _config.report.updates_only,
                            broadcast=False)
         if fresh is not None:
             report, age, reused = fresh, 0.0, False
@@ -817,12 +972,12 @@ def _admin_join_worker(server: PluginServerInterface, player: str) -> None:
 def on_player_joined(server: PluginServerInterface, player: str, info: Any) -> None:
     _online_players.add(player)
 
-    if not (_config.enabled and _config.check_on_admin_join):
+    if not (_config.enabled and _config.report.on_admin_join):
         return
 
     # The permission check is cheap and happens here; the check itself goes to its own thread,
     # because this runs on MCDR's event thread and a check reads and hashes every jar.
-    if not _permitted_players(server, [player], _config.admin_join_permission):
+    if not _permitted_players(server, [player], _config.report.admin_permission):
         return
 
     threading.Thread(
@@ -868,14 +1023,14 @@ def _start_interval_scheduler(server: PluginServerInterface) -> None:
     # silently kill interval checking until the next MCDR restart.
     _stop_event.clear()
 
-    interval_hours = max(0, int(_config.check_interval_hours))
+    interval_hours = max(0, int(_config.check.interval_hours))
     if not _config.enabled or interval_hours <= 0:
         return
 
     def loop() -> None:
         server.logger.info(tr("console.interval_enabled", hours=interval_hours))
         while not _stop_event.wait(interval_hours * 3600):
-            _run_check(server, announce_clean=not _config.notify_on_updates_only)
+            _run_check(server, announce_clean=not _config.report.updates_only)
 
     _scheduler_thread = threading.Thread(
         target=loop, name="mod_update_checker_scheduler", daemon=True
@@ -885,14 +1040,14 @@ def _start_interval_scheduler(server: PluginServerInterface) -> None:
 
 def _schedule_startup_check(server: PluginServerInterface) -> None:
     """Run one check a little while after the server finishes starting."""
-    delay = max(0, int(_config.start_check_delay_seconds))
+    delay = max(0, int(_config.check.start_delay_seconds))
     if delay:
         server.logger.info(tr("console.check_scheduled", seconds=delay))
 
     def once() -> None:
         if _stop_event.wait(delay):
             return
-        _run_check(server, announce_clean=not _config.notify_on_updates_only)
+        _run_check(server, announce_clean=not _config.report.updates_only)
 
     threading.Thread(
         target=once, name="mod_update_checker_startup_check", daemon=True
@@ -981,7 +1136,7 @@ def _show_status(source: CommandSource) -> None:
     scan, context = _scan_current(server, _config)
 
     modrinth_state = (
-        tr("command.status.enabled") if _config.use_modrinth else tr("command.status.disabled")
+        tr("command.status.enabled") if _config.sources.modrinth.enabled else tr("command.status.disabled")
     )
     parts = RTextList(
         _title_line(server),
@@ -1003,13 +1158,13 @@ def _show_status(source: CommandSource) -> None:
                tr("command.status.upstream", modrinth=modrinth_state),
                RColor.white),
     )
-    if _config.ignored_mods:
+    if _config.check.ignored_mods:
         parts.append("\n")
         parts.append(
             _field(
                 tr("command.status.ignored_label"),
-                tr("command.status.ignored", count=len(_config.ignored_mods),
-                   names=", ".join(_config.ignored_mods[:8])),
+                tr("command.status.ignored", count=len(_config.check.ignored_mods),
+                   names=", ".join(_config.check.ignored_mods[:8])),
                 RColor.white,
             )
         )
@@ -1031,9 +1186,9 @@ def _show_status(source: CommandSource) -> None:
         _field(
             tr("command.status.scheduling_label"),
             tr("command.status.scheduling",
-               on_start=tr("command.status.yes") if _config.check_on_server_start
+               on_start=tr("command.status.yes") if _config.check.on_server_start
                else tr("command.status.no"),
-               hours=_config.check_interval_hours),
+               hours=_config.check.interval_hours),
             RColor.white,
         )
     )
@@ -1260,7 +1415,7 @@ def on_load(server: PluginServerInterface, prev_module: Any) -> None:
     # on its own thread.
     try:
         directory = resolve_mods_directory(
-            _working_directory(server), _config.mods_directory
+            _working_directory(server), _config.server.mods_directory
         )
         if not os.path.isdir(directory):
             server.logger.warning(
@@ -1274,9 +1429,9 @@ def on_load(server: PluginServerInterface, prev_module: Any) -> None:
     except Exception as error:  # noqa: BLE001 - a broken mods folder is not fatal
         server.logger.warning("could not inspect the mods folder: {}".format(error))
 
-    if _config.ignored_mods:
-        server.logger.info(tr("console.ignored_mods", count=len(_config.ignored_mods),
-                              names=", ".join(_config.ignored_mods[:8])))
+    if _config.check.ignored_mods:
+        server.logger.info(tr("console.ignored_mods", count=len(_config.check.ignored_mods),
+                              names=", ".join(_config.check.ignored_mods[:8])))
 
     _log_cache_summary(server, _config)
 
@@ -1290,7 +1445,7 @@ def _log_cache_summary(server: PluginServerInterface, config: Config) -> None:
     about 40 mods again" and "the plugin remembered", and an admin chasing a slow check
     wants to know which it is without reading the config.
     """
-    if not config.use_resolve_cache:
+    if not config.network.cache.enabled:
         return
     path = os.path.join(server.get_data_folder(), CACHE_FILE_NAME)
     if not os.path.isfile(path):
@@ -1310,7 +1465,7 @@ def on_unload(server: PluginServerInterface) -> None:
 
 
 def on_server_startup(server: PluginServerInterface) -> None:
-    if _config.enabled and _config.check_on_server_start:
+    if _config.enabled and _config.check.on_server_start:
         _schedule_startup_check(server)
 
 

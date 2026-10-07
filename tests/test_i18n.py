@@ -19,6 +19,7 @@ import pytest
 
 from mod_update_checker import i18n
 from mod_update_checker.report import ALL_STATUSES
+from support import option_paths
 
 PACKAGE = Path(__file__).resolve().parent.parent / "mod_update_checker"
 CATALOGUES = sorted(PACKAGE.glob("lang/*.json"))
@@ -54,11 +55,26 @@ def languages() -> list:
     return [path.stem for path in CATALOGUES]
 
 
+def config_option_paths() -> set:
+    """The config's option paths, which the scanner must not mistake for message keys.
+
+    The two namespaces overlap in spelling: ``check.ignored_mods`` is a config path, and
+    ``check.in_game_header`` is a message key, and both start with a segment that looks like a
+    key family. Listing the real paths is how the scanner tells them apart — a rule about
+    spelling would either miss keys or invent them.
+    """
+    import mod_update_checker as plugin
+
+    return option_paths(plugin.Config)
+
+
 def keys_referenced_in_code() -> set:
     found = set()
     for path in PACKAGE.glob("*.py"):
         found.update(_KEY_IN_CODE.findall(path.read_text(encoding="utf-8")))
-    return found
+    # ``_LEGACY_FLAT_OPTIONS`` maps the old flat option names onto their new paths, so the
+    # source is full of dotted config strings that were never message keys.
+    return found - config_option_paths()
 
 
 def test_both_catalogues_ship():

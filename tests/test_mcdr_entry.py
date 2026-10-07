@@ -168,12 +168,8 @@ def test_the_stop_event_is_cleared_before_a_new_scheduler_starts(tmp_path, monke
     """
     import mod_update_checker as plugin
 
-    class _Config:
-        enabled = True
-        check_interval_hours = 1
-        notify_on_updates_only = True
-
-    monkeypatch.setattr(plugin, "_config", _Config(), raising=False)
+    monkeypatch.setattr(plugin, "_config", _config_with({"check.interval_hours": 1}),
+                        raising=False)
     plugin._stop_scheduler()            # leaves _stop_event set, exactly as a reload does
     assert plugin._stop_event.is_set()
 
@@ -193,12 +189,7 @@ def test_the_stop_event_is_cleared_before_a_new_scheduler_starts(tmp_path, monke
 def test_no_scheduler_thread_when_the_interval_is_zero(tmp_path, monkeypatch):
     import mod_update_checker as plugin
 
-    class _Config:
-        enabled = True
-        check_interval_hours = 0
-        notify_on_updates_only = True
-
-    monkeypatch.setattr(plugin, "_config", _Config(), raising=False)
+    monkeypatch.setattr(plugin, "_config", _config_with(), raising=False)
     plugin._scheduler_thread = None
     plugin._start_interval_scheduler(_FakeServer(tmp_path))
     assert plugin._scheduler_thread is None
@@ -271,29 +262,124 @@ def test_config_defaults_are_the_documented_ones():
     import mod_update_checker as plugin
 
     config = plugin.Config.get_default()
-    assert config.modrinth_api_base == ""          # official endpoint
-    assert config.use_modrinth is True
-    assert config.mc_version == "auto"
-    assert config.loader == "fabric"
+
+    # The three at the root, deliberately not buried in a section.
+    assert config.enabled is True
     assert config.language == "auto"
-    assert config.mods_directory == ""
-    assert config.check_on_server_start is True
-    assert config.check_interval_hours == 0        # no surprise periodic load
-    assert config.notify_in_game is False          # never broadcast to players by default
-    assert config.notify_on_updates_only is True
     assert config.command_permission_level == 3
-    assert config.use_resolve_cache is True          # and therefore must work for a user
-    assert config.requests_per_minute == 240         # under Modrinth's documented 300/min
+
+    assert config.server.mods_directory == ""
+    assert config.server.loader == "fabric"
+    assert config.server.mc_version == "auto"
+
+    assert config.check.on_server_start is True
+    assert config.check.interval_hours == 0        # no surprise periodic load
+    assert config.check.include_beta is False      # release builds only, by default
+    assert config.check.include_alpha is False
+    assert config.check.ignored_mods == []
+
+    assert config.report.updates_only is True
+    assert config.report.in_game is False          # never broadcast to players by default
+    assert config.report.write_file is True
+
+    assert config.sources.modrinth.enabled is True
+    assert config.sources.modrinth.api_base == ""   # official endpoint
+
     # The auto-download feature writes files, so "off unless asked for" is part of the
     # contract rather than a preference.
-    assert config.download_updates is False
-    assert config.download_folder_name == "downloads"
-    assert config.download_max_size_mb == 128
-    # Extra attempts after the first, matching the ``http_retries`` convention.
-    assert config.download_retries == 3
+    assert config.download.enabled is False
+    assert config.download.folder_name == "downloads"
+    assert config.download.max_size_mb == 128
+    # Extra attempts after the first, matching the ``network.retries`` convention.
+    assert config.download.retries == 3
+
+    assert config.network.timeout_seconds == 20
+    assert config.network.cache.enabled is True      # and therefore must work for a user
+    assert config.network.requests_per_minute == 240  # under Modrinth's documented 300/min
+
     # A day, not half an hour: an admin logging in wants the answer, and the answer from
     # yesterday is still the answer unless something has been installed since.
-    assert config.admin_join_max_report_age_minutes == 1440
+    assert config.report.reuse_report_minutes == 1440
+
+    # The two permission thresholds are deliberately separate settings rather than one shared
+    # value: one decides who counts as an admin, the other who may receive a broadcast. A refactor
+    # that merges them would still pass every other assertion here.
+    assert config.report.admin_permission == 3
+    assert config.report.in_game_permission == 3
+
+
+def _write_config(server, payload):
+    """Put ``payload`` where the plugin will look for its config file."""
+    import mod_update_checker as plugin
+
+    path = Path(server.get_data_folder()) / plugin.CONFIG_FILE_NAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def test_a_config_file_still_using_the_flat_option_names_is_reported(tmp_path):
+    """MCDR drops keys it does not recognise without saying so, so this has to be said here.
+
+    An admin who already has a config file keeps it; every option in it is then read as absent,
+    defaults are substituted, and the file is rewritten in the new shape. Without this warning
+    the only symptom is settings that appear to have been forgotten for no reason — which looks
+    like a bug in the plugin rather than a renamed option.
+    """
+    import mod_update_checker as plugin
+
+    server = _FakeServer(tmp_path)
+    _write_config(server, {"ignored_mods": ["pinned"], "download_updates": True})
+
+    config = plugin._load_config(server)
+
+    joined = "\n".join(server.logger.messages)
+    assert "WARN" in joined, joined
+    # The message has to name the move, or the admin cannot act on it.
+    assert "ignored_mods -> check.ignored_mods" in joined, joined
+    assert "download_updates -> download.enabled" in joined, joined
+    # A warning, not a failure: the plugin still comes up.
+    assert isinstance(config, plugin.Config)
+    # And nothing was archived as if the file had been corrupt.
+    assert "config_invalid" not in joined and ".broken." not in joined, joined
+
+
+def test_a_config_file_in_the_new_shape_is_not_reported(tmp_path):
+    """The warning must not fire on the file the plugin itself writes."""
+    import mod_update_checker as plugin
+
+    server = _FakeServer(tmp_path)
+    _write_config(server, {"check": {"ignored_mods": ["pinned"]}, "download": {"enabled": True}})
+
+    plugin._load_config(server)
+
+    joined = "\n".join(server.logger.messages)
+    assert "WARN" not in joined, joined
+
+
+def test_two_default_configs_do_not_share_their_nested_state():
+    """Two ``Config`` objects must not share the contents of a section.
+
+    MCDR builds a nested default with ``copy.copy``, which is shallow, so two instances would
+    share the same list object — and appending to one would change the other, the class
+    attribute, and every config built afterwards. The plugin rebuilds each section per
+    instance to prevent that; this is the assertion that notices if a new section is added
+    without going through the same path.
+    """
+    import mod_update_checker as plugin
+
+    first = plugin.Config.get_default()
+    second = plugin.Config.get_default()
+
+    first.check.ignored_mods.append("sodium")
+    assert second.check.ignored_mods == [], "the two configs share one ignored_mods list"
+    assert plugin.CheckConfig.ignored_mods == [], "the class attribute itself was mutated"
+
+    # Same question one level deeper, where the section-of-a-section lives.
+    assert first.sources.modrinth is not second.sources.modrinth
+    assert first.network.cache is not second.network.cache
+    first.network.cache.ttl_hours = 1
+    assert second.network.cache.ttl_hours == 24
 
 
 def test_the_end_to_end_run_uses_the_shipped_defaults():
@@ -322,54 +408,61 @@ def test_the_end_to_end_run_uses_the_shipped_defaults():
 
     config = tool.plugin_config(_Upstream())
 
-    assert set(config) == set(tool.CONFIG_OVERRIDES), (
-        "the matrix config drifted from its declared overrides:\n"
+    # Every option the tool sets, as a dotted path — the config file groups its options into
+    # sections, so comparing sets of paths is the only way to ask this question of both shapes.
+    from support import flatten_options, option_paths
+
+    overridden = flatten_options(config)
+
+    assert set(tool.CONFIG_OVERRIDES) == set(overridden), (
+        "the matrix config drifted from its declared overrides://n"
         "  extra: {}\n  missing: {}".format(
-            sorted(set(config) - set(tool.CONFIG_OVERRIDES)),
-            sorted(set(tool.CONFIG_OVERRIDES) - set(config)),
+            sorted(set(overridden) - set(tool.CONFIG_OVERRIDES)),
+            sorted(set(tool.CONFIG_OVERRIDES) - set(overridden)),
         )
     )
 
-    # The keys whose defaults must be in force, i.e. absent from the override dict. These are
-    # the ones that decide whether a code path runs at all.
+    # The options whose defaults must be in force, i.e. absent from the override dict. These
+    # are the ones that decide whether a code path runs at all.
     for key in (
-        "use_resolve_cache",   # the crash that hid here
+        "network.cache.enabled",   # the crash that hid here
         "enabled",
-        "write_report_file",
-        "notify_on_updates_only",
-        "loader",
+        "report.write_file",
+        "report.updates_only",
+        "server.loader",
         "language",
-        "mc_version",
-        "mods_directory",
-        "check_on_server_start",
+        "server.mc_version",
+        "server.mods_directory",
+        "check.on_server_start",
         # Where files are written must stay at the shipped value: pointing the run at some
         # other folder would leave the download assertions looking at an empty directory and
         # quietly passing.
-        "download_folder_name",
-        "download_max_size_mb",
+        "download.folder_name",
+        "download.max_size_mb",
         # And so must the retry budget, so the matrix keeps exercising the number a user gets.
-        "download_retries",
+        "download.retries",
     ):
-        assert key not in config, (
+        assert key not in overridden, (
             "{} must stay at its shipped default in the end-to-end run, otherwise the "
             "behaviour a user gets is never exercised".format(key)
         )
 
-    # ``notify_in_game`` is the one exception, and a deliberate one: its default is off, and
-    # off means the tellraw path never executes. That path builds a command out of mod names
-    # and sends it with ``server.execute``, so it is worth running. The override is declared
-    # above, and the run asserts the payload is valid JSON addressed to the right player.
-    assert config["notify_in_game"] is True
+    # ``report.in_game`` is the one exception, and a deliberate one: its default is off, and
+    # off means the in-game notification path never executes. That path builds a message out of
+    # mod names, so it is worth running. The override is declared above, and the run asserts
+    # the payload is valid JSON addressed to the right player.
+    assert overridden["report.in_game"] is True
 
-    # ``download_updates`` is off by default for the same reason, and switched on here because
+    # ``download.enabled`` is off by default for the same reason, and switched on here because
     # it is the only feature that writes files — the last one to leave to unit tests alone.
-    assert config["download_updates"] is True
+    assert overridden["download.enabled"] is True
 
-    # And every override has to be one the plugin's own config class knows about, so a typo
-    # cannot silently become a no-op.
+    # And every override has to name an option the plugin actually has, so a typo cannot
+    # silently become a no-op. Walked off the class structure rather than a hand-kept list, so a
+    # renamed section fails here instead of passing by accident.
     import mod_update_checker as plugin
 
-    known = set(plugin.Config.get_field_annotations())
+    known = option_paths(plugin.Config)
     unknown = set(tool.CONFIG_OVERRIDES) - known
     assert not unknown, "overrides for options that do not exist: {}".format(sorted(unknown))
 
@@ -424,17 +517,14 @@ def entry_env(tmp_path, monkeypatch):
     """The plugin module wired to a fake server, with a recording check function."""
     import mod_update_checker as plugin
 
-    class _Config:
-        enabled = True
-        check_on_admin_join = True
-        admin_join_permission = 3
-        admin_join_max_report_age_minutes = 30
-        notify_on_updates_only = True
-        notify_in_game = True
-        notify_in_game_permission = 3
-        start_check_delay_seconds = 60
-
-    monkeypatch.setattr(plugin, "_config", _Config(), raising=False)
+    # Only two departures from the shipped defaults here; everything else this fixture used to
+    # spell out was already the default, and saying so twice is how a stub drifts.
+    monkeypatch.setattr(
+        plugin,
+        "_config",
+        _config_with({"report.in_game": True, "report.reuse_report_minutes": 30}),
+        raising=False,
+    )
     plugin._stop_event.clear()
     plugin._online_players.clear()
     monkeypatch.setattr(plugin, "_last_report", None, raising=False)
@@ -492,7 +582,7 @@ def test_a_stale_report_triggers_a_fresh_check(entry_env):
 def test_the_window_can_be_switched_off(entry_env, monkeypatch):
     """``0`` means "always re-check", which is the literal reading of the feature."""
     plugin, server, calls = entry_env
-    monkeypatch.setattr(plugin._config, "admin_join_max_report_age_minutes", 0)
+    monkeypatch.setattr(plugin._config.report, "reuse_report_minutes", 0)
     plugin._last_report = _report(updates=1, age_seconds=1)
 
     plugin._admin_join_worker(server, "Admin")
@@ -537,7 +627,7 @@ def test_an_unknown_player_does_not_raise(entry_env):
 
 def test_the_feature_can_be_switched_off(entry_env, monkeypatch):
     plugin, server, calls = entry_env
-    monkeypatch.setattr(plugin._config, "check_on_admin_join", False)
+    monkeypatch.setattr(plugin._config.report, "on_admin_join", False)
 
     plugin.on_player_joined(server, "Admin", None)
 
@@ -635,7 +725,7 @@ def test_broadcast_and_join_use_their_own_permission_settings(entry_env, monkeyp
     """The two thresholds mean different things and must not be folded into one."""
     plugin, server, _calls = entry_env
     plugin._online_players.update({"Admin", "Helper"})
-    monkeypatch.setattr(plugin._config, "notify_in_game_permission", 4)
+    monkeypatch.setattr(plugin._config.report, "in_game_permission", 4)
 
     plugin._notify_in_game(server, _report(updates=1))
 
@@ -676,7 +766,7 @@ def test_the_download_folder_cannot_be_aimed_outside_the_plugin(tmp_path, name):
 
     server = _FakeServer(tmp_path)
     config = plugin.Config.get_default()
-    config.download_folder_name = name
+    config.download.folder_name = name
 
     folder, reason = plugin.resolve_download_folder(server, config)
 
@@ -735,7 +825,7 @@ def test_download_state_is_read_even_with_downloading_switched_off(tmp_path):
 
     server = _FakeServer(tmp_path)
     config = plugin.Config.get_default()
-    assert config.download_updates is False
+    assert config.download.enabled is False
     entry = _downloaded_entry(tmp_path)
 
     plugin._sync_download_state(server, _report_with([entry]), config)
@@ -792,7 +882,7 @@ def test_nothing_is_fetched_when_the_feature_is_off(tmp_path, monkeypatch):
 
     server = _FakeServer(tmp_path)
     config = plugin.Config.get_default()
-    assert config.download_updates is False
+    assert config.download.enabled is False
     entry = _entry_with_update()
 
     def explode(*_args, **_kwargs):
@@ -829,7 +919,7 @@ def test_a_broken_download_stage_does_not_fail_the_check(tmp_path):
 
     server = _FakeServer(tmp_path)
     config = plugin.Config.get_default()
-    config.download_updates = True
+    config.download.enabled = True
     # No data folder available is the cheapest way to make the stage throw from the inside.
     server.get_data_folder = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
 
@@ -931,6 +1021,28 @@ def test_the_console_path_logs_plain_strings():
 # --------------------------------------------------------------------------------------
 
 
+def _config_with(overrides=None):
+    """The shipped config with specific options replaced. Keys are dotted paths.
+
+    Built from the real ``Config`` rather than hand-written. A stub that mirrors four fields of
+    the config has to be updated whenever the config changes, and the time it is not updated is
+    the time the test quietly stops exercising the real object — which is the failure mode this
+    whole suite exists to catch. ``check.interval_hours`` rather than ``check_interval_hours``,
+    because the config file groups its options into sections and the tests should speak the
+    same language as the file.
+    """
+    import mod_update_checker as plugin
+
+    config = plugin.Config.get_default()
+    for path, value in (overrides or {}).items():
+        parts = path.split(".")
+        target = config
+        for name in parts[:-1]:
+            target = getattr(target, name)
+        setattr(target, parts[-1], value)
+    return config
+
+
 class _ReplyRecorder:
     """A command source that keeps whatever the command replied with."""
 
@@ -945,18 +1057,13 @@ def _render_help(prefix, language="zh_cn"):
     import mod_update_checker as plugin
 
     previous = plugin._config
-    plugin._apply_language(None, _LanguageConfig(language))
+    plugin._apply_language(None, _config_with({"language": language}))
     try:
         source = _ReplyRecorder()
         plugin._show_help(source, prefix)
         return source.replies
     finally:
         plugin._config = previous
-
-
-class _LanguageConfig:
-    def __init__(self, language):
-        self.language = language
 
 
 def test_help_is_one_rich_message_rather_than_a_line_per_reply():
@@ -1092,18 +1199,11 @@ def test_the_status_screen_uses_the_same_title_bar_as_the_help():
         mods = []
         disabled = []
 
-    class _Config:
-        language = "zh_cn"
-        use_modrinth = True
-        ignored_mods = []
-        check_on_server_start = True
-        check_interval_hours = 0
-        command_permission_level = 3
-
+    config = _config_with({"language": "zh_cn"})
     previous_config, previous_scan, previous_server = plugin._config, plugin._scan_current, plugin._server
     try:
-        plugin._config = _Config()
-        plugin._apply_language(None, _Config())
+        plugin._config = config
+        plugin._apply_language(None, config)
         plugin._scan_current = lambda *_a: (
             _Scan(),
             __import__(

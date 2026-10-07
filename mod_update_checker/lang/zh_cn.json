@@ -2,7 +2,7 @@
   "language.unsupported": "[Mod Update Checker] 不认识的语言 \"{value}\"，已回退到 {fallback}。可选：{options}",
   "help.modupdate": "检查服务端 Mod 是否有新版本：汇总 / 立即检查 / 列表 / 状态 / 重载配置",
   "console.loaded": "[Mod Update Checker] 已加载，在 {directory} 找到 {count} 个 jar",
-  "console.no_mods_directory": "[Mod Update Checker] 找不到 mods 目录：{directory}；如果它在别处，请修改配置里的 \"mods_directory\"",
+  "console.no_mods_directory": "[Mod 更新检查] {directory} 下没有 mods 目录；如果它在别处，请设置配置里的 \"server.mods_directory\"",
   "console.interval_enabled": "[Mod Update Checker] 已开启定时检查，每 {hours} 小时一次",
   "console.check_scheduled": "[Mod Update Checker] 将在 {seconds} 秒后检查 Mod 更新",
   "console.config_reloaded": "[Mod Update Checker] 配置已重载",
@@ -110,5 +110,6 @@
   "command.status.last_report": "{when}（{actionable} 项需要处理）",
   "command.status.never_checked": "从未",
   "command.status.scheduling_label": "自动检查: ",
-  "command.status.scheduling": "开服后 {on_start}，每 {hours} 小时一次"
+  "command.status.scheduling": "开服后 {on_start}，每 {hours} 小时一次",
+  "console.config_flat_legacy": "[Mod 更新检查] 配置文件里有 {count} 个旧版选项名，它们不会被读取（设置 -> 新位置：{moves}）。配置文件已按新结构重新生成，请把仍然需要的值填回去。"
 }

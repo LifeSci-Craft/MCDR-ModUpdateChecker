@@ -13,14 +13,14 @@ import zipfile
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from mod_update_checker.digests import digests_of_file
-
 __all__ = [
     "fabric_metadata",
     "write_jar",
     "write_plain_file",
     "digests_of",
     "make_mods_directory",
+    "flatten_options",
+    "option_paths",
 ]
 
 DEFAULT_FABRIC: Dict[str, Any] = {
@@ -86,6 +86,12 @@ def write_plain_file(path: Path, payload: bytes = b"not a zip at all\n") -> Path
 
 def digests_of(path: Path) -> Tuple[str, str, int]:
     """``(sha1, sha512, size)`` for a file on disk."""
+    # Imported here rather than at module level: importing any ``mod_update_checker`` submodule
+    # runs the package ``__init__``, which imports MCDR. That would make this module — and the
+    # plain dict helpers in it — unusable from ``tools/mcdr_matrix.py``, which runs on an
+    # interpreter with no MCDR installed.
+    from mod_update_checker.digests import digests_of_file
+
     with open(path, "rb") as handle:
         return digests_of_file(handle)
 
@@ -104,3 +110,43 @@ def make_mods_directory(
     for file_name, metadata in jars:
         written.append(write_jar(directory / file_name, fabric=metadata))
     return written
+
+
+def flatten_options(mapping: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
+    """Expand a nested config into ``{"section.option": value}``.
+
+    The config file groups options into sections (``check``, ``download``, …), so talking about
+    "every option" — or about which ones a test has overridden — means talking about dotted
+    paths rather than top-level names. A value that is itself a dict is a section; everything
+    else is an option.
+
+    Deliberately free of any MCDR import, so the cross-version matrix tool can use it too: that
+    tool runs on an interpreter with no MCDR installed.
+    """
+    flat: Dict[str, Any] = {}
+    for name, value in mapping.items():
+        path = "{}.{}".format(prefix, name) if prefix else name
+        if isinstance(value, dict):
+            flat.update(flatten_options(value, path))
+        else:
+            flat[path] = value
+    return flat
+
+
+def option_paths(config_class) -> set:
+    """Every settable option of a config class as a dotted path, sections included.
+
+    Duck-typed on purpose: a nested section is anything that can list its own fields, so this
+    needs no MCDR import and stays usable from the tooling that runs without it.
+
+    Read off the type annotations rather than off a serialised instance, because MCDR's
+    ``serialize()`` leaves a nested section as an object rather than a plain dict — a generic
+    dict-walker would see the section names and miss every option inside them.
+    """
+    paths = set()
+    for name, annotation in config_class.get_field_annotations().items():
+        if hasattr(annotation, "get_field_annotations"):
+            paths |= {"{}.{}".format(name, child) for child in option_paths(annotation)}
+        else:
+            paths.add(name)
+    return paths

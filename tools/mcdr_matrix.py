@@ -271,53 +271,65 @@ def version_tuple(text: str):
     return tuple(parts[:3])
 
 
-#: The plugin-config keys this tool is allowed to deviate from ``Config.get_default()`` on,
-#: with the reason. Everything else must be left at its shipped default.
+#: The config options this tool is allowed to deviate from ``Config.get_default()`` on, with
+#: the reason. Everything else must be left at its shipped default.
 #:
-#: This is an allow-list rather than a free-form dict for a specific reason: an earlier
-#: version of this file set ``use_resolve_cache: False`` for convenience, which meant the
-#: cache path was never executed against a real MCDR — and that path turned out to crash on
-#: the shipped default config. Anything that switches a code path off has to be justified
-#: here, and ``tests/test_mcdr_entry.py`` fails if the dict drifts from this list.
+#: An allow-list rather than a free-form dict for a specific reason: an earlier version of this
+#: file set ``network.cache.enabled: false`` for convenience, which meant the cache path was
+#: never executed against a real MCDR — and that path turned out to crash on the shipped
+#: default config. Anything that switches a code path off has to be justified here, and
+#: ``tests/test_mcdr_entry.py`` fails if the dict below drifts from this list.
+#:
+#: Dotted paths, because the config file groups its options into sections. The same paths are
+#: used to validate the dict, so a typo here cannot turn into a silent no-op.
 CONFIG_OVERRIDES = (
     # The fake upstream is not reachable at the real URLs.
-    "modrinth_api_base",
+    "sources.modrinth.api_base",
     # Waiting the shipped 60 seconds would make every job three times as long.
-    "start_check_delay_seconds",
+    "check.start_delay_seconds",
     # A test must not sit in the self-imposed rate limiter, and the retry path is covered by
     # its own unit test.
-    "requests_per_minute",
-    "http_retries",
-    # The shipped default is off, and off means the tellraw path never executes. It builds a
-    # command out of arbitrary mod names and sends it with ``server.execute``, so it is worth
-    # running rather than trusting — the fake server echoes the command back and the run
-    # asserts the payload is valid JSON.
-    "notify_in_game",
+    "network.requests_per_minute",
+    "network.retries",
+    # The shipped default is off, and off means the in-game notification path never executes.
+    # It builds a message out of arbitrary mod names, so it is worth running rather than
+    # trusting — the fake server echoes the command back and the run asserts the payload is
+    # valid JSON addressed to the right player.
+    "report.in_game",
     # Off by default too. Turned on here because it is the only feature that writes files, and
     # therefore the last one to leave to unit tests: this run proves against a real MCDR that
     # a verified file lands, that a tampered one is refused, and that nothing is written
     # outside the plugin's own folder.
-    "download_updates",
+    "download.enabled",
     # Not off, but a non-default *value*: this is how the run proves that a mod the admin
     # excluded is genuinely left alone. The scenario plants one with a newer build upstream,
     # so if the exclusion were ignored it would show up as an update.
-    "ignored_mods",
+    "check.ignored_mods",
 )
 
 
 def plugin_config(upstream) -> dict:
-    """The config for one MCDR instance: the shipped defaults, plus the allow-list."""
+    """The config for one MCDR instance: the shipped defaults, plus the allow-list.
+
+    Shaped like the file the plugin actually ships — grouped into sections — so what the run
+    exercises is the structure a user edits. A section may list only the options it overrides;
+    MCDR fills the rest in from the class defaults, which is itself worth exercising, since
+    that is what happens to an admin who upgrades and keeps an older, smaller config file.
+    """
     config = {
-        "modrinth_api_base": upstream.modrinth_base,
-        "start_check_delay_seconds": 2,
-        "requests_per_minute": 0,
-        "http_retries": 0,
-        "notify_in_game": True,
-        "download_updates": True,
-        "ignored_mods": ["ignored"],
+        "sources": {"modrinth": {"api_base": upstream.modrinth_base}},
+        "check": {"start_delay_seconds": 2, "ignored_mods": ["ignored"]},
+        "network": {"requests_per_minute": 0, "retries": 0},
+        "report": {"in_game": True},
+        "download": {"enabled": True},
     }
-    unexpected = set(config) - set(CONFIG_OVERRIDES)
-    assert not unexpected, "override not declared in CONFIG_OVERRIDES: {}".format(unexpected)
+    _ensure_dependencies_importable()
+    from support import flatten_options
+
+    unexpected = set(flatten_options(config)) - set(CONFIG_OVERRIDES)
+    assert not unexpected, "override not declared in CONFIG_OVERRIDES: {}".format(
+        sorted(unexpected)
+    )
     return config
 
 

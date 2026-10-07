@@ -125,17 +125,113 @@ Fabric 服务端**没有任何原生手段**能发现 Mod 过期。加载器只�
 
 ## 配置
 
-配置文件：`config/mod_update_checker/config.json`。
+配置文件：`config/mod_update_checker/config.json`。**选项按功能分组**，所以文件读起来是一棵小树：
+顶层只有三个最常改的开关，其余各归各的章节。`check`（查什么、什么时候查）和 `download`（要不要下载）
+是两个独立的章节，因为它们是两个独立的决定。
 
-### 基本
+```jsonc
+{
+  "enabled": true,                    // 总开关
+  "language": "auto",                 // 消息语言
+  "command_permission_level": 3,      // 谁能用 !!modupdate
+
+  "server":   { /* 扫描对象：目录、加载器、游戏版本 */ },
+  "check":    { /* 更新检测：何时查、什么算更新、哪些不查 */ },
+  "report":   { /* 结果怎么送到你手上：控制台、报告文件、游戏内通知 */ },
+  "sources":  { /* 去哪里查更新（目前只有 Modrinth） */ },
+  "download": { /* 可选：把新版本下到插件自己的文件夹 */ },
+  "network":  { /* HTTP 超时、重试、并发限速、识别缓存 */ }
+}
+```
+
+下面每张表的选项名都带上章节，也就是你在文件里写的完整路径（`check.ignored_mods` 表示
+`check` 章节下的 `ignored_mods`）。
+
+### 顶层
 
 | 选项 | 默认 | 说明 |
 |---|---|---|
-| `language` | `"auto"` | `auto` 跟随 MCDR；也可写 `zh_cn` / `en_us` |
 | `enabled` | `true` | 总开关。关掉后只保留命令，不做任何自动检查 |
-| `mods_directory` | `""` | 留空 = 服务端目录下的 `mods`。相对路径按**服务端目录**解析 |
-| `loader` | `"fabric"` | `fabric` / `quilt` / `neoforge` / `forge` |
-| `mc_version` | `"auto"` | `auto` = 依次从 MCDR 输出、`logs/latest.log`、Mod 元数据推断。**推断不准时请显式填写** |
+| `language` | `"auto"` | `auto` 跟随 MCDR；也可写 `zh_cn` / `en_us` |
+| `command_permission_level` | `3` | 执行 `!!modupdate` 所需的最低 MCDR 权限等级 |
+
+### `server` —— 扫描对象
+
+| 选项 | 默认 | 说明 |
+|---|---|---|
+| `server.mods_directory` | `""` | 留空 = 服务端目录下的 `mods`。相对路径按**服务端目录**解析 |
+| `server.loader` | `"fabric"` | `fabric` / `quilt` / `neoforge` / `forge` |
+| `server.mc_version` | `"auto"` | `auto` = 依次从 MCDR 输出、`logs/latest.log`、Mod 元数据推断。**推断不准时请显式填写** |
+
+### `check` —— 更新检测
+
+| 选项 | 默认 | 说明 |
+|---|---|---|
+| `check.on_server_start` | `true` | 服务端启动完成后自动检查一次，结果写进控制台日志 |
+| `check.start_delay_seconds` | `60` | 开服后延迟多久再查，避免和 Mod 加载抢资源 |
+| `check.interval_hours` | `0` | 定时检查间隔（小时）。`0` = 关闭 |
+| `check.include_beta` | `false` | 把 beta 也算作「可用更新」 |
+| `check.include_alpha` | `false` | 把 alpha 也算作「可用更新」 |
+| `check.ignored_mods` | `[]` | **完全不做更新检测**的 Mod，见[下一节](#排除某些-mod-不检查) |
+
+### `report` —— 结果送到哪里
+
+| 选项 | 默认 | 说明 |
+|---|---|---|
+| `report.updates_only` | `true` | 自动检查时，没问题就只留一行 |
+| `report.on_admin_join` | `true` | 管理员上线时把结果单独发给他（必要时先查一次） |
+| `report.admin_permission` | `3` | 多少权限等级算「管理员」，即上面那条通知的收件人 |
+| `report.reuse_report_minutes` | `1440` | 管理员上线时，多久以内的上次结果可直接复用。`0` = 每次都重查 |
+| `report.in_game` | `false` | 发现更新时是否在游戏内**广播**给在线管理员。默认关闭，避免打扰玩家 |
+| `report.in_game_permission` | `3` | 游戏内广播的最低 MCDR 权限等级 |
+| `report.write_file` | `true` | 是否把报告落盘 |
+
+**两种游戏内通知是不同的东西**，可以分别开关：
+
+- `report.in_game` —— 每次检查发现更新时**广播**给当时在线的管理员；
+- `report.on_admin_join` —— **管理员上线时**把结果单独发给他，即使他上线时别人已经收到过。
+
+管理员上线触发的那次检查**不会**再广播一遍，否则刚进来的人会收到两份同样的内容。
+
+`report.admin_permission` 与 `report.in_game_permission` 是**两个独立的阈值**，刻意没有合并：
+前者是「谁算管理员」，后者是「谁能收到广播」。一个服完全可以既让管理员上线时收到结果、
+又不希望广播打扰到所有人。
+
+`report.reuse_report_minutes` 为什么默认 1440（24 小时）而不是 0：管理员进服时想要的是
+**立刻看到结论**，而不是等一次完整扫描。窗口给到一整天，是因为「上次检查的结果」在一天之内几乎
+总是仍然是当前答案——这期间没人装过东西的话，重查只会得到同一份报告，却要多等一次完整的 mods
+扫描、多打一轮接口。设成 `0` 就是「每次都重新检查」。
+
+### `sources` —— 去哪里查
+
+| 选项 | 默认 | 说明 |
+|---|---|---|
+| `sources.modrinth.enabled` | `true` | 是否查询 Modrinth |
+| `sources.modrinth.api_base` | `""` | 留空 = 官方 `https://api.modrinth.com/v2`；可改成镜像 |
+
+### `download` —— 自动下载（默认关闭）
+
+| 选项 | 默认 | 说明 |
+|---|---|---|
+| `download.enabled` | `false` | 总开关 |
+| `download.folder_name` | `"downloads"` | 下载到哪个子文件夹 |
+| `download.max_size_mb` | `128` | 单个文件大小上限，超过就跳过 |
+| `download.retries` | `3` | 下载失败后**额外**重试几次。总尝试 = `1 + 该值`（默认最多 4 次） |
+
+### `network` —— 超时与限速
+
+| 选项 | 默认 | 说明 |
+|---|---|---|
+| `network.timeout_seconds` | `20` | 单次请求超时 |
+| `network.retries` | `3` | 失败重试次数（含 429 限流与网络错误） |
+| `network.concurrent_requests` | `4` | 并发数。调大更快，也更容易触发上游限流 |
+| `network.requests_per_minute` | `240` | 自限速。Modrinth 官方上限 300/分钟，这里留了余量 |
+| `network.cache.enabled` | `true` | 缓存「某个哈希属于哪个项目」，避免每次开服重复解析 |
+| `network.cache.ttl_hours` | `24` | 缓存有效期。`0` = 永不过期；要彻底关闭请用上面那项 |
+
+> **从旧版升级**：选项以前是平铺在顶层的（`download_updates`、`notify_in_game` …）。如果配置文件里
+> 还有那些旧名字，**它们不会被读取**——MCDR 对认不出的键不报错也不提示，只会静默忽略并重写文件。
+> 插件会为此打一行警告，把每个旧名字对应的新路径列出来，照着重填即可。
 
 ### 已下载与待下载是两件事
 
@@ -159,16 +255,9 @@ Mod 更新检查 — 服务端 26.3 / Fabric（版本来源：server_info）
 
 那下载过的 Mod 之后又发布了更新怎么办？插件会**自动删掉已下载的旧版本，再下载新版本**（见下）。
 
-### 下载新版本（默认关闭）
+### 下载新版本怎么工作
 
-开启后，检查发现更新会把新版本**从 Modrinth 下载**到插件数据文件夹的子文件夹里：
-
-| 选项 | 默认 | 说明 |
-|---|---|---|
-| `download_updates` | `false` | 总开关 |
-| `download_folder_name` | `downloads` | 下载到哪个子文件夹 |
-| `download_max_size_mb` | `128` | 单个文件大小上限，超过就跳过 |
-| `download_retries` | `3` | 下载失败后**额外**重试几次。总尝试 = `1 + 该值`（默认最多 4 次） |
+开启 `download.enabled` 后，检查发现更新会把新版本**从 Modrinth 下载**到插件数据文件夹的子文件夹里。
 
 下载位置：`config/mod_update_checker/downloads/`，日志会给出每个文件的完整路径。
 
@@ -183,7 +272,7 @@ Mod 更新检查 — 服务端 26.3 / Fabric（版本来源：server_info）
 - **换版本时删掉旧的那份。** 下载过的版本被更新的版本取代时，插件会删掉自己下载的旧文件再下新的。
   靠一份清单记录「哪个文件是给哪个 Mod 下的」——文件名做不到这件事，新版本的文件名通常都不一样。
   而且只删**自己写的、且内容仍是自己当初写的那份**：如果你手动替换过那个文件，它不会被删。
-- **`download_folder_name` 只能填文件夹名，不能填路径。** 带 `/`、`\`、`..` 或盘符的值会被拒绝，
+- **`download.folder_name` 只能填文件夹名，不能填路径。** 带 `/`、`\`、`..` 或盘符的值会被拒绝，
   这样就不可能把它配到 `server/mods` 去。
 - **下载失败会重试。** **会重试的**：传输中断、5xx、空响应、超过大小限制、哈希不符——传输过程中被损坏
   是哈希不符最常见的原因，重试是标准做法。**不会重试的**：404、401/403（文件不在或没权限，重试改变不了
@@ -191,59 +280,6 @@ Mod 更新检查 — 服务端 26.3 / Fabric（版本来源：server_info）
   最终仍失败时，日志写「(after N attempts)」，好让你区分「链接不稳」和「文件根本不在」。
 - **下载失败不影响检查结果。** 下载在报告之后独立进行，出问题只多一行警告。
 
-### 自动检查与提醒
-
-| 选项 | 默认 | 说明 |
-|---|---|---|
-| `check_on_server_start` | `true` | 服务端启动完成后自动检查一次，结果打印到控制台日志 |
-| `start_check_delay_seconds` | `60` | 开服后延迟多久再查，避免和 Mod 加载抢资源 |
-| `check_interval_hours` | `0` | 定时检查间隔（小时）。`0` = 关闭 |
-| `notify_on_updates_only` | `true` | 自动检查时，没问题就只留一行 |
-| `notify_in_game` | `false` | 有更新时是否在游戏内**广播**给在线管理员。默认关闭，避免打扰玩家 |
-| `notify_in_game_permission` | `3` | 游戏内广播的最低 MCDR 权限等级 |
-| `check_on_admin_join` | `true` | 管理员上线时自动检查并把结果发给他 |
-| `admin_join_permission` | `3` | 多少权限等级算「管理员」。MCDR 等级 3 = admin，2 = helper |
-| `admin_join_max_report_age_minutes` | `1440` | 管理员上线时，多久以内的上次结果可直接复用。默认 24 小时。`0` = 每次都重查 |
-| `write_report_file` | `true` | 是否把报告落盘 |
-
-**两种游戏内通知是不同的东西**，可以分别开关：
-
-- `notify_in_game` —— 每次检查发现更新时**广播**给当时在线的管理员；
-- `check_on_admin_join` —— **管理员上线时**把结果单独发给他，即使他上线时别人已经收到过。
-
-管理员上线触发的那次检查**不会**再广播一遍，否则刚进来的人会收到两份同样的内容。
-
-`admin_join_max_report_age_minutes` 为什么默认 1440（24 小时）而不是 0：管理员进服时想要的是
-**立刻看到结论**，而不是等一次完整扫描。窗口给到一整天，是因为「上次检查的结果」在一天之内几乎总是
-仍然是当前答案——这期间没人装过东西的话，重查只会得到同一份报告，却要多等一次完整的 mods 扫描、
-多打一轮接口。设成 `0` 就是「每次都重新检查」。
-
-### 上游
-
-| 选项 | 默认 | 说明 |
-|---|---|---|
-| `use_modrinth` | `true` | 启用 Modrinth 查询（无需 key，按哈希精确匹配） |
-| `modrinth_api_base` | `""` | 留空 = 官方 `https://api.modrinth.com/v2`；可改成镜像 |
-| `include_beta` | `false` | 把 beta 也算作「可用更新」 |
-| `include_alpha` | `false` | 把 alpha 也算作「可用更新」 |
-| `ignored_mods` | `[]` | **完全不做更新检测**的 Mod，见下一节 |
-
-### 网络与性能
-
-| 选项 | 默认 | 说明 |
-|---|---|---|
-| `http_timeout_seconds` | `20` | 单次请求超时 |
-| `http_retries` | `3` | 失败重试次数（含 429 限流与网络错误） |
-| `concurrent_requests` | `4` | 并发数。调大更快，也更容易触发上游限流 |
-| `requests_per_minute` | `240` | 自限速。Modrinth 官方上限 300/分钟，这里留了余量 |
-| `use_resolve_cache` | `true` | 缓存「某个哈希属于哪个项目」，避免每次开服重复解析 |
-| `resolve_cache_ttl_hours` | `24` | 缓存有效期。`0` = 永不过期；要彻底关闭请用 `use_resolve_cache` |
-
-### 权限
-
-| 选项 | 默认 | 说明 |
-|---|---|---|
-| `command_permission_level` | `3` | 执行 `!!modupdate` 所需的最低权限等级 |
 
 ---
 
@@ -275,7 +311,7 @@ Mod 更新检查 — 服务端 26.3 / Fabric（版本来源：server_info）
 
 Modrinth 在中国大陆的访问质量不稳定。如果报告出现「上游不可达」，可以：
 
-- 把 `modrinth_api_base` 指向自建或可信的镜像；
+- 把 `sources.modrinth.api_base` 指向自建或可信的镜像；
 - 或者用系统级代理（`requests` 会自动读取 `HTTP_PROXY` / `HTTPS_PROXY` 环境变量）。
 
 插件对这种失败是**降级而非中断**的：Modrinth 不可达时它会照样跑完名称匹配（那一步不需要哈希），并在
@@ -316,7 +352,7 @@ MC 的 Mod 版本号是一团乱麻：`1.2.3`、`v1.2.3`、`0.162.0+26.3`、`1.1
 - **重新打包过的 jar 查不到。** 同一个 Mod 若被别的渠道重新打包成不同字节，SHA-1 就与发布版本对不上，
   只能靠名称兜底；兜底不上就是 `unresolved`，报告会明说，而不是猜一个给你。
 - **不检查嵌套 jar。** Fabric 的 jar-in-jar 里打包的库不会单独检查（数量会在报告里说明）。
-- **不会自动安装。** 插件不会替换 `mods/` 里的任何文件。开启 `download_updates` 也只是把新版本下到
+- **不会自动安装。** 插件不会替换 `mods/` 里的任何文件。开启 `download.enabled` 也只是把新版本下到
   它自己的文件夹。Mod 更新可能改变配置格式或破坏存档，这一步必须由人做。
 - **`mc_version` 推断可能不准。** 报告里每一条都会写明版本来源（`config` / `server_info` / `log` /
   `mods`），来源是 `mods`（猜测）时还会额外提醒。**升级大版本后建议显式写死 `mc_version`。**
@@ -339,7 +375,7 @@ MC 的 Mod 版本号是一团乱麻：`1.2.3`、`v1.2.3`、`0.162.0+26.3`、`1.1
 | MCDR 生命周期语义（重复注册、reload 不触发 `on_unload`） | 逐条对照安装的 MCDR 源码核实，并用 AST 级测试钉住「模块级按名注册、不得再显式注册」这条约束 |
 | 上游行为与代码假设一致 | `tools/probe_upstream.py`——上线后上游若有变化，重跑它就能看出差别 |
 
-测试套件共 **443 项**，细节见 [`tests/README.md`](tests/README.md)。
+测试套件共 **446 项**，细节见 [`tests/README.md`](tests/README.md)。
 
 ---
 
@@ -373,7 +409,7 @@ A：不会。哈希识别是批量的：一个 100 Mod 的服务端通常是 3~5
 
 **Q：能自动更新 Mod 吗？**
 A：不会自动**替换**。Mod 更新可能改配置格式、破坏存档，这个决定应该由人做。插件给你新版本号、下载链接，
-可选地（`download_updates`）把新版本下到插件自己的文件夹，装不装由你决定。
+可选地（`download.enabled`）把新版本下到插件自己的文件夹，装不装由你决定。
 
 ---
 
