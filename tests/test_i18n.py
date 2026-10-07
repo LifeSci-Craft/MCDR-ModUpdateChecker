@@ -6,9 +6,9 @@ the middle of an admin's console output. And a key that exists in ``en_us`` but 
 ``zh_cn`` degrades to English without anyone noticing.
 
 So the two directions are both checked: nothing the code asks for is missing, and nothing the
-catalogue offers has gone stale. The handful of keys built at runtime (``status.<x>`` and
-``matched_by.<x>``) cannot be found by scanning, so they are listed explicitly and checked for
-completeness instead.
+catalogue offers has gone stale. The handful of keys built at runtime (``status.<x>``,
+``matched_by.<x>`` and ``install.reason.<code>``) cannot be found by scanning, so they are
+listed explicitly and checked for completeness instead.
 """
 
 import json
@@ -21,11 +21,22 @@ from mod_update_checker import i18n
 from mod_update_checker.report import ALL_STATUSES
 from support import option_paths
 
-PACKAGE = Path(__file__).resolve().parent.parent / "mod_update_checker"
+REPO = Path(__file__).resolve().parent.parent
+PACKAGE = REPO / "mod_update_checker"
 CATALOGUES = sorted(PACKAGE.glob("lang/*.json"))
 
 #: Key families whose full name is only known at runtime.
-DYNAMIC_PREFIXES = ("status.", "matched_by.")
+DYNAMIC_PREFIXES = ("status.", "matched_by.", "install.reason.", "download.reason.")
+
+#: Where the reason codes are written down, as named constants. ``_reason_text`` prefixes a
+#: record's short code at render time, so the catalogue keys for the two families are invisible
+#: to the scanner below; the codes themselves are read out of the two modules that produce
+#: them, which keeps the two in step without a second copy of the list.
+_REASON_CONSTANT = re.compile(r'^REASON_[A-Z_]+ = "([a-z0-9\-]+)"', re.MULTILINE)
+REASON_SOURCES = {
+    "install.reason.": PACKAGE / "installer.py",
+    "download.reason.": PACKAGE / "downloads.py",
+}
 
 #: Values the dynamic families are built from.
 #: How an entry was tied to a project. ``fingerprint`` went with CurseForge.
@@ -41,7 +52,7 @@ MATCHED_BY_VALUES = ("hash", "name")
 #: list is a deliberate allow-list of the dotted prefixes that mean something to this plugin.
 _KEY_IN_CODE = re.compile(
     r'"('
-    r'(?:line|note|advisory|report|command|console|check|help|language|download)'
+    r'(?:line|note|advisory|report|command|console|check|help|install|language|download|detail)'
     r'\.[a-z_0-9]+(?:\.[a-z_0-9]+)*'
     r')"'
 )
@@ -127,6 +138,46 @@ def test_the_dynamic_key_families_are_complete():
     assert {
         key for key in available if key.startswith("matched_by.")
     } == {"matched_by." + value for value in MATCHED_BY_VALUES}
+
+
+def test_every_skip_reason_has_a_translation_and_nothing_else_does():
+    """``install.reason.<code>`` and ``download.reason.<code>`` are built at render time.
+
+    Both directions matter: a code with no sentence would print ``install.reason.name-taken``
+    into the console or into a player's chat, and a sentence whose code no longer exists is a
+    leftover nobody would notice — the failure the two lists above exist to prevent.
+
+    The codes are read from the modules rather than restated here, because a restated list is
+    one more thing to update when a new skip reason is added — which is exactly the kind of
+    memory test this one replaced.
+    """
+    available = set(catalogue("en_us"))
+    for prefix, source in REASON_SOURCES.items():
+        codes = set(_REASON_CONSTANT.findall(source.read_text(encoding="utf-8")))
+        assert codes, "no reason codes could be read out of {}".format(source.name)
+        assert {prefix + code for code in codes} <= available
+        assert {
+            key for key in available if key.startswith(prefix)
+        } == {prefix + code for code in codes}
+
+
+def test_every_message_names_the_plugin_from_its_metadata():
+    """A message may not open with a ``[badge]`` other than the plugin's own name.
+
+    The Chinese catalogue used to carry two names for the same plugin — ``[Mod Update Checker]``
+    on most lines and the translated ``[Mod 更新检查]`` on fifteen others, chosen line by line.
+    A player reading two consecutive messages saw the plugin call itself two different things,
+    and the name in ``mcdreforged.plugin.json`` was neither of them.
+    """
+    badge = re.compile(r"^\[([^\]]+)\]\s")
+    name = json.loads((REPO / "mcdreforged.plugin.json").read_text(encoding="utf-8"))["name"]
+    wrong = []
+    for language in languages():
+        for key, template in catalogue(language).items():
+            match = badge.match(template)
+            if match is not None and match.group(1) != name:
+                wrong.append((language, key, match.group(1)))
+    assert wrong == [], "messages do not use the plugin's own name: {}".format(wrong)
 
 
 @pytest.mark.parametrize("language", ["en_us", "zh_cn"])

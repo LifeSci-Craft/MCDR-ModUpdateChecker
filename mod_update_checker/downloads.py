@@ -33,7 +33,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from .report import STATUS_AWAITING_INSTALL, STATUS_UPDATE_AVAILABLE, UpdateEntry
 from .upstream import NotFound, Unauthorised, UpstreamError
@@ -58,6 +58,17 @@ STATUS_DOWNLOADED = "downloaded"
 STATUS_ALREADY_PRESENT = "already_present"
 STATUS_SKIPPED = "skipped"
 STATUS_FAILED = "failed"
+
+#: Why an entry was not fetched. Short codes rather than sentences, because the same code is
+#: reported from two places — the batch log line and a reply to ``!!muc download`` — and each
+#: wants its own wording. The sentence for each lives in the catalogue under
+#: ``download.reason.<code>``; ``tests/test_i18n.py`` checks both directions, so a code with no
+#: sentence (which would reach a player verbatim) and a sentence with no code (a leftover) both
+#: fail the build.
+REASON_NO_URL = "no-download-url"
+REASON_NO_HASH = "no-hash-to-verify"
+REASON_TOO_LARGE = "declared-too-large"
+REASON_NAME_CONFLICT = "name-conflict"
 
 #: Characters that are illegal in a Windows file name, plus control characters. Kept as a
 #: single class because the same filter is applied to the stem and to the configured folder
@@ -178,14 +189,8 @@ class DownloadOptions:
     folder: Path
     max_bytes: int = 128 * 1024 * 1024
     #: *Extra* attempts after the first one fails, so the total is ``1 + retries``. Follows the
-    #: same convention as the ``http_retries`` setting, so the two do not read differently.
+    #: same convention as ``network.retries``, so the two do not read differently.
     retries: int = 3
-    #: Modrinth's own project, for the advisory in the log. Cosmetic.
-    source_name: str = "modrinth"
-
-    @property
-    def max_megabytes(self) -> float:
-        return self.max_bytes / (1024.0 * 1024.0)
 
 
 @dataclass
@@ -272,6 +277,11 @@ class DownloadLedger:
         record = self._records.get(key)
         return str(record.get("file", "")) if record else ""
 
+    def records(self) -> List[str]:
+        """Every key with a record. A list, not the dict, so a caller cannot mutate the
+        bookkeeping by accident — forgetting a record is :meth:`forget`'s job."""
+        return list(self._records)
+
     def prune(self, folder: Union[str, Path]) -> List[str]:
         """Drop records whose file is no longer there. Returns the keys dropped.
 
@@ -288,13 +298,66 @@ class DownloadLedger:
 
     # -- writing -----------------------------------------------------------------------
 
-    def record(self, key: str, file_name: str, sha1: str, version: str, at: str) -> None:
-        self._records[key] = {
+    def record(
+        self,
+        key: str,
+        file_name: str,
+        sha1: str,
+        version: str,
+        at: str,
+        installed_file: str = "",
+        name: str = "",
+    ) -> None:
+        """File the download under ``key``.
+
+        ``installed_file`` is the jar this build is meant to replace, as the scanner saw it —
+        which means it already carries any renaming the admin did. ``name`` is the display name,
+        for the log. Both are needed by the install stage: without them it would know a file had
+        been fetched but not which mod it was for, and matching on names alone is how the wrong
+        jar gets replaced.
+
+        An existing approval survives, but only while it still describes *this* file. Every
+        check re-records what is on disk, and an admin who typed ``!!muc install 3`` must not
+        have that approval dropped by the next unrelated check — while an approval for a build
+        that has since been replaced by a different one must not carry over to bytes nobody
+        agreed to install.
+        """
+        digest = (sha1 or "").lower()
+        previous = self._records.get(key)
+        keep_approval = bool(
+            previous
+            and previous.get("approved")
+            and previous.get("file") == file_name
+            and previous.get("sha1") == digest
+        )
+        record = {
             "file": file_name,
-            "sha1": (sha1 or "").lower(),
+            "sha1": digest,
             "version": version or "",
             "at": at,
+            "local": installed_file or "",
+            "name": name or "",
         }
+        if keep_approval:
+            record["approved"] = True
+        self._records[key] = record
+
+    def approve(self, key: str) -> bool:
+        """Mark this download as authorised for the next install. ``False`` if unknown.
+
+        The authorisation is per *record*, not a global switch, because the installer runs over
+        the whole ledger: an admin who approves one mod on a server that has five downloads
+        waiting must get exactly the one they named, not all five.
+        """
+        record = self._records.get(key)
+        if record is None:
+            return False
+        record["approved"] = True
+        return True
+
+    def approved_keys(self) -> List[str]:
+        """Every key an admin has authorised for the next install, in a stable order."""
+        return sorted(key for key, record in self._records.items() if record.get("approved"))
 
     def forget(self, key: str) -> None:
         self._records.pop(key, None)
@@ -388,18 +451,11 @@ class Downloader:
         options: DownloadOptions,
         logger: Optional[Any] = None,
         ledger: Optional[DownloadLedger] = None,
-        fallback_name: Callable[[UpdateEntry], str] = None,  # type: ignore[assignment]
     ) -> None:
         self.http = http
         self.options = options
         self.logger = logger
         self.ledger = ledger
-        self._fallback_name = fallback_name or self._default_fallback
-
-    @staticmethod
-    @staticmethod
-    def _default_fallback(entry: UpdateEntry) -> str:
-        return entry.fallback_file_name()
 
     def _log(self, level: str, message: str) -> None:
         if self.logger is None:
@@ -435,13 +491,13 @@ class Downloader:
             if entry.status != STATUS_UPDATE_AVAILABLE:
                 continue
             if not entry.download_url:
-                skip(entry, "no-download-url")
+                skip(entry, REASON_NO_URL)
                 continue
             if not entry.download_sha1:
-                skip(entry, "no-hash-to-verify")
+                skip(entry, REASON_NO_HASH)
                 continue
             if entry.download_size and entry.download_size > self.options.max_bytes:
-                skip(entry, "declared-too-large")
+                skip(entry, REASON_TOO_LARGE)
                 continue
             wanted.append(entry)
         return wanted, skipped
@@ -527,7 +583,7 @@ class Downloader:
         """
         expected = (entry.download_sha1 or "").lower()
         plain = self.options.folder / safe_jar_name(
-            entry.download_filename, self._fallback_name(entry)
+            entry.download_filename, entry.fallback_file_name()
         )
         suffixed = plain.with_name("{}.{}{}".format(plain.stem, expected[:8], plain.suffix))
 
@@ -558,7 +614,7 @@ class Downloader:
             return suffixed, False, ""
         # Two different files sharing a name and an 8-hex prefix of a hash. Refuse rather than
         # overwrite anything.
-        return None, False, "name-conflict"
+        return None, False, REASON_NAME_CONFLICT
 
     # -- writing -----------------------------------------------------------------------
 
@@ -780,5 +836,7 @@ class Downloader:
             entry.download_sha1 or "",
             entry.latest_version or "",
             datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+            installed_file=entry.file_name,
+            name=entry.name,
         )
         self.ledger.save()

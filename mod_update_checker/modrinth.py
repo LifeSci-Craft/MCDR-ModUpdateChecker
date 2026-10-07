@@ -17,6 +17,7 @@ large would fail a whole check run rather than one mod.
 No MCDR import; the client takes an :class:`~mod_update_checker.upstream.HttpClient`.
 """
 
+import json
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
@@ -277,13 +278,11 @@ class ModrinthClient:
         Filters are sent to the server because the alternative — fetching everything and
         filtering locally — can mean hundreds of kilobytes for a project like Fabric API.
         """
-        import json as _json
-
         params: Dict[str, Any] = {}
         if loaders:
-            params["loaders"] = _json.dumps(list(loaders))
+            params["loaders"] = json.dumps(list(loaders))
         if game_versions:
-            params["game_versions"] = _json.dumps(list(game_versions))
+            params["game_versions"] = json.dumps(list(game_versions))
         payload = self.http.get_json(
             "{}/project/{}/version".format(self.base_url, project_id),
             params=params or None,
@@ -306,14 +305,12 @@ class ModrinthClient:
         otherwise fail the whole request, and the caller would lose the titles and links for
         every other project in that chunk over one bad entry.
         """
-        import json as _json
-
         found: Dict[str, ModrinthProject] = {}
         unique = [value for value in dict.fromkeys(ids) if value]
         for batch in _chunks(unique, ID_CHUNK):
             payload = self.http.get_json(
                 "{}/projects".format(self.base_url),
-                params={"ids": _json.dumps(list(batch))},
+                params={"ids": json.dumps(list(batch))},
                 allow_404=True,
             )
             if not isinstance(payload, list):
@@ -341,8 +338,6 @@ class ModrinthClient:
         limit: int = 10,
     ) -> List[ModrinthHit]:
         """Full-text search, used only as a last-resort identification fallback."""
-        import json as _json
-
         facets: List[List[str]] = []
         if project_type:
             facets.append(["project_type:{}".format(project_type)])
@@ -350,7 +345,7 @@ class ModrinthClient:
             facets.append(["categories:{}".format(loader)])
         params: Dict[str, Any] = {"query": query, "limit": max(1, int(limit))}
         if facets:
-            params["facets"] = _json.dumps(facets)
+            params["facets"] = json.dumps(facets)
         payload = self.http.get_json("{}/search".format(self.base_url), params=params)
         if not isinstance(payload, dict):
             return []

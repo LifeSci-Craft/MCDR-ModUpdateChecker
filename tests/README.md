@@ -1,5 +1,8 @@
 # 测试说明
 
+面向改这个插件的人。面向使用者的说明在 [`../README.md`](../README.md)，
+设计取舍与发版流程在 [`../README-dev.md`](../README-dev.md)。
+
 ## 一次性准备
 
 插件本身**没有**额外依赖：`requests` 是 MCDR 的硬依赖，其余全部走标准库。测试需要 `pytest`，
@@ -14,11 +17,15 @@ python -m pip install --target .testlibs -r tests/requirements-test.txt
 ## 跑测试
 
 ```bash
-PYTHONPATH=.testlibs python -m pytest          # 全量（约 2 分钟，含端到端）
-PYTHONPATH=.testlibs python -m pytest -m "not e2e"   # 跳过端到端，约 50 秒
+PYTHONPATH=.testlibs python -m pytest          # 全量（496 项，约 4 分钟，含端到端）
+PYTHONPATH=.testlibs python -m pytest -m "not e2e"   # 跳过端到端，约 1.5 分钟
 ```
 
-`pytest.ini` 里已把 `tests/` 设为测试根，`conftest.py` 负责把仓库根和 `tests/` 放进 `sys.path`。
+`pytest.ini` 里已把 `tests/` 设为测试根，`conftest.py` 负责把仓库根和 `tests/` 放进 `sys.path`；
+`tests/support.py` 放跨文件复用的工具（`flatten_options`、合成 jar 等）。
+
+> **Windows**：多个路径要用**分号**分隔，即 `PYTHONPATH=".testlibs;tests"`。用冒号的话 Python 会把整串
+> 当成一个目录名，报 `No module named pytest`——看起来像 conftest 的问题，其实不是。
 
 ## 各文件在测什么
 
@@ -30,7 +37,8 @@ PYTHONPATH=.testlibs python -m pytest -m "not e2e"   # 跳过端到端，约 50 
 | `test_serverinfo.py` | MC 版本与加载器的推断顺序：配置覆盖 → MCDR ServerInformation → 日志 → Mod 元数据投票 |
 | `test_clients.py` | Modrinth 客户端的协议形状：批量哈希、**空过滤数组不发送**、chunk 分段、429/5xx 重试、401/403 与 404 处理 |
 | `test_checker.py` | 完整检查流程对本地假上游的判定结果、**请求预算**、缓存复用、报告序列化与中英渲染 |
-| `test_i18n.py` | 两份语言目录键集一致、代码里用到的键都在、没有失效键、占位符对齐 |
+| `test_i18n.py` | 两份语言目录键集一致、代码里用到的键都在、没有失效键、占位符对齐、**每条消息开头的 `[方括号]` 都是元数据里的插件名**、`install.reason.*` / `download.reason.*` 与产出它们的模块双向对齐 |
+| `test_mcdr_entry.py` | MCDR 入口：生命周期与事件注册的约束、配置分组的不变式、`!!muc download` / `install` / `confirm` 的确认流程（超时、换人、报告换过后作废、只授权点名的那一个）、关服安装的授权路径 |
 | `test_e2e.py` | 用 `pack.py` 打出 `.mcdr`，放进**真实 MCDR**里跑：加载、自动检查、命令树、别名、报告落盘 |
 
 `tests/fake_upstream.py` 是 Modrinth 的本地假实现。它的回答形状是照着线上实测抄的
@@ -50,8 +58,10 @@ python tools/mcdr_matrix.py /path/to/mcdr-2.13/python /path/to/mcdr-2.15.7/pytho
 ```
 
 每个版本会检查：插件加载（或被干净拒绝）、`language: auto` 确实跟随 MCDR、自动检查发现种下的更新、
-`!!modupdate` / `help` / `status` / `list` / `list <状态>` / `reload` 与 `!!muc` 别名都有回应、
-`last_report.json` 内容与控制台一致、没有任何 traceback。
+`!!modupdate` / `help` / `status` / `list` / `list <状态>` / `info` / `reload` 与 `!!muc` 别名都有回应、
+`!!muc download <编号>` 会暂存计划且 `confirm` 之后真的去抓（抓的正是那条哈希对不上的，所以断言的是
+「真开了 socket、真被拒绝、没留残渣」）、`!!muc install` 的两条分支、`last_report.json` 内容与控制台一致、
+没有任何 traceback。加上 `--with-install` 会再跑一遍关服安装。
 
 单版本跑同一个流程可以走 pytest：
 
@@ -74,7 +84,7 @@ python tools/probe_upstream.py
 ## 产物校验
 
 ```bash
-python tools/check_artifact.py            # 连打两次比字节 + 检查内容 + 确认包内代码能编译
+python tools/check_artifact.py            # 可复现 + 换行归一 + 内容白名单 + 注释已剥离 + 包内代码能编译
 python tools/check_artifact.py some.mcdr  # 检查一个已有的产物
 ```
 
@@ -84,7 +94,7 @@ python tools/check_artifact.py some.mcdr  # 检查一个已有的产物
 
 - `unit`：Python 3.10 / 3.13，`pytest -m "not e2e"`；
 - `mcdr-matrix`：五个 MCDR 版本各一个作业，跑 `tools/mcdr_matrix.py --current`（这就是真实 MCDR 的端到端覆盖）；
-- `artifact`：`tools/check_artifact.py`。
+- `artifact`：`tools/check_artifact.py`（可复现、换行归一、内容白名单、注释剥离、可编译）。
 
 > **在 CI 布局下本地复现**：CI 用 `pip install --target .testlibs` 装 MCDR，而不是装进解释器的
 > site-packages。要精确模拟，用一个**没装任何依赖**的解释器并给**绝对**路径：

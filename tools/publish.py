@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Create the GitHub repository and push to it, using a personal access token.
+"""Put this branch on GitHub: push it, open a pull request, optionally merge it.
 
 The trust boundary here is one function and one command. The token is read in
 :func:`find_token`, placed into the environment for exactly one ``git`` invocation
-(:func:`push_with_token`), and never printed, logged, or written anywhere — including
+(:func:`run_with_token`), and never printed, logged, or written anywhere — including
 ``.git/config``, which is checked afterwards to be sure.
 
 A token **file** is the recommended source: it then never passes through a chat log, a shell
@@ -18,11 +18,20 @@ history, or a process listing. Lookup order:
 (``public_repo`` is enough for a public repository); create a classic one at
 https://github.com/settings/tokens — 7 days is plenty for a one-off push.
 
+**Where the repository is** comes from the ``origin`` remote when one exists, not from the
+token's account. That distinction is not academic: a token belonging to a person, pointed at a
+repository that lives under an organisation, would otherwise look for — and offer to *create* —
+a second repository under the person's own account.
+
 Usage::
 
-    python tools/publish.py --dry-run        # report what would happen; change nothing
-    python tools/publish.py                  # create the repository and push
-    python tools/publish.py --private        # create it private instead
+    python tools/publish.py --dry-run                  # report what would happen; change nothing
+    python tools/publish.py                            # create the repository (if absent) and push
+    python tools/publish.py --private                  # create it private instead
+    python tools/publish.py --pr --title "..." --body-file pr.md
+                                                       # push the branch and open a pull request
+    python tools/publish.py --pr --title "..." --body-file pr.md --merge
+                                                       # ... and merge it, then delete the branch
 
 Exit codes: 0 success, 1 a problem the user has to resolve.
 """
@@ -31,6 +40,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import subprocess
 import sys
 import urllib.error
@@ -46,10 +56,11 @@ TOKEN_FILES = (
 )
 
 DEFAULT_NAME = "MCDR-ModUpdateChecker"
+DEFAULT_BRANCH = "main"
 
 DESCRIPTION = (
     "MCDR plugin that compares the server's installed Fabric mods against Modrinth and "
-    "against Modrinth, and reports which ones are out of date."
+    "reports which ones are out of date."
 )
 
 
@@ -139,18 +150,18 @@ def git(*args: str, check: bool = True) -> subprocess.CompletedProcess:
     )
 
 
-def push_with_token(token: str, branch: str) -> None:
-    """Push using the token, keeping it out of both ``argv`` and ``.git/config``.
+def run_with_token(token: str, args: list, timeout: int = 120) -> subprocess.CompletedProcess:
+    """Run one ``git`` command with the token supplied out-of-band.
 
-    Two things are deliberately avoided:
+    Three things are deliberately avoided:
 
     * putting the token in the remote URL, which would persist it in ``.git/config`` for
       anyone who reads the file later;
-    * passing it on the command line, where it is visible in a process listing.
+    * passing it on the command line, where it is visible in a process listing;
+    * writing it anywhere, so there is nothing to clean up afterwards.
 
     Instead the credential is handed to git through ``http.extraheader`` supplied via
     ``GIT_CONFIG_*`` environment variables, which apply to this one child process only.
-    Nothing is written to disk, so there is nothing to clean up afterwards.
     """
     basic = base64.b64encode(
         "x-access-token:{}".format(token).encode("utf-8")
@@ -169,15 +180,25 @@ def push_with_token(token: str, branch: str) -> None:
         }
     )
 
-    result = subprocess.run(
-        ["git", "push", "--quiet", "origin", "HEAD:refs/heads/{}".format(branch)],
+    return subprocess.run(
+        ["git", *args],
         cwd=str(REPO),
         capture_output=True,
         text=True,
         encoding="utf-8",
         errors="replace",
+        timeout=timeout,
         env=environment,
     )
+
+
+def push_with_token(token: str, ref: str, ref_prefix: str = "refs/heads/") -> None:
+    """Push ``HEAD`` to one ref on ``origin``, explaining a rejection in plain words.
+
+    ``ref_prefix`` is what makes this usable for a tag as well as a branch — the credential
+    handling is identical and worth having in one place.
+    """
+    result = run_with_token(token, ["push", "--quiet", "origin", "HEAD:{}".format(ref_prefix + ref)])
     if result.returncode != 0:
         message = ((result.stderr or "") + (result.stdout or "")).replace(token, "***")
         hint = ""
@@ -213,15 +234,84 @@ def describe_local_state() -> tuple:
 # --------------------------------------------------------------------------------------
 
 
+def origin_name() -> str:
+    """``owner/name`` of the ``origin`` remote, or ``""`` when there is none.
+
+    The owner comes from the remote rather than from the token's account on purpose: this
+    repository lives under an organisation while the token belongs to a person, and deriving
+    the target from the login would send the tool looking for ``<person>/<repo>`` and then
+    offering to *create* it — a second, empty repository that looks like the real one.
+    """
+    remotes = git("remote").stdout.split()
+    if "origin" not in remotes:
+        return ""
+    url = git("remote", "get-url", "origin").stdout.strip()
+    match = re.search(r"github\.com[:/]([^/]+)/([^/]+?)(?:\.git)?$", url)
+    return "{}/{}".format(match.group(1), match.group(2)) if match else ""
+
+
+def open_pull_request(token: str, full_name: str, head: str, base: str,
+                      title: str, body: str) -> dict:
+    status, payload = call(
+        "POST",
+        "/repos/{}/pulls".format(full_name),
+        token,
+        {"title": title, "body": body, "head": head, "base": base},
+    )
+    if status not in (200, 201) or not payload:
+        raise Failure("could not open the pull request (HTTP {}): {}".format(
+            status, (payload or {}).get("message", "no message")
+        ))
+    return payload
+
+
+def merge_pull_request(token: str, full_name: str, number: int, title: str) -> dict:
+    """Merge with a merge commit, so the branch's own commits stay visible in the history."""
+    status, payload = call(
+        "PUT",
+        "/repos/{}/pulls/{}/merge".format(full_name, number),
+        token,
+        {
+            "merge_method": "merge",
+            "commit_title": "{} (#{})".format(title, number),
+        },
+    )
+    if status != 200 or not (payload or {}).get("merged"):
+        raise Failure("could not merge the pull request (HTTP {}): {}".format(
+            status, (payload or {}).get("message", "no message")
+        ))
+    return payload
+
+
+def delete_branch(token: str, full_name: str, branch: str) -> None:
+    status, payload = call("DELETE", "/repos/{}/git/refs/heads/{}".format(full_name, branch), token)
+    if status not in (204, 200):
+        # Not fatal: the pull request is merged and the branch is harmless.
+        print("warning       : could not delete the branch: {}".format(
+            (payload or {}).get("message", status)
+        ))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--name", default=DEFAULT_NAME, help="repository name")
+    parser.add_argument("--name", default=DEFAULT_NAME, help="repository name, if creating one")
     parser.add_argument("--private", action="store_true", help="create it private")
     parser.add_argument("--dry-run", action="store_true", help="change nothing")
     parser.add_argument("--token-file", default="", help="read the token from this file")
+    parser.add_argument("--pr", action="store_true",
+                        help="open a pull request instead of pushing straight to the default branch")
+    parser.add_argument("--merge", action="store_true", help="also merge the pull request (--pr)")
+    parser.add_argument("--base", default=DEFAULT_BRANCH, help="the branch to merge into")
+    parser.add_argument("--title", default="", help="pull request title")
+    parser.add_argument("--body-file", default="", help="file holding the pull request body")
     args = parser.parse_args()
+
+    if args.merge and not args.pr:
+        parser.error("--merge only makes sense with --pr")
+    if args.pr and not (args.title and args.body_file):
+        parser.error("--pr needs --title and --body-file")
 
     branch, commits, files, dirty = describe_local_state()
     print("repository    : {}".format(REPO))
@@ -246,8 +336,12 @@ def main() -> int:
     login = user["login"]
     print("authenticated : {}".format(login))
 
-    full_name = "{}/{}".format(login, args.name)
-    print("target repo   : {}{}".format(full_name, " (private)" if args.private else ""))
+    configured = origin_name()
+    full_name = configured or "{}/{}".format(login, args.name)
+    print("target repo   : {}{}".format(
+        full_name,
+        " (from origin)" if configured else " (from the token's account)",
+    ))
 
     status_code, existing = call("GET", "/repos/{}".format(full_name), token)
     already_exists = status_code == 200
@@ -255,6 +349,12 @@ def main() -> int:
         print("state         : already exists — it will be reused, not recreated")
         print("                {}".format(existing["html_url"]))
     elif status_code == 404:
+        if configured:
+            raise Failure(
+                "origin points at {}, which this token cannot see. Either the token needs "
+                "access to it, or the remote is wrong — this tool will not create a second "
+                "repository under {}.".format(full_name, login)
+            )
         print("state         : does not exist yet — it will be created")
     else:
         raise Failure(
@@ -263,9 +363,22 @@ def main() -> int:
             )
         )
 
+    body = ""
+    if args.pr:
+        body_path = Path(args.body_file).expanduser()
+        if not body_path.is_file():
+            raise Failure("no such file: {}".format(body_path))
+        body = body_path.read_text(encoding="utf-8")
+
     if args.dry_run:
         print()
         print("dry run: nothing was created and nothing was pushed")
+        if args.pr:
+            print("dry run: would open a pull request {} -> {} titled {!r}".format(
+                branch, args.base, args.title
+            ))
+            if args.merge:
+                print("dry run: and would merge it with a merge commit")
         return 0
 
     if not already_exists:
@@ -313,8 +426,31 @@ def main() -> int:
         print("upstream      : {}/{}".format("origin", branch))
 
     print("pushed        : {} commit(s) to origin/{}".format(commits, branch))
+
+    if not args.pr:
+        print()
+        print("done: https://github.com/{}/tree/{}".format(full_name, branch))
+        print()
+        print("When you are finished: delete the token file and revoke the token at")
+        print("https://github.com/settings/tokens")
+        return 0
+
+    pull = open_pull_request(token, full_name, branch, args.base, args.title, body)
+    print("pull request  : #{} {}".format(pull["number"], pull["html_url"]))
+
+    if args.merge:
+        merged = merge_pull_request(token, full_name, pull["number"], args.title)
+        print("merged        : {}".format(merged["sha"][:12]))
+        delete_branch(token, full_name, branch)
+        # Local ``main`` is now behind: move it onto the merge commit so the next release is
+        # cut from what is actually on the remote.
+        git("fetch", "--quiet", "origin", check=False)
+        git("checkout", args.base, check=False)
+        git("merge", "--ff-only", "origin/{}".format(args.base), check=False)
+        print("local {}  : {}".format(args.base, git("rev-parse", "HEAD").stdout.strip()[:12]))
+
     print()
-    print("done: https://github.com/{}/tree/{}".format(full_name, branch))
+    print("done: {}".format(pull["html_url"]))
     print()
     print("When you are finished: delete the token file and revoke the token at")
     print("https://github.com/settings/tokens")

@@ -10,9 +10,8 @@ that are therefore implemented once here rather than twice:
   :class:`RateLimiter` throttles proactively and the retry loop honours whatever the server
   tells us to wait.
 * **It must survive a flaky or censored network.** ``429``/``5xx`` and transport errors are
-  retried with exponential backoff; a mirror or proxy can be pointed at through the
-  configurable base URL / proxy settings, which matters a lot for players reaching
-  Modrinth from mainland China.
+  retried with exponential backoff, and the base URL is configurable, which matters a lot for
+  players reaching Modrinth from mainland China.
 
 The module deliberately does not import MCDR: it is directly unit-testable, and the plugin
 injects the logger it wants to use.
@@ -49,12 +48,10 @@ class UpstreamError(Exception):
         message: str,
         status: Optional[int] = None,
         url: Optional[str] = None,
-        attempts: int = 1,
     ) -> None:
         super().__init__(message)
         self.status = status
         self.url = url
-        self.attempts = attempts
 
     def __str__(self) -> str:
         parts = [super().__str__()]
@@ -117,7 +114,6 @@ class HttpClient:
         retries: int = 3,
         rate_limiter: Optional[RateLimiter] = None,
         logger: Optional[Any] = None,
-        proxies: Optional[Dict[str, str]] = None,
         backoff_base: float = 0.6,
         session: Optional[requests.Session] = None,
     ) -> None:
@@ -128,10 +124,6 @@ class HttpClient:
         self.backoff_base = float(backoff_base)
         self._session = session or requests.Session()
         self._session.headers.update({"User-Agent": user_agent})
-        if proxies:
-            # An explicit empty value in the config means "do not proxy this host", which
-            # is why falsy entries are kept rather than filtered out.
-            self._session.proxies.update(proxies)
 
     # -- internals ---------------------------------------------------------------------
 
@@ -194,7 +186,6 @@ class HttpClient:
                     raise UpstreamError(
                         "{}: {}".format(type(error).__name__, error),
                         url=url,
-                        attempts=attempt + 1,
                     ) from error
                 wait = min(self.backoff_base * (2 ** attempt), 20.0)
                 self._log(
@@ -226,13 +217,12 @@ class HttpClient:
                 time.sleep(wait)
                 continue
             if status == 429:
-                raise RateLimited("rate limited", status=status, url=url, attempts=attempt + 1)
+                raise RateLimited("rate limited", status=status, url=url)
             if status >= 400:
                 raise UpstreamError(
                     (response.text or "").strip()[:200] or "request failed",
                     status=status,
                     url=url,
-                    attempts=attempt + 1,
                 )
 
             try:
@@ -247,7 +237,7 @@ class HttpClient:
                 ) from error
 
         raise UpstreamError(
-            "{}".format(last_error or "request failed"), url=url, attempts=self.retries + 1
+            "{}".format(last_error or "request failed"), url=url
         )
 
     # -- public ------------------------------------------------------------------------

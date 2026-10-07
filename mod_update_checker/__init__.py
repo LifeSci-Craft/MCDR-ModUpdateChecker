@@ -17,6 +17,7 @@ import json
 import os
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, ClassVar, Dict, List, Optional, Sequence, Set, Tuple, Type
 
@@ -34,6 +35,12 @@ from mcdreforged.api.all import (
 
 from . import i18n
 from .checker import USER_AGENT, CheckOptions, Checker
+from .installer import (
+    STATUS_INSTALLED as INSTALL_INSTALLED,
+    InstallOptions,
+    install_pending,
+    pending_records,
+)
 from .downloads import (
     STATUS_ALREADY_PRESENT,
     STATUS_DOWNLOADED,
@@ -44,9 +51,25 @@ from .downloads import (
     DownloadOutcome,
     Downloader,
     classify_downloaded,
+    entry_key,
     resolve_folder as resolve_download_folder_path,
+    safe_jar_name,
 )
-from .report import ALL_STATUSES, Report, render_entry_line, render_full, render_summary
+from .report import (
+    ALL_STATUSES,
+    CHAT_PAGE_LINES,
+    STATUS_AWAITING_INSTALL,
+    STATUS_LOCAL_AHEAD,
+    STATUS_NO_COMPATIBLE_BUILD,
+    STATUS_UP_TO_DATE,
+    STATUS_UPDATE_AVAILABLE,
+    Report,
+    UpdateEntry,
+    entry_detail_rows,
+    render_full,
+    render_index,
+    render_summary,
+)
 from .upstream import HttpClient
 from .scanner import (
     ScanResult,
@@ -64,6 +87,10 @@ CACHE_FILE_NAME = "resolve-cache.json"
 #: the download folder, so that folder stays nothing but jars.
 DOWNLOAD_LEDGER_FILE_NAME = "download-manifest.json"
 
+#: What the last stop installed. Read at the next startup so the admin is told what changed
+#: under their feet while the server was down, and kept until an admin has been told in game.
+INSTALL_REPORT_FILE_NAME = "last-install.json"
+
 #: Both spellings are registered so an admin does not have to guess which one is canonical.
 ROOT_LITERALS = ("!!modupdate", "!!muc")
 
@@ -75,20 +102,26 @@ _FALLBACK_TITLE = "Mod Update Checker"
 _TITLE_WIDTH = 53
 #: Never fewer than this many ``=`` on each side, however long the plugin name gets.
 _TITLE_BAR_MIN = 4
-#: Left column of the help page, in characters. Derived from the literals themselves so it
-#: cannot drift from the commands it has to line up: the longest registered prefix, then the
-#: longest subcommand actually printed (``status``; a subcommand that takes an argument is
-#: shown without it).
-_HELP_COMMAND_WIDTH = max(len(name) for name in ROOT_LITERALS) + 1 + len("status")
 
-#: Cap on how many mods are listed in a one-shot notification, so a server with 150 stale
-#: mods does not dump 150 lines into the chat every restart. The full list is one command
-#: away.
-NOTIFY_MAX_UPDATES = 15
+#: Cap on how many mods a one-shot notification lists.
+#:
+#: Smaller than a command reply's page budget on purpose: a notification arrives unasked, in
+#: the middle of whatever the player was doing, and half a screen of chat nobody requested is
+#: worse than a short message that names the command to run. The listing is one command away.
+NOTIFY_MAX_UPDATES = 6
 #: How many download outcomes to print individually before summarising the rest. The download
 #: folder is for a human to look at, so the lines are worth printing — but not two hundred
 #: of them on a big modpack.
 DOWNLOAD_LOG_LIMIT = 20
+
+#: How long a ``!!muc confirm`` stays valid, in seconds.
+#:
+#: The two-step form exists because both actions write something that is awkward to undo: one
+#: spends bandwidth, the other plans a change to ``mods/`` that happens at a moment the admin
+#: will not be watching. A confirmation is what turns "the number I typed was the one I meant"
+#: into a decision the admin made twice. The window then has to close, or a stray
+#: ``!!muc confirm`` typed days later would act on a plan nobody remembers making.
+CONFIRM_TIMEOUT_SECONDS = 120
 
 
 class _Grouped(Serializable):
@@ -220,6 +253,22 @@ class DownloadConfig(_Grouped):
     max_size_mb: int = 128
     """单个文件的大小上限（MB）。超过就跳过并说明原因。"""
 
+    install_on_stop: bool = False
+    """服务端停止后，把已下载的新版本装进 ``mods/``，旧 jar 改名为 ``<原名>.old`` 保留。
+
+    **默认关闭，而且这是本插件唯一会改动 ``mods/`` 的功能。** 开启后：
+
+    * 只在**服务端已经停止**之后动手（不会在运行中替换 jar）；
+    * 只处理**插件自己下载过**的文件（清单里记着的那几个），手动放进 mods/ 的东西一概不碰；
+    * 旧 jar **只改名、不删除**——更新出问题时改回名字就能回退；
+    * 安装前校验哈希，对不上就不装；
+    * 目标文件名已被占用时**跳过并说明**，绝不覆盖任何文件。
+
+    ``mods/`` 里那个 jar 的文件名会被保留为「你的中括号备注 + 上游发布的文件名」，
+    例如 ``[锂-性能优化]Lithium.jar`` 更新后会变成 ``[锂-性能优化]lithium-fabric-0.15.0.jar``。
+
+    它**不依赖上面的 ``enabled``**：那只管「要不要去抓新的」，这只管「抓下来的要不要装」。"""
+
     retries: int = 3
     """下载失败后**额外**重试几次。总尝试次数 = 1 + 该值（默认 3 → 最多尝试 4 次）。
 
@@ -319,6 +368,14 @@ _online_players: Set[str] = set()
 _check_lock = threading.Lock()
 _stop_event = threading.Event()
 _scheduler_thread: Optional[threading.Thread] = None
+
+#: The ``!!muc download`` / ``!!muc install`` waiting for a ``!!muc confirm``.
+#:
+#: Kept in module state rather than per-source, because ``confirm`` is typed as its own command
+#: and has nothing to correlate with. Guarded by its own lock: commands run on MCDR's task
+#: executor, and the two-step form means two of them arrive at unrelated moments.
+_pending_action: Optional[Dict[str, Any]] = None
+_pending_lock = threading.Lock()
 
 
 def tr(key: str, **kwargs: Any) -> str:
@@ -685,6 +742,185 @@ def _reconcile_downloads(
             http.close()
 
 
+# --------------------------------------------------------------------------------------
+# Installing what was downloaded
+# --------------------------------------------------------------------------------------
+
+
+def _mods_folder(server: PluginServerInterface, config: Config) -> Optional[Path]:
+    try:
+        return resolve_mods_directory(_working_directory(server), config.server.mods_directory)
+    except Exception as error:  # noqa: BLE001 - an unusable path is worth reporting, not raising
+        server.logger.warning(tr("install.bad_mods_folder", error=str(error)))
+        return None
+
+
+def _install_paths(
+    server: PluginServerInterface, config: Config
+) -> Tuple[Optional[Path], Optional[Path]]:
+    mods = _mods_folder(server, config)
+    downloads, _reason = resolve_download_folder(server, config)
+    return mods, downloads
+
+
+def _write_install_report(server: PluginServerInterface, results) -> None:
+    """Record what was replaced, for the next startup and the first admin to log in."""
+    installed = [item for item in results if item.status == INSTALL_INSTALLED]
+    skipped = [item for item in results if item.status != INSTALL_INSTALLED]
+    payload = {
+        "version": 1,
+        "at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+        "logged": False,
+        "notified": False,
+        "installed": [
+            {
+                "name": item.name,
+                "version": item.version,
+                "new_file": item.new_file,
+                "replaced_file": item.replaced_file,
+                "backup_file": item.backup_file,
+            }
+            for item in installed
+        ],
+        "skipped": [
+            {"name": item.name, "version": item.version, "status": item.status,
+             "detail": item.detail}
+            for item in skipped
+        ],
+    }
+    path = Path(server.get_data_folder()) / INSTALL_REPORT_FILE_NAME
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as error:
+        server.logger.warning(tr("install.report_failed", error=str(error)))
+
+
+def _read_install_report(server: PluginServerInterface) -> Optional[Dict[str, Any]]:
+    path = Path(server.get_data_folder()) / INSTALL_REPORT_FILE_NAME
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("installed"), list):
+        return None
+    return data
+
+
+def _mark_install_reported(server: PluginServerInterface, data: Dict[str, Any], field: str) -> None:
+    data[field] = True
+    path = Path(server.get_data_folder()) / INSTALL_REPORT_FILE_NAME
+    try:
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        # Losing the flag means the message may be repeated, which is a far smaller problem
+        # than failing the startup it is being written during.
+        pass
+
+
+def _reason_text(family: str, code: str) -> str:
+    """A short reason code as words, or the text itself when it is not a known code.
+
+    ``translate`` returns the key when it has no entry, which is exactly the signal needed here:
+    a failure carries a sentence (``could not move the new jar in: ...``) rather than a code, and
+    that sentence is more useful than a missing-key placeholder.
+
+    The family is named by the caller rather than guessed, because the two stages overlap:
+    ``no-hash-to-verify`` means "the downloader would not accept this file" in one and "the
+    installer will not install it" in the other, and they are different sentences. Trying both
+    prefixes would print the wrong one half the time, depending only on the order they were
+    tried in.
+    """
+    text = str(code or "")
+    key = family + (text or "unknown")
+    translated = tr(key)
+    return text if translated == key else translated
+
+
+def _install_summary_lines(data: Dict[str, Any]) -> List[str]:
+    """The lines that describe one install batch, for the console and for chat."""
+    installed = data.get("installed") or []
+    lines = [tr("install.header", count=len(installed), when=str(data.get("at") or ""))]
+    for item in installed[:NOTIFY_MAX_UPDATES]:
+        lines.append(tr("install.line", name=item.get("name") or "?",
+                        version=item.get("version") or "?",
+                        old=item.get("backup_file") or "?"))
+    if len(installed) > NOTIFY_MAX_UPDATES:
+        lines.append(tr("report.and_more", count=len(installed) - NOTIFY_MAX_UPDATES))
+    skipped = data.get("skipped") or []
+    if skipped:
+        lines.append(tr("install.skipped_header", count=len(skipped)))
+        for item in skipped[:NOTIFY_MAX_UPDATES]:
+            lines.append(tr("install.skipped_line", name=item.get("name") or "?",
+                            reason=_reason_text("install.reason.",
+                                               str(item.get("detail") or "unknown"))))
+    return lines
+
+
+def _install_on_stop(server: PluginServerInterface) -> None:
+    """Replace installed jars with the builds fetched for them. Runs once the server is down.
+
+    The event is the whole safety story: ``mods/`` is only written while nothing is reading it.
+    Everything else this function does — the ledger as the work list, the hash check, the
+    ``.old`` backup, the skip on a name clash — exists so that a mistake here costs a log line
+    rather than a modpack.
+
+    Two ways in, and the ledger decides which records each covers:
+
+    * ``download.install_on_stop`` — every download this plugin made;
+    * ``!!muc install <编号>`` — exactly the ones an admin authorised, which is what makes the
+      command work whether or not the automatic setting is on.
+
+    When the automatic setting *is* on, the two are the same instruction and the per-record
+    flag is not consulted: an admin who switches the feature on has already said "install what
+    you fetch", and honouring only the explicitly named ones would silently contradict that.
+    """
+    automatic = bool(_config.download.install_on_stop)
+
+    mods, downloads = _install_paths(server, _config)
+    if mods is None or downloads is None:
+        return
+
+    ledger = DownloadLedger(
+        Path(server.get_data_folder()) / DOWNLOAD_LEDGER_FILE_NAME, logger=server.logger
+    )
+    options = InstallOptions(
+        mods_folder=mods, downloads_folder=downloads, approved_only=not automatic
+    )
+    # Asked before anything is written, so a stop with nothing to install leaves no
+    # install report behind for the next start to announce.
+    if not pending_records(ledger, options.approved_only):
+        return
+    if not mods.is_dir():
+        server.logger.warning(tr("install.no_mods_folder", directory=str(mods)))
+        return
+    if not downloads.is_dir():
+        return
+
+    results = install_pending(
+        ledger, options,
+        logger=None,   # the summary below is the log; per-file lines would repeat it
+    )
+    _write_install_report(server, results)
+    installed = sum(1 for item in results if item.status == INSTALL_INSTALLED)
+    if installed:
+        # One line here, the list at the next startup. MCDR is shutting down and nobody is
+        # reading the console; the batch is written to a file for the moment somebody is.
+        server.logger.info(tr("install.done", count=installed))
+
+
+def _announce_install_reminder(server: PluginServerInterface) -> None:
+    """Say what changed while the server was down, once, at startup."""
+    data = _read_install_report(server)
+    if data is None or data.get("logged"):
+        return
+    for line in _install_summary_lines(data):
+        server.logger.info(line)
+    _mark_install_reported(server, data, "logged")
+
+
 def resolve_download_folder(
     server: PluginServerInterface, config: Config
 ) -> Tuple[Optional[Path], str]:
@@ -773,7 +1009,11 @@ def _log_download_outcomes(
 
     # Skips are summarised rather than listed one by one: on a server where most mods are only
     # that were not eligible, the list would otherwise be the bulk of the output.
-    skipped_reasons = sorted({outcome.detail for outcome in outcomes
+    #
+    # Ran through ``_reason_text`` because a skip arrives as a code (``no-download-url``), and
+    # a code is not something to put in front of an admin. Failures are not: those already
+    # carry a sentence, and translating one would flatten the detail that makes it useful.
+    skipped_reasons = sorted({_reason_text("download.reason.", outcome.detail) for outcome in outcomes
                               if outcome.status == STATUS_SKIPPED})
     if skipped_reasons:
         server.logger.info(tr("download.skipped_reasons", reasons=", ".join(skipped_reasons)))
@@ -789,7 +1029,8 @@ def _log_download_outcomes(
         elif outcome.status == STATUS_FAILED:
             entry.add_note("note.download_failed", reason=outcome.detail)
         else:
-            entry.add_note("note.download_skipped", reason=outcome.detail)
+            entry.add_note("note.download_skipped",
+                           reason=_reason_text("download.reason.", outcome.detail))
 
 
 def _entry_for(report: Report, file_name: str):
@@ -832,6 +1073,95 @@ def _reply_lines(source: CommandSource, lines) -> None:
         source.reply(_coloured_line(line))
 
 
+def _detail_link(command: str) -> RText:
+    """A ``[详细信息]`` label that runs ``command`` when clicked.
+
+    Clicking is by number rather than by mod id: the number is what the reader sees, and
+    ``!!modupdate info 3`` is short enough to type if the chat log has since scrolled past the
+    row. The command is spellable by hand, so a player is never stuck without the button.
+    """
+    return RText(tr("command.list.detail_link"), RColor.aqua).set_click_event(
+        RAction.run_command, command
+    )
+
+
+def _reply_index(
+    source: CommandSource, report: Report, entries=None, prefix: str = ROOT_LITERALS[0]
+) -> None:
+    """The numbered listing with a click on every row.
+
+    The rows and their selection come from ``report.render_index``; this only decorates them.
+    Keeping the two apart is what stops the chat reply from being the place where the page
+    budget is computed — which it was, briefly, and it came out two lines too long.
+    """
+    head, rows, tail = render_index(report, tr, entries=entries, budget=CHAT_PAGE_LINES)
+    source.reply(_coloured_line(head))
+    for number, _entry, text in rows:
+        source.reply(
+            RTextList(
+                _coloured_line("  " + text),
+                RText("  "),
+                _detail_link("{} info {}".format(prefix, number)),
+            )
+        )
+    for line in tail:
+        source.reply(_coloured_line(line))
+
+
+def _action_link(label_key: str, command: str) -> RText:
+    """A clickable label that runs ``command``."""
+    return RText(tr(label_key), RColor.green).set_click_event(RAction.run_command, command)
+
+
+def _action_rows(entry: UpdateEntry, prefix: str) -> List[RText]:
+    """The one action this mod can be given right now, as a clickable label.
+
+    Only the detail view offers it: in the listing, an action per row would have to carry its
+    number through the click anyway, and one link per row is the rule that keeps a listing
+    scannable. Here exactly one mod is on screen, so the row already knows which mod it is —
+    which is the whole reason the commands take a number at all.
+
+    ``update_available`` offers the fetch and ``awaiting_install`` offers the install, never
+    both: the second is what the first produces, and offering a step the mod is not ready for
+    is how a command comes to answer with an error.
+    """
+    report = _last_report
+    if report is None:
+        return []
+    number = _number_of(report, entry)
+    if number is None:
+        return []
+    if entry.status == STATUS_UPDATE_AVAILABLE and entry.download_url and entry.download_sha1:
+        return [_action_link("command.detail.download",
+                             "{} download {}".format(prefix, number))]
+    if entry.status == STATUS_AWAITING_INSTALL:
+        return [_action_link("command.detail.install",
+                             "{} install {}".format(prefix, number))]
+    return []
+
+
+def _reply_detail(
+    source: CommandSource, entry: UpdateEntry, prefix: str = ROOT_LITERALS[0]
+) -> None:
+    """One mod's detail: the version change, the links, its notes, and the action it affords.
+
+    Links are labels with an ``open_url`` click and the url on hover, not the url itself —
+    which is what lets a mod's detail afford two of them while a listing cannot afford one.
+    """
+    for label, value, url in entry_detail_rows(entry, tr):
+        if not label:
+            source.reply(RText(value, RColor.white))
+            continue
+        rendered = (
+            RText(value, RColor.aqua).set_click_event(RAction.open_url, url).set_hover_text(url)
+            if url
+            else RText(value, RColor.green)
+        )
+        source.reply(RTextList(RText(label, RColor.gray), rendered))
+    for link in _action_rows(entry, prefix):
+        source.reply(link)
+
+
 def _notification_lines(report: Report) -> List[str]:
     """The body of an in-game notification.
 
@@ -863,6 +1193,10 @@ def _notification_lines(report: Report) -> List[str]:
 
     if not lines:
         lines.append(tr("report.no_updates"))
+    elif updates or pending:
+        # A truncated list with no way onward is a dead end, so the notification says which
+        # command carries the rest.
+        lines.append(tr("check.in_game_more_hint"))
     return lines
 
 
@@ -908,7 +1242,7 @@ def _permitted_players(
 
     The threshold is a parameter rather than read from the config inside, because the two
     callers genuinely mean different things: ``notify_in_game_permission`` is "who may be
-    told about updates", while ``admin_join_permission`` is "who counts as an admin worth
+    told about updates", while ``report.admin_permission`` is "who counts as an admin worth
     waking up for". Folding them into one setting would make the option that is no longer
     read look like it still works.
 
@@ -936,7 +1270,7 @@ def _admin_join_worker(server: PluginServerInterface, player: str) -> None:
       about mod updates when they log in, so an answer from ten minutes ago serves that goal
       better than a fresh scan: it arrives instantly instead of after a full read of ``mods/``,
       and three admins logging in together do not each fire a round of API calls. The window
-      is ``admin_join_max_report_age_minutes``; set it to ``0`` to always re-check.
+      is ``report.reuse_report_minutes``; set it to ``0`` to always re-check.
     * **A check that could not start still answers.** If another check holds the lock, the
       admin gets the previous report with its age, which beats silence.
     """
@@ -958,6 +1292,17 @@ def _admin_join_worker(server: PluginServerInterface, player: str) -> None:
 
     if _stop_event.is_set():
         return
+
+    # What the last stop replaced comes first: it is news about this server's own files, and
+    # the admin is the only one who can act on it. Sent once, then marked so the next admin
+    # does not get the same list again.
+    install = _read_install_report(server)
+    if install is not None and not install.get("notified"):
+        # The summary carries its own header, so no second one is added here: two headings for
+        # one list is how a message starts looking like the plugin talking to itself.
+        _tell_player(server, player, _install_summary_lines(install))
+        _mark_install_reported(server, install, "notified")
+
     if report is None:
         _tell_player(server, player, [tr("check.admin_join_no_report")])
         return
@@ -1086,14 +1431,26 @@ def _show_summary(source: CommandSource) -> None:
     _reply_lines(source, render_summary(_last_report, tr))
 
 
-def _show_full(source: CommandSource) -> None:
+def _show_list(source: CommandSource, prefix: str = ROOT_LITERALS[0]) -> None:
+    """``list`` — the numbered index. Detail is one click away, not inline.
+
+    It used to print every mod's project page, download url and notes inline: five to seven
+    lines each, so even a small server's output ran past a chat page and the useful rows were
+    the ones that scrolled off.
+    """
     if _last_report is None:
         source.reply(tr("command.no_report_yet"))
         return
-    _reply_lines(source, render_full(_last_report, tr))
+    _reply_index(source, _last_report, prefix=prefix)
 
 
-def _show_filtered(source: CommandSource, status: str) -> None:
+def _show_filtered(source: CommandSource, status: str, prefix: str = ROOT_LITERALS[0]) -> None:
+    """``list <状态>`` — the same index, filtered. Numbers keep their full-list meaning.
+
+    Numbering over the filtered set would be more natural to read, but it would make a click
+    ambiguous: the same number would mean different mods depending on which command produced
+    the row. Keeping one numbering means a number always identifies a mod.
+    """
     wanted = (status or "").strip().lower()
     if wanted not in ALL_STATUSES:
         source.reply(tr("command.unknown_status", value=status, options=", ".join(ALL_STATUSES)))
@@ -1101,12 +1458,354 @@ def _show_filtered(source: CommandSource, status: str) -> None:
     if _last_report is None:
         source.reply(tr("command.no_report_yet"))
         return
-    entries = _last_report.by_status(wanted)
-    source.reply(tr("report.header", version=_last_report.server.describe(),
-                    source=_last_report.server.mc_version_source))
-    source.reply("  [{}] {}".format(wanted, len(entries)))
-    for entry in sorted(entries, key=lambda item: item.name.lower()):
-        source.reply(_coloured_line(render_entry_line(entry, tr, verbose=True)))
+    _reply_index(source, _last_report, entries=_last_report.by_status(wanted), prefix=prefix)
+
+
+def _show_info(source: CommandSource, target: str, prefix: str = ROOT_LITERALS[0]) -> None:
+    """``info <编号|mod id|文件名>`` — one mod's version change, links and notes."""
+    if _last_report is None:
+        source.reply(tr("command.no_report_yet"))
+        return
+    text = (target or "").strip()
+    if not text:
+        source.reply(tr("command.info.usage"))
+        return
+    entry = _last_report.entry_by_handle(text)
+    if entry is None:
+        source.reply(tr("command.info.unknown", value=text))
+        return
+    _reply_detail(source, entry, prefix=prefix)
+
+
+# --------------------------------------------------------------------------------------
+# Fetching and installing one mod, on demand
+#
+# The same two steps the automatic path takes, but for a single mod the admin names, and
+# available whether or not the automatic halves are switched on. Both end in something awkward
+# to undo — one spends bandwidth, the other plans a change to ``mods/`` that happens while
+# nobody is watching — so neither acts on the first command: ``!!muc download 3`` and
+# ``!!muc install 3`` stage a plan, and ``!!muc confirm`` carries it out.
+# --------------------------------------------------------------------------------------
+
+
+def _requester(source: CommandSource) -> str:
+    """A stable name for whoever typed a command.
+
+    The console has no player name, and giving it the empty string would collide with a player
+    whose name failed to resolve — so it gets a name of its own. Nothing is sent to it; the
+    value only ever decides whose ``!!muc confirm`` matches.
+    """
+    player = getattr(source, "player", "")
+    return str(player) if getattr(source, "is_player", False) and player else "<console>"
+
+
+def _number_of(report: Report, entry: UpdateEntry) -> Optional[int]:
+    """The listing's number for an entry, so a reply can name the handle to type next."""
+    for number, candidate in report.indexed_entries():
+        if candidate is entry:
+            return number
+    return None
+
+
+def _clear_pending() -> None:
+    global _pending_action
+    with _pending_lock:
+        _pending_action = None
+
+
+def _stage_action(
+    kind: str, source: CommandSource, report: Report, entry: UpdateEntry, lines: Sequence[str]
+) -> None:
+    """Remember what ``!!muc confirm`` is about to do, and print the plan it will carry out.
+
+    The file name is stored alongside the number on purpose. A check can finish between the two
+    commands, and the numbers of the new report are a new mapping — so the confirmation
+    re-resolves the handle and refuses if it no longer points at the same mod. A number that
+    quietly started meaning something else is precisely the mistake the two steps exist to make
+    impossible.
+    """
+    global _pending_action
+    with _pending_lock:
+        superseded = _pending_action is not None
+        _pending_action = {
+            "kind": kind,
+            "number": _number_of(report, entry),
+            "file_name": entry.file_name,
+            "mod_id": entry.mod_id,
+            "requester": _requester(source),
+            "deadline": time.monotonic() + CONFIRM_TIMEOUT_SECONDS,
+        }
+    if superseded:
+        source.reply(tr("command.action.superseded"))
+    _reply_lines(source, lines)
+
+
+def _pending_action_for(source: CommandSource) -> Optional[Dict[str, Any]]:
+    """The staged action, or ``None`` after explaining why there is nothing to confirm.
+
+    The three ways to get here are answered separately on purpose: "you never staged anything",
+    "yours expired" and "that was somebody else's" call for three different next actions, and a
+    single "nothing to confirm" would leave the reader guessing which one they hit.
+    """
+    global _pending_action
+    with _pending_lock:
+        pending = _pending_action
+    if pending is None:
+        source.reply(tr("command.action.nothing"))
+        return None
+    if time.monotonic() > pending["deadline"]:
+        _clear_pending()
+        source.reply(tr("command.action.expired", seconds=CONFIRM_TIMEOUT_SECONDS))
+        return None
+    if pending["requester"] != _requester(source):
+        source.reply(tr("command.action.other_player", player=pending["requester"]))
+        return None
+    return pending
+
+
+def _manual_download(source: CommandSource, handle: str, prefix: str) -> None:
+    """``download <编号>`` — stage a fetch of one mod's newer build.
+
+    Works with ``download.enabled`` off, which is the point: the automatic setting answers
+    "fetch everything you find", and an admin who wants one mod now should not have to switch it
+    on and wait for a whole run to pick it up.
+    """
+    report = _last_report
+    if report is None:
+        source.reply(tr("command.no_report_yet"))
+        return
+    text = (handle or "").strip()
+    if not text:
+        source.reply(tr("command.download.usage", command=prefix))
+        return
+    entry = report.entry_by_handle(text)
+    if entry is None:
+        source.reply(tr("command.info.unknown", value=text))
+        return
+    number = _number_of(report, entry)
+
+    reason = _download_blocker(entry, prefix, number)
+    if reason is not None:
+        source.reply(reason)
+        return
+
+    _stage_action(
+        "download", source, report, entry,
+        [
+            tr("command.download.plan_header", count=1),
+            tr("line.update", name=entry.name, local=entry.local_version or "?",
+               latest=entry.latest_version or "?"),
+            tr("command.download.plan_file",
+               file=safe_jar_name(entry.download_filename, entry.fallback_file_name()),
+               size=_format_size(entry.download_size) if entry.download_size
+               else tr("command.download.size_unknown")),
+            tr("command.action.ask", seconds=CONFIRM_TIMEOUT_SECONDS,
+               command=prefix + " confirm"),
+        ],
+    )
+
+
+def _download_blocker(entry: UpdateEntry, prefix: str, number: Optional[int]) -> Optional[str]:
+    """Why this entry cannot be fetched, or ``None`` when it can.
+
+    One message per situation rather than a single "cannot download", because the four cases
+    ask for four different things from the admin — and the one that matters most is the second:
+    a build that is already in the download folder needs ``install``, and telling its owner
+    "cannot download" would send them looking for a problem that does not exist.
+    """
+    if entry.status == STATUS_AWAITING_INSTALL:
+        return tr("command.download.already", name=entry.name,
+                  command="{} install {}".format(prefix, number))
+    if entry.status == STATUS_UPDATE_AVAILABLE:
+        if not entry.download_url or not entry.download_sha1:
+            return tr("command.download.no_file", name=entry.name)
+        return None
+    if entry.status == STATUS_NO_COMPATIBLE_BUILD:
+        return tr("command.download.no_build", name=entry.name)
+    if entry.status == STATUS_UP_TO_DATE or entry.status == STATUS_LOCAL_AHEAD:
+        return tr("command.download.current", name=entry.name,
+                  version=entry.local_version or "?")
+    return tr("command.download.unresolvable", name=entry.name,
+              status=tr("status." + entry.status))
+
+
+def _manual_install(source: CommandSource, handle: str, prefix: str) -> None:
+    """``install <编号>`` — authorise one downloaded build for the next stop.
+
+    The build has to be on disk already: fetching is ``!!muc download``'s job, and letting this
+    command imply it would make the two-step form ambiguous about what is being confirmed.
+    """
+    report = _last_report
+    if report is None:
+        source.reply(tr("command.no_report_yet"))
+        return
+    text = (handle or "").strip()
+    if not text:
+        source.reply(tr("command.install.usage", command=prefix))
+        return
+    entry = report.entry_by_handle(text)
+    if entry is None:
+        source.reply(tr("command.info.unknown", value=text))
+        return
+    number = _number_of(report, entry)
+
+    if entry.status != STATUS_AWAITING_INSTALL:
+        source.reply(
+            tr("command.install.not_downloaded", name=entry.name,
+               command="{} download {}".format(prefix, number))
+            if entry.status == STATUS_UPDATE_AVAILABLE
+            else tr("command.install.not_applicable", name=entry.name,
+                    status=tr("status." + entry.status))
+        )
+        return
+
+    upstream = entry.download_filename or entry.fallback_file_name()
+    lines = [
+        tr("command.install.plan_header"),
+        tr("command.install.plan_swap", old=entry.file_name,
+           new=safe_jar_name(upstream, entry.fallback_file_name())),
+    ]
+    if _config.download.install_on_stop:
+        # Said out loud rather than silently accepted: on a server that installs everything
+        # anyway this command changes nothing, and an admin who did not know that would think
+        # they had just narrowed the next stop to one mod.
+        lines.append(tr("command.install.plan_already_automatic"))
+    lines.append(tr("command.action.ask", seconds=CONFIRM_TIMEOUT_SECONDS,
+                    command=prefix + " confirm"))
+    _stage_action("install", source, report, entry, lines)
+
+
+def _manual_confirm(source: CommandSource, prefix: str) -> None:
+    """``confirm`` — carry out whatever ``download`` or ``install`` staged."""
+    pending = _pending_action_for(source)
+    if pending is None:
+        return
+
+    report = _last_report
+    entry = report.entry_by_handle(str(pending["number"])) if report is not None else None
+    if entry is None or entry.file_name != pending["file_name"]:
+        # The report was replaced between the two commands, so the number means something else
+        # now — act on nothing rather than on whatever it happens to point at.
+        _clear_pending()
+        source.reply(tr("command.action.stale", command=prefix))
+        return
+
+    number = int(pending["number"] or 0)
+    if pending["kind"] == "download":
+        _clear_pending()
+        _confirmed_download(source, entry, number, prefix)
+    else:
+        _confirmed_install(source, entry, prefix)
+
+def _confirmed_download(
+    source: CommandSource, entry: UpdateEntry, number: int, prefix: str
+) -> None:
+    """Run the fetch the plan was about, on its own thread.
+
+    Off MCDR's command thread because it is a multi-megabyte transfer: replying first and
+    fetching behind is what keeps the server's own command handling responsive. Nothing needs a
+    lock — two downloads for different mods are independent, and the ledger is saved per file.
+    """
+    source.reply(tr("command.download.started", name=entry.name,
+                    version=entry.latest_version or "?"))
+
+    def run() -> None:
+        try:
+            outcome = _perform_manual_download(entry)
+        except Exception as error:  # noqa: BLE001 - a failure must not take the server down
+            server = _server
+            if server is not None:
+                server.logger.exception("manual download failed")
+            _reply_to(source, tr("command.download.failed", name=entry.name,
+                                 reason="{}: {}".format(type(error).__name__, error)))
+            return
+        if outcome is None:
+            _reply_to(source, tr("command.download.failed", name=entry.name,
+                                 reason=tr("command.download.bad_folder")))
+        elif outcome.status in (STATUS_DOWNLOADED, STATUS_ALREADY_PRESENT):
+            _reply_to(source, tr("command.download.done", name=entry.name,
+                                 version=entry.latest_version or "?",
+                                 path=outcome.path,
+                                 command="{} install {}".format(prefix, number)))
+        else:
+            _reply_to(source, tr("command.download.failed", name=entry.name,
+                                 reason=_reason_text("download.reason.", outcome.detail)))
+
+    threading.Thread(
+        target=run, name="mod_update_checker_manual_download", daemon=True
+    ).start()
+
+
+def _perform_manual_download(entry: UpdateEntry) -> Optional[DownloadOutcome]:
+    """Fetch one entry, outside the check run. ``None`` when the folder is unusable."""
+    server = _server
+    assert server is not None
+    folder, _reason = resolve_download_folder(server, _config)
+    if folder is None:
+        return None
+
+    options = DownloadOptions(
+        folder=folder,
+        max_bytes=max(1, int(_config.download.max_size_mb)) * 1024 * 1024,
+        retries=max(0, int(_config.download.retries)),
+    )
+    ledger = DownloadLedger(
+        Path(server.get_data_folder()) / DOWNLOAD_LEDGER_FILE_NAME, logger=server.logger
+    )
+    http = _make_http_client(_config)
+    try:
+        outcomes = Downloader(
+            http, options, logger=server.logger, ledger=ledger
+        ).run([entry])
+        # The build is on disk now, so it stops being "an update to fetch". Done here rather
+        # than left to the next check so the very next ``!!muc list`` shows the new state.
+        classify_downloaded([entry], folder, ledger)
+        if entry.status == STATUS_AWAITING_INSTALL and _last_report is not None:
+            _last_report.download_folder = str(folder)
+    finally:
+        http.close()
+        ledger.save()
+    for outcome in outcomes:
+        if outcome.file_name == entry.file_name:
+            return outcome
+    return None
+
+
+def _confirmed_install(
+    source: CommandSource, entry: UpdateEntry, prefix: str
+) -> None:
+    """Mark one downloaded build as authorised, for the next ``on_server_stop``.
+
+    Nothing is copied here. The install only ever happens with the server down, so this writes
+    a mark on the ledger record and says when it will be acted on — which is also why it needs
+    a confirmation: the admin is approving an action they will not be present for.
+    """
+    server = _server
+    assert server is not None
+    ledger = DownloadLedger(
+        Path(server.get_data_folder()) / DOWNLOAD_LEDGER_FILE_NAME, logger=server.logger
+    )
+    if not ledger.approve(entry_key(entry)):
+        # The record is written when the file lands, so this means the download folder was
+        # emptied or the ledger edited by hand behind the plugin's back.
+        _clear_pending()
+        source.reply(tr("command.install.no_record", name=entry.name))
+        return
+    ledger.save()
+    _clear_pending()
+    source.reply(tr("command.install.approved", name=entry.name,
+                    version=entry.latest_version or "?",
+                    command="{} status".format(prefix)))
+
+
+def _reply_to(source: CommandSource, message: str) -> None:
+    """Reply to a command source from a background thread, tolerating a vanished player."""
+    try:
+        source.reply(message)
+    except Exception as error:  # noqa: BLE001 - the player may have left mid-download
+        server = _server
+        if server is not None:
+            server.logger.debug("could not reply to {}: {}".format(source, error))
 
 
 def _field(label: str, value: str, value_colour: Any = RColor.green) -> RTextList:
@@ -1120,6 +1819,23 @@ def _field(label: str, value: str, value_colour: Any = RColor.green) -> RTextLis
     white or green is the content, gray is an aside.
     """
     return RTextList(RText(label, RColor.aqua), RText(value, value_colour))
+
+
+def _approved_install_count(server: PluginServerInterface) -> int:
+    """How many downloads an admin has authorised by hand, or ``0`` if that cannot be told.
+
+    Read for the status page only. ``!!muc status`` reports the automatic setting, and after
+    ``!!muc install`` that one line would otherwise still say "off" — technically true, and
+    exactly the kind of half-answer that makes an admin go looking for a change that is already
+    there.
+    """
+    try:
+        ledger = DownloadLedger(
+            Path(server.get_data_folder()) / DOWNLOAD_LEDGER_FILE_NAME, logger=None
+        )
+    except Exception:  # noqa: BLE001 - a status page is not worth failing over
+        return 0
+    return len(ledger.approved_keys())
 
 
 def _show_status(source: CommandSource) -> None:
@@ -1138,6 +1854,16 @@ def _show_status(source: CommandSource) -> None:
     modrinth_state = (
         tr("command.status.enabled") if _config.sources.modrinth.enabled else tr("command.status.disabled")
     )
+    automatic = _config.download.install_on_stop
+    if automatic:
+        install_state, install_colour = tr("command.status.install_on"), RColor.yellow
+    else:
+        approved = _approved_install_count(server)
+        install_state = (
+            tr("command.status.install_pending", count=approved) if approved
+            else tr("command.status.install_off")
+        )
+        install_colour = RColor.yellow if approved else RColor.gray
     parts = RTextList(
         _title_line(server),
         "\n",
@@ -1157,6 +1883,14 @@ def _show_status(source: CommandSource) -> None:
         _field(tr("command.status.upstream_label"),
                tr("command.status.upstream", modrinth=modrinth_state),
                RColor.white),
+        # The setting that changes files on this server belongs on the page that describes
+        # what the plugin is doing, not only in the config file.
+        "\n",
+        _field(
+            tr("command.status.install_label"),
+            install_state,
+            install_colour,
+        ),
     )
     if _config.check.ignored_mods:
         parts.append("\n")
@@ -1202,6 +1936,10 @@ def _reload_config(source: CommandSource) -> None:
     global _config
     _config = _load_config(server)
     _apply_language(server, _config)
+    # A plan is shown with the settings that were in force when it was staged — the size limit,
+    # the retry count, the folder. Re-reading the config can change all three, so the plan is
+    # dropped rather than carried out against numbers the admin never saw.
+    _clear_pending()
     _stop_scheduler()
     _start_interval_scheduler(server)
     source.reply(tr("console.config_reloaded"))
@@ -1227,7 +1965,8 @@ def _plugin_title(server: Optional[PluginServerInterface]) -> Tuple[str, str]:
 
 
 def _title_line(server: Optional[PluginServerInterface] = None) -> RTextList:
-    """``========  Mod Update Checker v1.5.0  ========``
+    """``========  Mod Update Checker v1.0.0  ========`` — the name and version read from
+    the plugin metadata, so the example above is just a shape, not a version to keep in step.
 
     The bar is sized to the name so the two sides stay even, with a floor so a very long or
     very short name still looks deliberate. Name and version are coloured differently because
@@ -1245,17 +1984,19 @@ def _title_line(server: Optional[PluginServerInterface] = None) -> RTextList:
     return line
 
 
-def _help_line(description: str, command: str, action: Any) -> RTextList:
-    """One ``!!muc <subcommand>  -- description`` row, left column padded to line up.
+def _help_line(description: str, command: str, action: Any, width: int) -> RTextList:
+    """One ``!!muc <subcommand>  -- description`` row, left column padded to ``width``.
 
-    The separator carries its own leading space, so the column width is the longest command
-    itself and the descriptions all start at the same place — no command needs a gap jammed
-    against it, and the longest one is not pushed out of alignment by one.
+    The separator carries its own leading space, so the column is exactly as wide as the longest
+    command on the page, and every description starts at the same place. ``width`` is measured
+    from the rows that are actually printed rather than kept as a constant — a hand-kept number
+    is one more thing to remember when a command is added, and getting it wrong pushes the
+    longest row out of alignment rather than failing visibly.
 
     The click event goes on the command only: the padding that makes the column straight is not
     part of what gets typed when the row is clicked.
     """
-    padding = " " * max(0, _HELP_COMMAND_WIDTH - len(command))
+    padding = " " * max(0, width - len(command))
     click = command + (" " if action is RAction.suggest_command else "")
     return RTextList(
         RText(command, RColor.aqua).set_click_event(action, click),
@@ -1270,38 +2011,39 @@ def _show_help(source: CommandSource, prefix: str = ROOT_LITERALS[0]) -> None:
     ``prefix`` is the spelling actually typed, so ``!!muc help`` lists ``!!muc ...`` and not
     the other alias. The other spelling is mentioned once in the usage line instead.
 
-    Every row is clickable: the command runs when clicked, except ``list``, which suggests
-    rather than runs — it works bare, but the useful form takes a status filter, so the input
-    box is filled in ready for one instead of firing the unfiltered listing.
+    Every row is clickable. ``list``, ``check``, ``confirm`` and friends run when clicked —
+    they work bare, and running them is what the reader wants. The four whose useful form takes
+    an argument (``info``, ``download``, ``install``) suggest instead, filling the input box
+    ready for one rather than firing a command that can only answer with its own usage.
     """
     other = next((name for name in ROOT_LITERALS if name != prefix), prefix)
-    rows = RTextList()
-    # Built with explicit ``RTextList`` calls rather than by looping over a tuple of keys: the
+    # Built with explicit ``tr`` calls rather than by looping over a tuple of keys: the
     # catalogue invariant collects key literals from their call sites, so a key reached through
     # a variable would look unused and be reported as a stale entry.
+    entries = (
+        (tr("command.help.entry_summary"), prefix, RAction.run_command),
+        (tr("command.help.entry_check"), prefix + " check", RAction.run_command),
+        (tr("command.help.entry_list"), prefix + " list", RAction.run_command),
+        (tr("command.help.entry_info"), prefix + " info", RAction.suggest_command),
+        (tr("command.help.entry_download"), prefix + " download", RAction.suggest_command),
+        (tr("command.help.entry_install"), prefix + " install", RAction.suggest_command),
+        (tr("command.help.entry_confirm"), prefix + " confirm", RAction.run_command),
+        (tr("command.help.entry_status"), prefix + " status", RAction.run_command),
+        (tr("command.help.entry_reload"), prefix + " reload", RAction.run_command),
+        (tr("command.help.entry_help"), prefix + " help", RAction.run_command),
+    )
+    width = max(len(command) for _description, command, _action in entries)
+
+    rows = RTextList()
     rows.append(_title_line(_server))
     rows.append("\n")
     rows.append(RText(tr("command.help.usage", command=prefix, alias=other), RColor.gray))
     rows.append("\n")
     rows.append(RText(tr("command.help.permission", level=_config.command_permission_level),
                       RColor.yellow))
-    rows.append("\n")
-    rows.append(_help_line(tr("command.help.entry_summary"), prefix, RAction.run_command))
-    rows.append("\n")
-    rows.append(_help_line(tr("command.help.entry_check"), prefix + " check",
-                           RAction.run_command))
-    rows.append("\n")
-    rows.append(_help_line(tr("command.help.entry_list"), prefix + " list",
-                           RAction.suggest_command))
-    rows.append("\n")
-    rows.append(_help_line(tr("command.help.entry_status"), prefix + " status",
-                           RAction.run_command))
-    rows.append("\n")
-    rows.append(_help_line(tr("command.help.entry_reload"), prefix + " reload",
-                           RAction.run_command))
-    rows.append("\n")
-    rows.append(_help_line(tr("command.help.entry_help"), prefix + " help",
-                           RAction.run_command))
+    for description, command, action in entries:
+        rows.append("\n")
+        rows.append(_help_line(description, command, action, width))
     source.reply(rows)
 
 
@@ -1334,15 +2076,43 @@ def _command_tree(prefix: str):
         .then(Literal("check").runs(_trigger_check))
         .then(
             Literal("list")
-            .runs(_show_full)
+            .runs(lambda source: _show_list(source, prefix))
             .then(
                 GreedyText("status").runs(
-                    lambda source, context: _show_filtered(source, context["status"])
+                    lambda source, context: _show_filtered(source, context["status"], prefix)
+                )
+            )
+        )
+        .then(
+            Literal("info")
+            .runs(lambda source: source.reply(tr("command.info.usage")))
+            .then(
+                GreedyText("target").runs(
+                    lambda source, context: _show_info(source, context["target"], prefix)
                 )
             )
         )
         .then(Literal("status").runs(_show_status))
         .then(Literal("reload").runs(_reload_config))
+        .then(
+            Literal("download")
+            .runs(lambda source: source.reply(tr("command.download.usage", command=prefix)))
+            .then(
+                GreedyText("target").runs(
+                    lambda source, context: _manual_download(source, context["target"], prefix)
+                )
+            )
+        )
+        .then(
+            Literal("install")
+            .runs(lambda source: source.reply(tr("command.install.usage", command=prefix)))
+            .then(
+                GreedyText("target").runs(
+                    lambda source, context: _manual_install(source, context["target"], prefix)
+                )
+            )
+        )
+        .then(Literal("confirm").runs(lambda source: _manual_confirm(source, prefix)))
     )
 
 
@@ -1465,12 +2235,28 @@ def on_unload(server: PluginServerInterface) -> None:
 
 
 def on_server_startup(server: PluginServerInterface) -> None:
-    if _config.enabled and _config.check.on_server_start:
+    if not _config.enabled:
+        return
+    # What the last stop replaced. Announced here rather than at install time because there is
+    # nobody listening while the server is down.
+    _announce_install_reminder(server)
+    if _config.check.on_server_start:
         _schedule_startup_check(server)
 
 
 def on_server_stop(server: PluginServerInterface, server_return_code: int) -> None:
+    """The one moment ``mods/`` may be written: nothing is reading it any more."""
     # A pending startup check would otherwise fire against a stopped server and report
-    # nonsense; the event is also the natural point to drop stale player state.
+    # nonsense; the event is also the natural point to drop stale player state, and a staged
+    # ``!!muc confirm`` — whose whole point is that it is acted on now, not at some later stop.
     _online_players.clear()
+    _clear_pending()
+
+    if not _config.enabled:
+        return
+    try:
+        _install_on_stop(server)
+    except Exception as error:  # noqa: BLE001 - a failed install must not break the shutdown
+        server.logger.warning(tr("install.crashed", error="{}: {}".format(
+            type(error).__name__, error)))
 

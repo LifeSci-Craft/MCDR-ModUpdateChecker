@@ -126,15 +126,6 @@ def normalize(code: Any) -> str:
 _CATALOGS: Dict[str, Catalog] = {}
 
 
-def relative_catalog_path(language: str) -> str:
-    """The catalogue's path as it appears in the repository (for messages).
-
-    Not the on-disk path: inside a packed plugin that would be a path containing ``.mcdr``,
-    which tells a user nothing useful.
-    """
-    return "{}/{}/{}.json".format(__package__, LANG_DIR_NAME, language)
-
-
 def get_catalog(language: str) -> Catalog:
     """Load ``<language>.json`` (cached). Never raises: failure gives an empty catalogue."""
     cached = _CATALOGS.get(language)
@@ -161,11 +152,6 @@ def get_catalog(language: str) -> Catalog:
                 catalog = Catalog({}, "the catalogue must be a JSON object")
     _CATALOGS[language] = catalog
     return catalog
-
-
-def clear_cache() -> None:
-    """Forget every loaded catalogue (used by the tests)."""
-    _CATALOGS.clear()
 
 
 def translate(key: str, language: str = FALLBACK_LANGUAGE, **kwargs: Any) -> str:

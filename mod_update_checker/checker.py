@@ -65,7 +65,7 @@ __all__ = ["CheckOptions", "Checker", "ResolveCache", "USER_AGENT", "normalise_n
 _LOGGER = logging.getLogger(__name__)
 
 #: Modrinth requires a descriptive User-Agent and uses it to contact an abusive client.
-USER_AGENT = "Pau1am/MCDR-ModUpdateChecker (+https://github.com/Pau1am/MCDR-ModUpdateChecker)"
+USER_AGENT = "LifeSci-Craft/MCDR-ModUpdateChecker (+https://github.com/LifeSci-Craft/MCDR-ModUpdateChecker)"
 
 #: Fallback per-mod query budget, so one misbehaving upstream cannot stall a whole run.
 _MAX_WORKERS = 8

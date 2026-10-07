@@ -150,6 +150,27 @@ def build_scenario_jars(upstream: FakeUpstream, workdir: Path) -> List[Path]:
         )
     )
 
+    # 4b. Renamed by the admin, which is the case the install stage has to carry over: the
+    #     bracket note is theirs and belongs on the new file too.
+    prefixed = add("[测试-前缀]prefixed.jar", id="prefixed", version="1.0.0",
+                   name="Prefixed Mod")
+    new_prefixed = published("prefixed-fabric-1.1.0.jar", id="prefixed", version="1.1.0",
+                             name="Prefixed Mod")
+    upstream.add_project(
+        FakeProject(
+            id="proj-prefixed",
+            slug="prefixed",
+            title="Prefixed Mod",
+            versions=[
+                version("proj-prefixed", "p-1", "1.0.0", sha1_of(prefixed),
+                        "2026-01-01T00:00:00Z", "[测试-前缀]prefixed.jar"),
+                version("proj-prefixed", "p-2", "1.1.0", new_prefixed["sha1"],
+                        "2026-02-01T00:00:00Z", new_prefixed["filename"],
+                        sha512=new_prefixed["sha512"], size=new_prefixed["size"]),
+            ],
+        )
+    )
+
     # 5. A library jar that is not a mod at all: the report must say so rather than guess.
     library = directory / "library.jar"
     write_jar(library, fabric=None)

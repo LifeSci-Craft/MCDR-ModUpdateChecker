@@ -410,17 +410,29 @@ def test_the_end_to_end_run_uses_the_shipped_defaults():
 
     # Every option the tool sets, as a dotted path — the config file groups its options into
     # sections, so comparing sets of paths is the only way to ask this question of both shapes.
+    #
+    # Both runs are asked. One option (``download.install_on_stop``) is set by ``--with-install``
+    # alone, because installing moves the fetched files out of the folder the default run's
+    # download assertions inspect; without asking about both, the declared list and the set it
+    # describes would never agree.
     from support import flatten_options, option_paths
 
+    with_install = tool.plugin_config(_Upstream(), install=True)
     overridden = flatten_options(config)
 
-    assert set(tool.CONFIG_OVERRIDES) == set(overridden), (
+    assert set(tool.CONFIG_OVERRIDES) == set(overridden) | set(flatten_options(with_install)), (
         "the matrix config drifted from its declared overrides://n"
         "  extra: {}\n  missing: {}".format(
-            sorted(set(overridden) - set(tool.CONFIG_OVERRIDES)),
-            sorted(set(tool.CONFIG_OVERRIDES) - set(overridden)),
+            sorted((set(overridden) | set(flatten_options(with_install)))
+                   - set(tool.CONFIG_OVERRIDES)),
+            sorted(set(tool.CONFIG_OVERRIDES)
+                   - set(overridden) - set(flatten_options(with_install))),
         )
     )
+
+    # And the install run differs by exactly that one option, so the second run stays a second
+    # run of the same thing rather than a differently configured one.
+    assert set(flatten_options(with_install)) - set(overridden) == {"download.install_on_stop"}
 
     # The options whose defaults must be in force, i.e. absent from the override dict. These
     # are the ones that decide whether a code path runs at all.
@@ -1160,19 +1172,37 @@ def test_every_help_row_is_clickable_and_describes_its_command():
     assert descriptions, "the help rows have no descriptions"
 
 
-def test_the_list_row_suggests_rather_than_runs():
-    """``list`` works bare, but its useful form takes a status filter.
+def test_only_the_row_that_needs_an_argument_suggests_instead_of_running():
+    """Help rows run, except where the command is useless without an argument.
 
-    Running it unfiltered the moment it is clicked would answer a question the admin did not
-    ask; filling the input box lets them add the status.
+    ``list`` runs: it is a read-only listing and the useful thing to see. ``info`` does not —
+    it needs a mod, so clicking it fills the input box rather than firing an error, which is
+    what makes the number in the listing worth copying. ``download`` and ``install`` follow the
+    same rule for the same reason; ``confirm`` takes nothing, so it runs.
     """
     segments = list(_segments(_render_help("!!muc")[0]))
-    row = next(
-        item for item in segments
-        if item.get("text") == "!!muc list"
-    )
-    assert row["clickEvent"]["action"] == "suggest_command"
-    assert row["clickEvent"]["value"].endswith(" "), "the suggestion should be ready for an argument"
+    rows = {
+        item["text"]: item
+        for item in segments
+        if item.get("text", "").startswith("!!muc ") and "clickEvent" in item
+    }
+
+    for command in ("!!muc list", "!!muc check", "!!muc status", "!!muc reload",
+                    "!!muc confirm"):
+        assert rows[command]["clickEvent"]["action"] == "run_command", command
+
+    for command in ("!!muc info", "!!muc download", "!!muc install"):
+        assert rows[command]["clickEvent"]["action"] == "suggest_command", command
+        # A trailing space, so the number is typed straight after the command.
+        assert rows[command]["clickEvent"]["value"].endswith(" "), command
+
+    # Every command the tree registers is on the page, so a new one cannot be added and left
+    # undiscoverable — the failure this list would otherwise not notice at all. (The bare
+    # ``!!muc`` row is the summary, and is excluded by the ``"!!muc "`` filter above.)
+    assert set(rows) == {
+        "!!muc check", "!!muc list", "!!muc info", "!!muc download", "!!muc install",
+        "!!muc confirm", "!!muc status", "!!muc reload", "!!muc help",
+    }
 
 
 def _segments(node):
@@ -1226,3 +1256,381 @@ def test_the_status_screen_uses_the_same_title_bar_as_the_help():
     ]
     assert bars, "the status screen has no title bar"
     assert bars[0]["text"].strip("=") == "", bars[0]
+
+
+# --------------------------------------------------------------------------------------
+# !!muc download / install / confirm
+#
+# The three commands exist so a single mod can be fetched and installed without switching the
+# automatic halves on. Both end in something awkward to undo, so both are staged and carried
+# out by ``confirm`` — which means the interesting invariants are about what must NOT happen:
+# nothing is fetched on the first command, nothing is installed that the admin did not name,
+# and a plan cannot be carried out after the numbers it referred to have moved.
+# --------------------------------------------------------------------------------------
+
+
+class _PlayerSource:
+    """A named player command source that records the replies."""
+
+    def __init__(self, player="Admin"):
+        self.player = player
+        self.is_player = True
+        self.replies = []
+
+    def reply(self, text, **_kwargs):
+        self.replies.append(str(text))
+
+    @property
+    def body(self):
+        return "\n".join(self.replies)
+
+
+def _manual_env(tmp_path, monkeypatch, status="update_available", player="Admin"):
+    """The plugin wired to a fake server, with one entry and a matching ledger record.
+
+    The ledger record is written because both ``download`` and ``install`` act on records, not
+    on the report: a build with no record is a build the install stage will refuse, and a test
+    that skipped this step would pass while the real flow refused.
+
+    The language is set explicitly rather than inherited. ``_translator`` is module state that
+    survives between tests, so a fixture that leaves it alone makes every assertion below depend
+    on which test ran first — which is a green suite one day and a red one the next.
+    """
+    import mod_update_checker as plugin
+    from mod_update_checker.downloads import DownloadLedger
+    from mod_update_checker.report import UpdateEntry
+
+    monkeypatch.setattr(plugin, "_config", _config_with({"language": "zh_cn"}), raising=False)
+    plugin._apply_language(None, plugin._config)
+    plugin._stop_event.clear()
+    plugin._clear_pending()
+
+    server = _FakeServer(tmp_path, levels={"Admin": 4, "Other": 4})
+    entry = UpdateEntry(
+        mod_id="sodium",
+        name="Sodium",
+        file_name="sodium.jar",
+        local_version="1.0.0",
+        latest_version="1.1.0",
+        status=status,
+        platform="modrinth",
+        project_url="https://modrinth.com/mod/sodium",
+        download_url="https://cdn.example/sodium-1.1.0.jar",
+        download_filename="sodium-fabric-1.1.0.jar",
+        download_sha1="a" * 40,
+        download_size=2048,
+    )
+    monkeypatch.setattr(plugin, "_last_report", _report_with([entry]), raising=False)
+    monkeypatch.setattr(plugin, "_server", server, raising=False)
+
+    ledger = DownloadLedger(
+        Path(server.get_data_folder()) / plugin.DOWNLOAD_LEDGER_FILE_NAME, logger=server.logger
+    )
+    ledger.record("sodium", "sodium-fabric-1.1.0.jar", "a" * 40, "1.1.0", "2026-01-01T00:00:00+00:00",
+                  installed_file="sodium.jar", name="Sodium")
+    ledger.save()
+
+    return plugin, server, _PlayerSource(player), entry, ledger
+
+
+def test_download_stages_a_plan_and_fetches_nothing(tmp_path, monkeypatch):
+    """The first command must not spend bandwidth: that is what ``confirm`` is for."""
+    plugin, _server, source, entry, _ledger = _manual_env(tmp_path, monkeypatch)
+    fetched = []
+    monkeypatch.setattr(
+        plugin, "_perform_manual_download", lambda item: fetched.append(item), raising=False
+    )
+
+    plugin._manual_download(source, "1", "!!muc")
+
+    assert fetched == [], "the download ran before it was confirmed"
+    pending = plugin._pending_action
+    assert pending is not None and pending["kind"] == "download"
+    assert "!!muc confirm" in source.body
+    assert "sodium-fabric-1.1.0.jar" in source.body, source.body
+    assert "2 KB" in source.body, "the plan should say how big the file is"
+
+
+def test_confirm_is_what_runs_the_download(tmp_path, monkeypatch):
+    """And the outcome is reported back with the next command to type."""
+    import mod_update_checker as plugin
+    from mod_update_checker.downloads import STATUS_DOWNLOADED
+
+    plugin_mod, server, source, entry, _ledger = _manual_env(tmp_path, monkeypatch)
+
+    class _Outcome:
+        status = STATUS_DOWNLOADED
+        path = "config/mod_update_checker/downloads/sodium-fabric-1.1.0.jar"
+        file_name = "sodium.jar"
+        detail = ""
+
+    plugin_mod._manual_download(source, "1", "!!muc")
+    monkeypatch.setattr(plugin_mod, "_perform_manual_download",
+                        lambda item: _Outcome(), raising=False)
+    plugin_mod._manual_confirm(source, "!!muc")
+
+    # The fetch runs on its own thread; wait for it rather than sleeping a fixed time.
+    for _ in range(200):
+        if "已下载到" in source.body:
+            break
+        time.sleep(0.02)
+
+    assert "!!muc install 1" in source.body, source.body
+    assert plugin_mod._pending_action is None, "the plan was carried out, so it is spent"
+
+
+def test_a_failed_download_says_why_and_stays_an_update(tmp_path, monkeypatch):
+    """A failure is reported in words, not as the internal code it travels as."""
+    import mod_update_checker as plugin
+    from mod_update_checker.downloads import STATUS_FAILED
+
+    plugin_mod, _server, source, entry, _ledger = _manual_env(tmp_path, monkeypatch)
+
+    class _Outcome:
+        status = STATUS_FAILED
+        path = ""
+        file_name = "sodium.jar"
+        detail = "no-hash-to-verify"
+
+    plugin_mod._manual_download(source, "1", "!!muc")
+    monkeypatch.setattr(plugin_mod, "_perform_manual_download",
+                        lambda item: _Outcome(), raising=False)
+    plugin_mod._manual_confirm(source, "!!muc")
+
+    for _ in range(200):
+        if "失败" in source.body:
+            break
+        time.sleep(0.02)
+
+    assert "上游没有提供哈希" in source.body, source.body
+    assert "no-hash-to-verify" not in source.body, "a raw code reached the player"
+
+
+def test_an_already_downloaded_mod_points_at_install(tmp_path, monkeypatch):
+    """The one case that must not say "cannot download" — there is nothing left to fetch."""
+    plugin, _server, source, _entry, _ledger = _manual_env(
+        tmp_path, monkeypatch, status="awaiting_install"
+    )
+
+    plugin._manual_download(source, "1", "!!muc")
+
+    assert plugin._pending_action is None
+    assert "!!muc install 1" in source.body, source.body
+
+
+def test_a_mod_with_nothing_to_fetch_says_which_case_it_is(tmp_path, monkeypatch):
+    """Four situations, four sentences — an admin needs to know which one they are in."""
+    for status, expected in (
+        ("up_to_date", "已是最新"),
+        ("no_compatible_build", "没有适配本服务端的构建"),
+        ("unresolved", "无法定位到 Modrinth"),
+    ):
+        plugin, _server, source, _entry, _ledger = _manual_env(
+            tmp_path, monkeypatch, status=status
+        )
+        plugin._manual_download(source, "1", "!!muc")
+
+        assert plugin._pending_action is None, status
+        assert expected in source.body, (status, source.body)
+
+
+def test_install_refuses_a_mod_that_has_not_been_downloaded(tmp_path, monkeypatch):
+    """It names the command that fixes it, with the number already filled in."""
+    plugin, _server, source, _entry, _ledger = _manual_env(tmp_path, monkeypatch)
+
+    plugin._manual_install(source, "1", "!!muc")
+
+    assert plugin._pending_action is None
+    assert "!!muc download 1" in source.body, source.body
+
+
+def test_install_stages_the_swap_and_confirm_authorises_only_that_mod(tmp_path, monkeypatch):
+    """The whole point of the per-record flag: five downloads, one named, one installed."""
+    import mod_update_checker as plugin
+    from mod_update_checker.downloads import DownloadLedger
+
+    plugin_mod, server, source, _entry, ledger = _manual_env(
+        tmp_path, monkeypatch, status="awaiting_install"
+    )
+    # A second mod, downloaded and NOT authorised.
+    ledger.record("other", "other-2.0.jar", "b" * 40, "2.0", "2026-01-01T00:00:00+00:00",
+                  installed_file="other.jar", name="Other")
+    ledger.save()
+
+    plugin_mod._manual_install(source, "1", "!!muc")
+    assert plugin_mod._pending_action["kind"] == "install"
+    assert "sodium.jar" in source.body and "sodium-fabric-1.1.0.jar" in source.body, source.body
+    assert "!!muc confirm" in source.body
+
+    plugin_mod._manual_confirm(source, "!!muc")
+
+    assert "已授权" in source.body, source.body
+    # Read back from disk: the command writes its own ledger, because by the time an admin
+    # confirms, the plugin may have been reloaded and the record is what is on disk.
+    written = DownloadLedger(
+        Path(server.get_data_folder()) / plugin_mod.DOWNLOAD_LEDGER_FILE_NAME
+    )
+    assert written.approved_keys() == ["sodium"], "an unauthorised record was swept up"
+
+
+def test_confirm_with_nothing_staged_says_so(tmp_path, monkeypatch):
+    import mod_update_checker as plugin
+
+    plugin_mod, _server, source, _entry, _ledger = _manual_env(tmp_path, monkeypatch)
+    plugin_mod._clear_pending()
+    plugin_mod._manual_confirm(source, "!!muc")
+
+    assert "没有待确认的操作" in source.body, source.body
+
+
+def test_only_the_one_who_staged_it_can_confirm(tmp_path, monkeypatch):
+    """A confirmation is a decision, and only its author can make it."""
+    plugin, _server, source, _entry, _ledger = _manual_env(tmp_path, monkeypatch, player="Admin")
+    other = _PlayerSource("Other")
+
+    plugin._manual_download(source, "1", "!!muc")
+    plugin._manual_confirm(other, "!!muc")
+
+    assert "只有本人可以确认" in other.body, other.body
+    assert plugin._pending_action is not None, "somebody else's confirm consumed the plan"
+
+
+def test_a_lapsed_confirmation_is_refused(tmp_path, monkeypatch):
+    """A ``!!muc confirm`` typed much later must not act on a plan nobody remembers."""
+    plugin, _server, source, _entry, _ledger = _manual_env(tmp_path, monkeypatch)
+
+    plugin._manual_download(source, "1", "!!muc")
+    plugin._pending_action["deadline"] = time.monotonic() - 1
+
+    plugin._manual_confirm(source, "!!muc")
+
+    assert "作废" in source.body, source.body
+    assert plugin._pending_action is None
+
+
+def test_a_confirmation_is_dropped_when_the_report_moved_underneath_it(tmp_path, monkeypatch):
+    """Numbers are a mapping, and a new report is a new mapping.
+
+    Re-resolving ``1`` against a report that has been replaced is how the wrong mod gets
+    installed — the numbers still exist, they just mean something else now.
+    """
+    import mod_update_checker as plugin
+    from mod_update_checker.report import UpdateEntry
+
+    plugin_mod, server, source, _entry, _ledger = _manual_env(
+        tmp_path, monkeypatch, status="awaiting_install"
+    )
+    plugin_mod._manual_install(source, "1", "!!muc")
+
+    # Same number, different mod: exactly what a re-run produces.
+    replacement = UpdateEntry(
+        mod_id="lithium", name="Lithium", file_name="lithium.jar",
+        local_version="0.1", latest_version="0.2", status="awaiting_install",
+    )
+    plugin_mod._last_report = _report_with([replacement])
+
+    plugin_mod._manual_confirm(source, "!!muc")
+
+    assert "作废" in source.body, source.body
+    assert plugin_mod._pending_action is None
+
+
+def test_the_console_counts_as_its_own_requester(tmp_path, monkeypatch):
+    """A player cannot confirm a plan the console staged, and vice versa."""
+    import mod_update_checker as plugin
+
+    plugin_mod, server, _source, _entry, _ledger = _manual_env(tmp_path, monkeypatch)
+    console = _ReplyRecorder()
+    console.player = ""
+    console.is_player = False
+
+    plugin_mod._manual_install(console, "1", "!!muc")
+    # The entry is not downloaded, so nothing was staged — stage it directly to test ``confirm``.
+    plugin_mod._pending_action = {
+        "kind": "install", "number": 1, "file_name": "sodium.jar", "mod_id": "sodium",
+        "requester": plugin_mod._requester(console),
+        "deadline": time.monotonic() + 60,
+    }
+
+    player = _PlayerSource("Admin")
+    plugin_mod._manual_confirm(player, "!!muc")
+
+    assert "只有本人可以确认" in player.body, player.body
+
+
+def test_install_on_stop_installs_only_what_was_authorised(tmp_path, monkeypatch):
+    """With the automatic half off, the ledger is not a work list — the approvals are.
+
+    This is the invariant the per-record flag exists for. Installing the whole ledger here
+    would turn "install this one" into "install everything that happens to be downloaded".
+    """
+    import mod_update_checker as plugin
+    from mod_update_checker.downloads import DownloadLedger
+    from mod_update_checker.installer import STATUS_INSTALLED
+
+    plugin_mod, server, _source, entry, ledger = _manual_env(
+        tmp_path, monkeypatch, status="awaiting_install"
+    )
+    monkeypatch.setattr(plugin_mod, "_config", _config_with(), raising=False)
+
+    # Two real jars: the installed one, and the fetched replacement.
+    mods = Path(tmp_path) / "mods"
+    downloads = Path(server.get_data_folder()) / "downloads"
+    mods.mkdir(parents=True, exist_ok=True)
+    downloads.mkdir(parents=True, exist_ok=True)
+    (mods / "sodium.jar").write_bytes(b"old")
+    blob = b"new-build"
+    (downloads / "sodium-fabric-1.1.0.jar").write_bytes(blob)
+    (mods / "other.jar").write_bytes(b"other-old")
+    (downloads / "other-2.0.jar").write_bytes(b"other-new")
+
+    fresh = DownloadLedger(
+        Path(server.get_data_folder()) / plugin_mod.DOWNLOAD_LEDGER_FILE_NAME
+    )
+    fresh.record("sodium", "sodium-fabric-1.1.0.jar", hashlib.sha1(blob).hexdigest(), "1.1.0",
+                 "2026-01-01T00:00:00+00:00", installed_file="sodium.jar", name="Sodium")
+    fresh.record("other", "other-2.0.jar", hashlib.sha1(b"other-new").hexdigest(), "2.0",
+                 "2026-01-01T00:00:00+00:00", installed_file="other.jar", name="Other")
+    fresh.approve("sodium")
+    fresh.save()
+
+    plugin_mod._install_on_stop(server)
+
+    assert (mods / "sodium-fabric-1.1.0.jar").is_file(), "the authorised mod was not installed"
+    assert (mods / "sodium.jar.old").is_file(), "the old jar was not kept"
+    assert (mods / "other.jar").is_file() and not (mods / "other.jar.old").exists(), (
+        "an unauthorised mod was installed"
+    )
+    assert (mods / "other-2.0.jar").exists() is False
+
+
+def test_install_on_stop_does_nothing_at_all_without_an_approval(tmp_path, monkeypatch):
+    """A server that never used the command must not grow an install report."""
+    import mod_update_checker as plugin
+    from mod_update_checker.downloads import DownloadLedger
+
+    plugin_mod, server, _source, _entry, _ledger = _manual_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(plugin_mod, "_config", _config_with(), raising=False)
+
+    mods = Path(tmp_path) / "mods"
+    mods.mkdir(parents=True, exist_ok=True)
+    (mods / "sodium.jar").write_bytes(b"old")
+
+    plugin_mod._install_on_stop(server)
+
+    assert not (Path(server.get_data_folder()) / plugin_mod.INSTALL_REPORT_FILE_NAME).exists()
+    assert (mods / "sodium.jar.old").exists() is False
+
+
+def test_the_automatic_setting_installs_the_whole_ledger(tmp_path, monkeypatch):
+    """Switching install-on-stop on is itself the instruction, so the flag is not consulted."""
+    import mod_update_checker as plugin
+    from mod_update_checker.installer import pending_records
+
+    plugin_mod, _server, _source, _entry, ledger = _manual_env(tmp_path, monkeypatch)
+    ledger.record("other", "other-2.0.jar", "b" * 40, "2.0", "2026-01-01T00:00:00+00:00",
+                  installed_file="other.jar", name="Other")
+    ledger.save()
+
+    assert pending_records(ledger, approved_only=False) == ["other", "sodium"]
+    assert pending_records(ledger, approved_only=True) == []

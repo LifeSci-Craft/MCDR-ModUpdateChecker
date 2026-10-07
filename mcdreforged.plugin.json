@@ -13,9 +13,9 @@
     }
   ],
   "links": {
-    "homepage": "https://github.com/Pau1am/MCDR-ModUpdateChecker",
-    "source": "https://github.com/Pau1am/MCDR-ModUpdateChecker",
-    "issues": "https://github.com/Pau1am/MCDR-ModUpdateChecker/issues"
+    "homepage": "https://github.com/LifeSci-Craft/MCDR-ModUpdateChecker",
+    "source": "https://github.com/LifeSci-Craft/MCDR-ModUpdateChecker",
+    "issues": "https://github.com/LifeSci-Craft/MCDR-ModUpdateChecker/issues"
   },
   "license": "MIT",
   "dependencies": {

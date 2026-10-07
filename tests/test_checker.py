@@ -17,12 +17,14 @@ asserted rather than assumed.
 """
 
 import json
+import re
 
 import pytest
 
 from mod_update_checker.checker import CheckOptions, Checker, ResolveCache, normalise_name
 from mod_update_checker.i18n import make_translator
 from mod_update_checker.report import (
+    CHAT_PAGE_LINES,
     STATUS_AWAITING_INSTALL,
     STATUS_ERROR,
     STATUS_IGNORED,
@@ -34,8 +36,11 @@ from mod_update_checker.report import (
     STATUS_UPDATE_AVAILABLE,
     Report,
     UpdateEntry,
+    entry_detail_rows,
+    render_detail,
     render_entry_lines,
     render_full,
+    render_index_body,
     render_summary,
 )
 from mod_update_checker.scanner import scan_jar, scan_mods
@@ -832,6 +837,39 @@ def test_summary_and_full_listing_render_in_both_languages(report, language):
     assert not [line for line in full if line.strip().startswith(("note.", "report.", "line."))]
 
 
+def test_the_full_listing_does_not_claim_rows_were_held_back():
+    """The summary is capped and says how many rows it left out; the full one is not capped.
+
+    ``render_full`` asks for the summary's headings with ``max_updates=0``, and the cap used
+    to be applied as "more than zero entries were held back" — so the text report opened with
+    ``... and 13 more`` directly above the section listing all thirteen, with none of them
+    shown above it. The number was the whole list, presented as a remainder.
+    """
+    tr = make_translator("en_us")
+    entries = [
+        UpdateEntry(mod_id="mod{}".format(index), name="Mod {}".format(index),
+                    file_name="mod{}.jar".format(index), local_version="1.0",
+                    latest_version="2.0", status=STATUS_UPDATE_AVAILABLE)
+        for index in range(13)
+    ]
+    report = Report(
+        generated_at="2026-01-01T00:00:00+00:00",
+        server=SERVER,
+        mods_directory="server/mods",
+        entries=entries,
+    )
+
+    summary = "\n".join(render_summary(report, tr))
+    full = "\n".join(render_full(report, tr))
+
+    hidden_line = tr("report.and_more", count=len(entries) - 12)
+    assert hidden_line in summary, "the summary must say what it left out"
+    assert hidden_line not in full, "nothing is left out of the full listing"
+    assert tr("report.and_more", count=len(entries)) not in full
+    # And every mod is there, which is what makes the line above a lie rather than a warning.
+    assert all("Mod {}".format(index) in full for index in range(13))
+
+
 # --------------------------------------------------------------------------------------
 # What a listing looks like
 #
@@ -1023,6 +1061,156 @@ def test_a_name_match_is_flagged_but_the_normal_case_is_not():
 
     assert "按名称匹配" in lines[1], lines[1]
     assert "按文件哈希" not in lines[0], lines[0]
+
+
+# --------------------------------------------------------------------------------------
+# The listing, the numbering, and the detail view
+#
+# The listing used to print each mod's project page, download url and notes inline — five to
+# seven lines per mod, which ran past a page of chat on a server with a handful of mods. It is
+# a numbered index now, with the detail one click away, and the properties below are what make
+# that safe: the number has to identify a mod, and the reply has to fit.
+# --------------------------------------------------------------------------------------
+
+
+def _index_report(entries):
+    return Report(
+        generated_at="2026-01-01T00:00:00+00:00",
+        server=SERVER,
+        mods_directory="server/mods",
+        download_folder="config/mod_update_checker/downloads",
+        entries=list(entries),
+    )
+
+
+def _many(actionable=0, up_to_date=0):
+    entries = [
+        _entry_with_links("act{:03d}".format(i), STATUS_UPDATE_AVAILABLE,
+                          name="Action Mod {:03d}".format(i))
+        for i in range(actionable)
+    ]
+    entries += [
+        _entry_with_links("up{:03d}".format(i), STATUS_UP_TO_DATE, name="Fresh Mod {:03d}".format(i))
+        for i in range(up_to_date)
+    ]
+    return entries
+
+
+def test_the_listing_fits_a_page_whatever_the_server_holds():
+    """The property the whole change exists for.
+
+    A reply that has to be scrolled to find the row you need is the reply that gets closed, so
+    the budget holds at every size — including the two extremes where the actionable set alone
+    overflows, and where nothing is actionable at all.
+    """
+    tr = make_translator("zh_cn")
+    for actionable, up_to_date in ((3, 4), (40, 160), (0, 200), (40, 0), (0, 0)):
+        report = _index_report(_many(actionable, up_to_date))
+        lines = render_index_body(report, tr)
+        assert len(lines) <= CHAT_PAGE_LINES, (actionable, up_to_date, len(lines))
+
+
+def test_the_actionable_mods_are_never_the_ones_left_out():
+    """Priority, not just a cap: what needs doing survives the truncation.
+
+    The sort order already puts them first, and this is what stops a future reordering — say,
+    alphabetical — from quietly pushing the one mod that needs attention off the page.
+    """
+    tr = make_translator("zh_cn")
+    report = _index_report(_many(actionable=40, up_to_date=160))
+    body = "\n".join(render_index_body(report, tr))
+
+    assert "Action Mod 000" in body
+    # 13 rows fit at this budget; every one of them is an actionable mod.
+    assert "Action Mod 012" in body
+    assert "Fresh Mod" not in body
+
+
+def test_a_truncated_listing_says_how_many_it_held_back():
+    """A silent cap is worse than no cap: the reader cannot tell a short list from a cut one.
+
+    The count is read out of the line and compared with the number of mods that are actually
+    missing from the body. Asserting on the *text* would not do: an earlier version printed
+    "另有 -9 个未显示", and the loose check written for it ("no ``-`` in the body") also
+    matched the version arrows in every row, so it could only ever fail — or, worse, pass for
+    the wrong reason.
+    """
+    tr = make_translator("zh_cn")
+    report = _index_report(_many(actionable=40, up_to_date=160))
+    body = "\n".join(render_index_body(report, tr))
+
+    assert "另有" in body and "未显示" in body
+    match = re.search(r"另有\s+(\d+)\s+个未显示", body)
+    assert match is not None, body
+    omitted = int(match.group(1))
+    # Every mod is either printed as a row or counted in that number, never both and never
+    # neither — which is the arithmetic the line is claiming. The row shape is matched rather
+    # than "starts with a bracket": the header opens with the ``[Mod Update Checker]`` badge,
+    # so a looser test counted it as a row.
+    printed = [line for line in body.splitlines() if re.match(r"^  \[\s*\d+\] ", line)]
+    assert omitted > 0
+    assert len(printed) + omitted == len(report.entries)
+
+
+def test_the_number_in_the_listing_identifies_the_mod_it_looks_up():
+    """The click carries the number, so a mismatch would silently open the wrong mod.
+
+    Asserted by looking up every number the listing prints and checking it resolves to the mod
+    on that row — the failure mode is not a crash, it is the wrong page.
+    """
+    report = _index_report(_many(actionable=2, up_to_date=3))
+    for number, entry in report.indexed_entries():
+        assert report.entry_by_handle(str(number)) is entry
+
+
+def test_a_filtered_listing_keeps_the_numbers_the_full_one_used():
+    """Otherwise the same number would mean two different mods in two replies."""
+    report = _index_report(_many(actionable=2, up_to_date=3))
+    full = {number: entry.name for number, entry in report.indexed_entries()}
+    filtered = report.by_status(STATUS_UP_TO_DATE)
+
+    tr = make_translator("zh_cn")
+    body = "\n".join(render_index_body(report, tr, entries=filtered))
+
+    for number, entry in report.indexed_entries():
+        if entry in filtered:
+            assert "[{}] {}".format(str(number).rjust(2), entry.name) in body
+
+
+def test_an_entry_can_be_looked_up_by_number_or_by_name():
+    """A player copying an id out of the listing should not have to translate it to a number."""
+    report = _index_report([_entry_with_links("sodium", STATUS_UPDATE_AVAILABLE)])
+    entry = report.entries[0]
+
+    for handle in ("1", "sodium", "sodium.jar", "SODIUM"):
+        assert report.entry_by_handle(handle) is entry, handle
+    assert report.entry_by_handle("999") is None
+    assert report.entry_by_handle("") is None
+    assert report.entry_by_handle("no such mod") is None
+
+
+def test_the_detail_view_is_where_the_links_live():
+    """The listing cannot afford a url; one mod's detail can afford two."""
+    entry = _entry_with_links("sodium", STATUS_UPDATE_AVAILABLE)
+    rows = entry_detail_rows(entry, make_translator("zh_cn"))
+
+    urls = [url for _label, _value, url in rows if url]
+    assert entry.project_url in urls
+    assert entry.download_url in urls
+    # And the version change the reader came for, with both versions named.
+    body = "\n".join(render_detail(entry, make_translator("zh_cn")))
+    assert "1.0.0" in body and "1.1.0" in body
+
+
+def test_the_detail_view_stays_short():
+    """One mod's detail must still fit, notes and all."""
+    entry = _entry_with_links("sodium", STATUS_UPDATE_AVAILABLE)
+    entry.add_note("note.declared_mc", range=">=26.1 <27")
+    entry.add_note("note.bundled_jars", count=16)
+    entry.add_note("note.client_only")
+
+    body = render_detail(entry, make_translator("zh_cn"))
+    assert len(body) <= 10, body
 
 
 def test_summary_says_so_when_there_is_nothing_to_do(tmp_path, upstream):
