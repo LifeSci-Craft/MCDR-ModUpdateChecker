@@ -18,7 +18,7 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, List, Optional, Sequence, Set, Tuple
 
 from mcdreforged.api.all import (
     CommandSource,
@@ -88,6 +88,18 @@ class Config(Serializable):
 
     notify_in_game_permission: int = 3
     """游戏内提醒的最低 MCDR 权限等级。"""
+
+    check_on_admin_join: bool = True
+    """管理员上线时自动检查一次，并把结果发给他。"""
+
+    admin_join_permission: int = 3
+    """多少权限等级算「管理员」。MCDR 等级 3 = admin，2 = helper。"""
+
+    admin_join_max_report_age_minutes: int = 30
+    """管理员上线时，多久以内的上次检查结果可以直接复用而不重新查。
+
+    ``0`` = 每次都重新检查。默认复用是为了两件事：管理员一进服**马上**就能看到结果，
+    而不用等一次完整扫描；以及避免几位管理员接连上线时反复打接口。"""
 
     write_report_file: bool = True
     """把每次检查的结果写成 JSON / 文本文件，便于外部脚本或事后排查。"""
@@ -284,6 +296,7 @@ def _run_check(
     server: PluginServerInterface,
     source: Optional[CommandSource] = None,
     announce_clean: bool = True,
+    broadcast: bool = True,
 ) -> Optional[Report]:
     """Scan, query and report. Safe to call from any thread; only one runs at a time."""
     global _last_report
@@ -321,7 +334,8 @@ def _run_check(
         if config.write_report_file:
             _write_report_files(server, report)
 
-        _notify(server, report, source=source, announce_clean=announce_clean)
+        _notify(server, report, source=source, announce_clean=announce_clean,
+                broadcast=broadcast)
         return report
     except Exception as error:  # noqa: BLE001 - a check must never take the server down
         server.logger.exception("mod update check failed")
@@ -357,6 +371,7 @@ def _notify(
     report: Report,
     source: Optional[CommandSource] = None,
     announce_clean: bool = True,
+    broadcast: bool = True,
 ) -> None:
     """Print the result to the console, to the invoker, and optionally into the game."""
     lines = render_summary(report, tr)
@@ -378,7 +393,7 @@ def _notify(
     if source is not None:
         _reply_lines(source, lines)
 
-    if _config.notify_in_game and report.has_updates:
+    if broadcast and _config.notify_in_game and report.has_updates:
         _notify_in_game(server, report)
 
 
@@ -406,8 +421,38 @@ def _reply_lines(source: CommandSource, lines) -> None:
         source.reply(_coloured_line(line))
 
 
+def _notification_lines(report: Report) -> List[str]:
+    """The body of an in-game notification, in both the broadcast and the on-join case."""
+    if not report.has_updates:
+        return [tr("report.no_updates")]
+    lines = [tr("check.in_game_header", count=len(report.updates))]
+    for entry in report.updates[:NOTIFY_MAX_UPDATES]:
+        lines.append(tr("line.update", name=entry.name, local=entry.local_version or "?",
+                        latest=entry.latest_version or "?"))
+    if len(report.updates) > NOTIFY_MAX_UPDATES:
+        lines.append(tr("report.and_more", count=len(report.updates) - NOTIFY_MAX_UPDATES))
+    return lines
+
+
+def _tell_player(server: PluginServerInterface, player: str, lines: List[str]) -> None:
+    """Send a few lines to one player.
+
+    ``server.tell`` rather than a hand-built ``tellraw``: it goes through the active handler's
+    own "send message" command (so it is right for whatever handler the server runs, not just
+    the vanilla-derived ones), it escapes the payload, and it uses the receiving player's
+    preferred language. Delivery is best-effort — the player may have disconnected while a
+    check was running.
+    """
+    if not _server_running(server):
+        return
+    try:
+        server.tell(player, RText("\n".join(lines), RColor.yellow))
+    except Exception as error:  # noqa: BLE001 - a failed message must not break anything
+        server.logger.debug("could not message {}: {}".format(player, error))
+
+
 def _notify_in_game(server: PluginServerInterface, report: Report) -> None:
-    """Send a short tellraw to the online players who are allowed to see it.
+    """Send a short notification to the online players who are allowed to see it.
 
     Only players already tracked as online from join/leave events are targeted, and only
     those whose MCDR permission level is high enough — broadcasting to everybody would
@@ -416,29 +461,103 @@ def _notify_in_game(server: PluginServerInterface, report: Report) -> None:
     if not (_server_running(server) and _online_players):
         return
 
-    recipients = []
-    for name in sorted(_online_players):
+    lines = _notification_lines(report)
+    permitted = _permitted_players(
+        server, sorted(_online_players), _config.notify_in_game_permission
+    )
+    for name in permitted:
+        _tell_player(server, name, lines)
+
+
+def _permitted_players(
+    server: PluginServerInterface, players: Sequence[str], required: int
+) -> List[str]:
+    """The players among ``players`` whose MCDR permission level reaches ``required``.
+
+    The threshold is a parameter rather than read from the config inside, because the two
+    callers genuinely mean different things: ``notify_in_game_permission`` is "who may be
+    told about updates", while ``admin_join_permission`` is "who counts as an admin worth
+    waking up for". Folding them into one setting would make the option that is no longer
+    read look like it still works.
+
+    A permission lookup can throw for a player MCDR does not know about (a name that never
+    joined, or a permission file mid-edit), so each one is guarded individually: one
+    unresolvable name must not stop the others from being told.
+    """
+    threshold = max(0, int(required))
+    permitted: List[str] = []
+    for name in players:
         try:
-            if server.get_permission_level(name) >= _config.notify_in_game_permission:
-                recipients.append(name)
-        except Exception:  # noqa: BLE001 - an unknown player is simply skipped
-            continue
-    if not recipients:
+            if server.get_permission_level(name) >= threshold:
+                permitted.append(name)
+        except Exception as error:  # noqa: BLE001 - an unknown player is simply skipped
+            server.logger.debug("no permission level for {}: {}".format(name, error))
+    return permitted
+
+
+def _admin_join_worker(server: PluginServerInterface, player: str) -> None:
+    """Check if needed, then message the admin who just came online.
+
+    Two decisions worth stating, because neither is obvious:
+
+    * **A recent report is reused rather than re-run.** The point is for the admin to *learn*
+      about mod updates when they log in, so an answer from ten minutes ago serves that goal
+      better than a fresh scan: it arrives instantly instead of after a full read of ``mods/``,
+      and three admins logging in together do not each fire a round of API calls. The window
+      is ``admin_join_max_report_age_minutes``; set it to ``0`` to always re-check.
+    * **A check that could not start still answers.** If another check holds the lock, the
+      admin gets the previous report with its age, which beats silence.
+    """
+    if _stop_event.is_set():
         return
 
-    body = [tr("check.in_game_header", count=len(report.updates))]
-    for entry in report.updates[:NOTIFY_MAX_UPDATES]:
-        body.append(tr("line.update", name=entry.name, local=entry.local_version or "?",
-                       latest=entry.latest_version or "?"))
-    if len(report.updates) > NOTIFY_MAX_UPDATES:
-        body.append(tr("report.and_more", count=len(report.updates) - NOTIFY_MAX_UPDATES))
+    report = _last_report
+    window_minutes = max(0, int(_config.admin_join_max_report_age_minutes))
+    age = report.age_seconds() if report is not None else None
+    reused = age is not None and 0 < age <= window_minutes * 60
 
-    payload = json.dumps({"text": "\n".join(body), "color": "yellow"}, ensure_ascii=False)
-    for name in recipients:
-        try:
-            server.execute("tellraw {} {}".format(name, payload))
-        except Exception as error:  # noqa: BLE001 - chat delivery is best-effort
-            server.logger.debug("tellraw to {} failed: {}".format(name, error))
+    if not reused:
+        # No broadcast here: the admin who just joined is about to get the same figures in
+        # their own message, and everyone else online was told when the previous check ran.
+        fresh = _run_check(server, announce_clean=not _config.notify_on_updates_only,
+                           broadcast=False)
+        if fresh is not None:
+            report, age, reused = fresh, 0.0, False
+
+    if _stop_event.is_set():
+        return
+    if report is None:
+        _tell_player(server, player, [tr("check.admin_join_no_report")])
+        return
+
+    lines = [tr("check.admin_join_header", version=report.server.describe())]
+    lines.extend(_notification_lines(report))
+    if reused:
+        lines.append(tr("check.admin_join_reused", minutes=int((age or 0) // 60)))
+    _tell_player(server, player, lines)
+
+
+def on_player_joined(server: PluginServerInterface, player: str, info: Any) -> None:
+    _online_players.add(player)
+
+    if not (_config.enabled and _config.check_on_admin_join):
+        return
+
+    # The permission check is cheap and happens here; the check itself goes to its own thread,
+    # because this runs on MCDR's event thread and a check reads and hashes every jar.
+    if not _permitted_players(server, [player], _config.admin_join_permission):
+        return
+
+    threading.Thread(
+        target=_admin_join_worker,
+        args=(server, player),
+        name="mod_update_checker_admin_join",
+        daemon=True,
+    ).start()
+
+
+def on_player_left(server: PluginServerInterface, player: str) -> None:
+    _online_players.discard(player)
 
 
 def _server_running(server: PluginServerInterface) -> bool:
@@ -781,12 +900,4 @@ def on_server_stop(server: PluginServerInterface, server_return_code: int) -> No
     # A pending startup check would otherwise fire against a stopped server and report
     # nonsense; the event is also the natural point to drop stale player state.
     _online_players.clear()
-
-
-def on_player_joined(server: PluginServerInterface, player: str, info: Any) -> None:
-    _online_players.add(player)
-
-
-def on_player_left(server: PluginServerInterface, player: str) -> None:
-    _online_players.discard(player)
 

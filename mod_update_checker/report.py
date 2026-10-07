@@ -24,6 +24,7 @@ goes through the plugin's translation catalogue.
 
 import json
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from .serverinfo import ServerContext
@@ -139,6 +140,24 @@ class Report:
     duration_seconds: float = 0.0
 
     # -- queries -----------------------------------------------------------------------
+
+    def age_seconds(self) -> Optional[float]:
+        """How long ago this report was produced, or ``None`` if that cannot be told.
+
+        Used to decide whether a report is still worth reusing instead of running the check
+        again — an admin logging in does not need a fresh scan if the answer is ten minutes
+        old. Returning ``None`` rather than raising keeps a malformed timestamp from breaking
+        the caller: the worst case is that the check simply runs again.
+        """
+        if not self.generated_at:
+            return None
+        try:
+            produced = datetime.fromisoformat(self.generated_at)
+        except ValueError:
+            return None
+        if produced.tzinfo is None:
+            produced = produced.replace(tzinfo=timezone.utc)
+        return max(0.0, (datetime.now(timezone.utc) - produced).total_seconds())
 
     def by_status(self, *statuses: str) -> List[UpdateEntry]:
         wanted = set(statuses)

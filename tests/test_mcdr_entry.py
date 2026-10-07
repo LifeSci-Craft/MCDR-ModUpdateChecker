@@ -7,7 +7,10 @@ firing — so they are pinned here rather than left to a review.
 
 import ast
 import json
+import time
 from pathlib import Path
+
+import pytest
 
 PACKAGE = Path(__file__).resolve().parent.parent / "mod_update_checker"
 REPO = PACKAGE.parent
@@ -45,20 +48,25 @@ class _FakeLogger:
 
 
 class _FakeServer:
-    """Just enough of PluginServerInterface to run ``on_load`` head-less.
+    """Just enough of PluginServerInterface to run the entry module head-less.
 
-    ``on_load`` needs the data folder (for the config), the MCDR config (for
-    ``working_directory``), the MCDR language, and the two registration calls. Everything
-    else it might touch is a no-op here.
+    Covers ``on_load`` (data folder, MCDR config, language, registration) and the player
+    notification paths (``is_server_running``, ``get_permission_level``, ``tell``), which is
+    what the on-join feature needs in order to be exercised without booting MCDR.
     """
 
-    def __init__(self, tmp_path):
+    def __init__(self, tmp_path, levels=None, running=True):
         self.logger = _FakeLogger()
         self._folder = Path(tmp_path) / "config" / "mod_update_checker"
         self._folder.mkdir(parents=True, exist_ok=True)
         self._mcdr_config = {"working_directory": str(tmp_path), "language": "zh_cn"}
         self.help_messages = []
         self.commands = []
+        #: name -> MCDR permission level. An absent name raises, like an unknown player.
+        self._levels = dict(levels or {})
+        self._running = running
+        #: (player, text) for every message this server delivered.
+        self.delivered = []
 
     def get_data_folder(self):
         return str(self._folder)
@@ -72,14 +80,25 @@ class _FakeServer:
     def get_mcdr_language(self):
         return self._mcdr_config["language"]
 
+    def is_server_running(self):
+        return self._running
+
     def register_help_message(self, prefix, message, permission=0):
         self.help_messages.append((prefix, message, permission))
 
     def register_command(self, node, **_kwargs):
         self.commands.append(node)
 
-    def get_permission_level(self, _obj):
-        return 4
+    def get_permission_level(self, name):
+        if name not in self._levels:
+            raise KeyError("no permission level for {!r}".format(name))
+        return self._levels[name]
+
+    def tell(self, player, text, **_kwargs):
+        self.delivered.append((player, str(text)))
+
+    def told(self, player=None):
+        return [text for name, text in self.delivered if player is None or name == player]
 
 
 def _entry_source() -> str:
@@ -337,8 +356,261 @@ def test_the_end_to_end_run_uses_the_shipped_defaults():
     assert not unknown, "overrides for options that do not exist: {}".format(sorted(unknown))
 
 
+# --------------------------------------------------------------------------------------
+# Admin-on-join checks and notification
+# --------------------------------------------------------------------------------------
+
+
+def _report(updates=2, age_seconds=0.0):
+    """A report with ``updates`` pending updates, produced ``age_seconds`` ago."""
+    from datetime import datetime, timedelta, timezone
+
+    from mod_update_checker.report import Report, UpdateEntry
+    from mod_update_checker.serverinfo import ServerContext
+
+    produced = datetime.now(timezone.utc) - timedelta(seconds=age_seconds)
+    report = Report(
+        generated_at=produced.isoformat(timespec="seconds"),
+        server=ServerContext(mc_version="26.3", mc_version_source="config", loader="fabric"),
+        mods_directory="server/mods",
+    )
+    for index in range(updates):
+        report.entries.append(
+            UpdateEntry(
+                mod_id="mod{}".format(index),
+                name="Mod {}".format(index),
+                file_name="mod{}.jar".format(index),
+                local_version="1.0.0",
+                latest_version="1.1.0",
+                status="update_available",
+            )
+        )
+    return report
+
+
+@pytest.fixture
+def entry_env(tmp_path, monkeypatch):
+    """The plugin module wired to a fake server, with a recording check function."""
+    import mod_update_checker as plugin
+
+    class _Config:
+        enabled = True
+        check_on_admin_join = True
+        admin_join_permission = 3
+        admin_join_max_report_age_minutes = 30
+        notify_on_updates_only = True
+        notify_in_game = True
+        notify_in_game_permission = 3
+        start_check_delay_seconds = 60
+
+    monkeypatch.setattr(plugin, "_config", _Config(), raising=False)
+    plugin._stop_event.clear()
+    plugin._online_players.clear()
+    monkeypatch.setattr(plugin, "_last_report", None, raising=False)
+
+    server = _FakeServer(tmp_path, levels={"Admin": 4, "Helper": 2, "Guest": 0})
+    calls = []
+
+    def fake_run(server, source=None, announce_clean=True, broadcast=True):
+        calls.append({"announce_clean": announce_clean, "broadcast": broadcast})
+        return _report()
+
+    monkeypatch.setattr(plugin, "_run_check", fake_run, raising=False)
+    return plugin, server, calls
+
+
+def test_an_admin_joining_with_no_report_runs_a_check_and_is_told(entry_env, tmp_path):
+    plugin, server, calls = entry_env
+
+    plugin._admin_join_worker(server, "Admin")
+
+    assert len(calls) == 1, "a check should have run"
+    # No separate broadcast: this admin is already being messaged with the same figures.
+    assert calls[0]["broadcast"] is False
+    told = server.told("Admin")
+    assert len(told) == 1, told
+    assert "服务端 26.3" in told[0]
+    assert "Mod 0" in told[0] and "1.0.0 -> 1.1.0" in told[0]
+
+
+def test_a_recent_report_is_reused_instead_of_rechecking(entry_env):
+    """Newest first: an admin logging in should not wait for a scan, and should not cause
+    one either when the answer is minutes old."""
+    plugin, server, calls = entry_env
+    plugin._last_report = _report(updates=1, age_seconds=120)
+
+    plugin._admin_join_worker(server, "Admin")
+
+    assert calls == [], "no check should have run for a 2-minute-old report"
+    told = server.told("Admin")
+    assert len(told) == 1
+    assert "2 分钟前" in told[0], told[0]
+
+
+def test_a_stale_report_triggers_a_fresh_check(entry_env):
+    plugin, server, calls = entry_env
+    plugin._last_report = _report(updates=1, age_seconds=3600)
+
+    plugin._admin_join_worker(server, "Admin")
+
+    assert len(calls) == 1, "a 1-hour-old report is past the 30-minute window"
+    assert "分钟前" not in server.told("Admin")[0]
+
+
+def test_the_window_can_be_switched_off(entry_env, monkeypatch):
+    """``0`` means "always re-check", which is the literal reading of the feature."""
+    plugin, server, calls = entry_env
+    monkeypatch.setattr(plugin._config, "admin_join_max_report_age_minutes", 0)
+    plugin._last_report = _report(updates=1, age_seconds=1)
+
+    plugin._admin_join_worker(server, "Admin")
+
+    assert len(calls) == 1
+
+
+def test_a_non_admin_gets_nothing(entry_env):
+    plugin, server, calls = entry_env
+
+    plugin.on_player_joined(server, "Helper", None)
+    plugin.on_player_joined(server, "Guest", None)
+    assert calls == []
+    assert server.delivered == []
+    # Both are still tracked as online, which the broadcast notification relies on.
+    assert {"Helper", "Guest"} <= plugin._online_players
+
+
+def test_an_admin_joining_is_checked_against_the_permission_level(entry_env):
+    plugin, server, calls = entry_env
+
+    plugin.on_player_joined(server, "Admin", None)
+
+    # The worker runs on its own thread; wait briefly for it rather than assume.
+    for _ in range(100):
+        if server.told("Admin"):
+            break
+        time.sleep(0.02)
+    assert server.told("Admin"), "the admin was never told"
+    assert len(calls) == 1
+
+
+def test_an_unknown_player_does_not_raise(entry_env):
+    """A permission lookup can fail for a name MCDR does not know."""
+    plugin, server, calls = entry_env
+
+    plugin.on_player_joined(server, "SomeoneMCDRDoesNotKnow", None)
+
+    assert calls == []
+    assert "SomeoneMCDRDoesNotKnow" in plugin._online_players
+
+
+def test_the_feature_can_be_switched_off(entry_env, monkeypatch):
+    plugin, server, calls = entry_env
+    monkeypatch.setattr(plugin._config, "check_on_admin_join", False)
+
+    plugin.on_player_joined(server, "Admin", None)
+
+    assert calls == []
+
+
+def test_a_disabled_plugin_does_nothing_on_join(entry_env, monkeypatch):
+    plugin, server, calls = entry_env
+    monkeypatch.setattr(plugin._config, "enabled", False)
+
+    plugin.on_player_joined(server, "Admin", None)
+
+    assert calls == []
+
+
+def test_a_check_that_cannot_start_still_answers(entry_env, monkeypatch):
+    """If another check holds the lock, the admin gets the previous report, not silence."""
+    plugin, server, calls = entry_env
+    previous = _report(updates=1, age_seconds=6000)
+
+    monkeypatch.setattr(plugin, "_run_check", lambda *a, **k: None, raising=False)
+    plugin._last_report = previous
+
+    plugin._admin_join_worker(server, "Admin")
+
+    told = server.told("Admin")
+    assert len(told) == 1, told
+    assert "Mod 0" in told[0]
+
+
+def test_no_report_at_all_is_stated_plainly(entry_env, monkeypatch):
+    plugin, server, calls = entry_env
+    monkeypatch.setattr(plugin, "_run_check", lambda *a, **k: None, raising=False)
+    plugin._last_report = None
+
+    plugin._admin_join_worker(server, "Admin")
+
+    told = server.told("Admin")
+    assert len(told) == 1
+    assert "还没有任何检查结果" in told[0]
+
+
+def test_nothing_is_sent_while_the_server_is_stopped(entry_env):
+    """A message that cannot be delivered must not be attempted, nor crash the thread."""
+    plugin, _, _ = entry_env
+    stopped = _FakeServer(Path("."), levels={"Admin": 4}, running=False)
+    plugin._last_report = _report(updates=1)
+
+    plugin._admin_join_worker(stopped, "Admin")
+
+    assert stopped.delivered == []
+
+
+def test_an_unloaded_plugin_does_not_send(entry_env):
+    plugin, server, calls = entry_env
+    plugin._last_report = _report(updates=1)
+    plugin._stop_event.set()
+    try:
+        plugin._admin_join_worker(server, "Admin")
+    finally:
+        plugin._stop_event.clear()
+
+    assert server.delivered == []
+    assert calls == []
+
+
+def test_a_clean_report_says_so_rather_than_nothing(entry_env):
+    plugin, server, _calls = entry_env
+    plugin._last_report = _report(updates=0)
+
+    plugin._admin_join_worker(server, "Admin")
+
+    told = server.told("Admin")
+    assert len(told) == 1
+    assert "没有发现更新" in told[0]
+
+
+def test_the_join_message_respects_the_update_cap(entry_env):
+    """A server with 200 outdated mods must not put 200 lines in someone's chat box."""
+    from mod_update_checker import NOTIFY_MAX_UPDATES
+
+    plugin, server, _calls = entry_env
+    plugin._last_report = _report(updates=NOTIFY_MAX_UPDATES + 5)
+
+    plugin._admin_join_worker(server, "Admin")
+
+    told = server.told("Admin")[0]
+    listed = [line for line in told.splitlines() if "1.0.0 -> 1.1.0" in line]
+    assert len(listed) == NOTIFY_MAX_UPDATES, len(listed)
+    assert "5 个" in told, "the remainder should be summarised, not silently dropped"
+
+
+def test_broadcast_and_join_use_their_own_permission_settings(entry_env, monkeypatch):
+    """The two thresholds mean different things and must not be folded into one."""
+    plugin, server, _calls = entry_env
+    plugin._online_players.update({"Admin", "Helper"})
+    monkeypatch.setattr(plugin._config, "notify_in_game_permission", 4)
+
+    plugin._notify_in_game(server, _report(updates=1))
+
+    assert server.told("Admin"), "the level-4 admin should be told"
+    assert not server.told("Helper"), "the level-2 helper should not be"
+
+
 def test_config_round_trips_through_json():
-    """``load_config_simple`` serialises and deserialises; unknown keys must not explode."""
     import mod_update_checker as plugin
 
     config = plugin.Config.get_default()

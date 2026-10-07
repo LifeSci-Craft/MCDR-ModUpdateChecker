@@ -82,8 +82,13 @@ for line in sys.stdin:
     command = line.strip()
     if command == "stop":
         break
-    # Echo the command back so the test can see what the plugin sent, and check the payload.
-    if command.startswith("tellraw"):
+    # Echo anything carrying a tellraw back, so the test can inspect what the plugin sent.
+    # Matching on "tellraw" *anywhere* in the line matters: MCDR wraps the command as
+    # "execute at @p run tellraw <player> {{...}}" on Minecraft 1.13 and newer (it does that to
+    # mute the "No player was found" error). An earlier version of this server only matched a
+    # leading "tellraw", so the echo never happened and the run wrongly reported that the
+    # plugin had sent nothing.
+    if "tellraw" in command:
         out("(tellraw) " + command)
 
 out("Stopping server")
@@ -406,30 +411,49 @@ def run_one(python: str, plugin: Path, workdir: Path, scenario_builder) -> dict:
         upstream.stop()
 
 
-def _inspect_tellraw(console: str) -> tuple:
-    """Find the in-game notification the plugin sent and validate its payload.
+def _collect_tellraw(console: str) -> tuple:
+    """Every ``tellraw`` the plugin sent to the test player, as parsed payloads.
 
-    The fake server echoes ``tellraw`` commands it receives, so the console carries the exact
-    command that went to the game. Parsing it back out is the only way to check the two things
-    that matter and that a mere "it didn't crash" would miss: the argument is addressed to the
-    right player, and the JSON is well-formed — the payload is built from mod names, which are
-    attacker-controlled text as far as this plugin is concerned.
+    The fake server echoes any command carrying a tellraw, so the console holds exactly what
+    went to the game. Parsing it back is the only way to check the things a "it didn't crash"
+    would miss: the command is addressed to the right player, and the payload is well-formed —
+    the text is built from mod names, which are attacker-controlled as far as this plugin
+    knows.
+
+    The command may be wrapped. MCDR sends ``execute at @p run tellraw <player> {...}`` on
+    Minecraft 1.13+, so the tellraw is located by searching for it rather than assumed to be
+    at the start; which form was used is reported too, since it is version-dependent.
+
+    Returns ``(payloads, wrapped, errors)`` so a malformed command fails the run instead of
+    being silently skipped.
     """
-    marker = "(tellraw) tellraw {} ".format(TEST_PLAYER)
+    marker = "(tellraw) "
+    needle = "tellraw {} ".format(TEST_PLAYER)
+    payloads = []
+    errors = []
+    wrapped = None
     for line in console.splitlines():
         index = line.find(marker)
         if index == -1:
             continue
-        raw = line[index + len(marker):].strip()
+        command = line[index + len(marker):].strip()
+        at = command.find(needle)
+        if at == -1:
+            errors.append("not addressed to {}: {}".format(TEST_PLAYER, command[:140]))
+            continue
+        wrapped = command[:at].strip() or "(none)"
+        raw = command[at + len(needle):].strip()
         try:
             payload = json.loads(raw)
         except ValueError:
-            return False, "not valid JSON: {}".format(raw[:120])
+            errors.append("not valid JSON: {}".format(raw[:120]))
+            continue
         text = payload.get("text")
         if not isinstance(text, str) or not text.strip():
-            return False, "no text in the payload: {}".format(raw[:120])
-        return True, text
-    return False, "no tellraw command was sent"
+            errors.append("no text in the payload: {}".format(raw[:120]))
+            continue
+        payloads.append(text)
+    return payloads, wrapped, errors
 
 
 def summarise(console: str, root: Path, version: str, python: str) -> dict:
@@ -460,7 +484,8 @@ def summarise(console: str, root: Path, version: str, python: str) -> dict:
         entry["file_name"]: entry["status"] for entry in report.get("entries", [])
     }
 
-    tellraw_valid, tellraw_text = _inspect_tellraw(console)
+    tellraws, tellraw_wrapper, tellraw_errors = _collect_tellraw(console)
+    joined = "\n".join(tellraws)
 
     return {
         "mcdr": version,
@@ -481,8 +506,14 @@ def summarise(console: str, root: Path, version: str, python: str) -> dict:
         "report_entry_count": len(report.get("entries", [])),
         "cache_written": cache_path.is_file(),
         "cache_records": cache_records,
-        "notify_in_game_sent": tellraw_valid,
-        "notify_in_game_text": tellraw_text,
+        # Two distinct notifications are expected, and their markers differ, so a regression
+        # that stops sending one of them cannot be masked by the other still arriving.
+        "notify_in_game_sent": "Mod 更新：有" in joined,
+        "admin_join_notified": "[Mod 更新检查] 服务端" in joined,
+        "notify_payloads_valid": not tellraw_errors,
+        "notify_payloads": tellraws,
+        "notify_wrapper": tellraw_wrapper,
+        "notify_errors": tellraw_errors,
         "statuses": statuses,
         "command_summary": COMMAND_EXPECTATIONS["summary"] in console,
         "command_help": COMMAND_EXPECTATIONS["help"] in console,
@@ -508,6 +539,8 @@ CHECK_KEYS = [
     "report_has_entries",
     "cache_written",
     "notify_in_game_sent",
+    "admin_join_notified",
+    "notify_payloads_valid",
     "command_summary",
     "command_help",
     "command_status",
