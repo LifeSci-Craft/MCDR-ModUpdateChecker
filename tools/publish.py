@@ -44,6 +44,7 @@ import re
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -284,12 +285,25 @@ def merge_pull_request(token: str, full_name: str, number: int, title: str) -> d
 
 
 def delete_branch(token: str, full_name: str, branch: str) -> None:
-    status, payload = call("DELETE", "/repos/{}/git/refs/heads/{}".format(full_name, branch), token)
+    """Delete the merged branch, URL-encoding the name.
+
+    A branch called ``chore/something`` has a slash in it, and an unencoded slash makes the ref
+    path ambiguous — the API answers ``404 Not Found`` for a branch that is sitting right there.
+    Encoding the name is the difference between deleting the branch and printing a warning about
+    a branch that "could not be deleted" while it stays on the remote forever.
+    """
+    status, payload = call(
+        "DELETE",
+        "/repos/{}/git/refs/heads/{}".format(full_name, urllib.parse.quote(branch, safe="")),
+        token,
+    )
     if status not in (204, 200):
         # Not fatal: the pull request is merged and the branch is harmless.
         print("warning       : could not delete the branch: {}".format(
             (payload or {}).get("message", status)
         ))
+    else:
+        print("branch        : {} deleted".format(branch))
 
 
 def main() -> int:

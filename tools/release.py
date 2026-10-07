@@ -178,12 +178,19 @@ def push_tag(token: str, tag: str, message: str) -> None:
     publish.push_with_token(token, tag, ref_prefix="refs/tags/")
 
 
-def upload_asset(token: str, owner: str, name: str, release_id: int, path: Path) -> dict:
-    """Upload one asset, streaming the file rather than buffering it in memory."""
-    query = urllib.parse.urlencode({"name": path.name})
-    url = "{}/repos/{}/{}/releases/{}/assets?{}".format(API, owner, name, release_id, query)
-    with open(path, "rb") as handle:
-        request = urllib.request.Request(url, data=handle.read(), method="POST")
+def upload_asset(token: str, upload_url: str, path: Path) -> dict:
+    """Upload one asset to ``upload_url``, which the release response supplies.
+
+    The URL comes from the API rather than being assembled here, and that is not merely tidier:
+    asset uploads are **not** served by ``api.github.com``. Building the path against that host
+    returns a bare ``404 Not Found`` — after the tag has been pushed and the release created, so
+    the failure lands on a release that already exists and is missing its only file. The
+    ``upload_url`` GitHub hands back points at ``uploads.github.com``, and the ``{?name,label}``
+    on the end is an RFC 6570 template that has to be replaced rather than kept.
+    """
+    base = upload_url.split("{", 1)[0]
+    url = "{}?{}".format(base, urllib.parse.urlencode({"name": path.name}))
+    request = urllib.request.Request(url, data=path.read_bytes(), method="POST")
     request.add_header("Authorization", "Bearer " + token)
     request.add_header("Accept", "application/vnd.github+json")
     request.add_header("Content-Type", "application/octet-stream")
@@ -280,7 +287,7 @@ def main() -> int:
         )
     print("release         : {}".format(release["html_url"]))
 
-    uploaded = upload_asset(token, owner, name, release["id"], artifact)
+    uploaded = upload_asset(token, release["upload_url"], artifact)
     print("asset           : {} ({} bytes reported)".format(
         uploaded["name"], uploaded.get("size", "?")
     ))
