@@ -139,7 +139,7 @@ COMMANDS = [
     "!!modupdate list",
     "!!modupdate list update_available",
     "!!modupdate reload",
-    "!!muc status",
+    "!!muc help",
     "!!modupdate check",
 ]
 
@@ -148,11 +148,15 @@ COMMANDS = [
 COMMAND_EXPECTATIONS = {
     "summary": "Mod 更新检查",
     "help": "!!modupdate list",
-    "status_mc": "服务端：26.3",
+    # ASCII colon: the separator is part of the translated label, not hardcoded.
+    "status_mc": "服务端: 26.3",
     "list_all": "全部 Mod：",
     "list_filtered": "[update_available]",
     "reload": "配置已重载",
-    "alias": "Mod Update Checker — 当前状态",
+    # Runs ``!!muc help`` and looks for a row naming that alias. The status screen cannot
+    # serve here any more: both aliases now print the same title bar, so it would pass without
+    # proving anything about the alias. Only the ``!!muc`` help says ``!!muc list``.
+    "alias": "!!muc list",
     "check_started": "已在后台开始检查",
 }
 
@@ -612,7 +616,7 @@ def summarise(
         "spoke_chinese": "Mod Update Checker] 已加载" in console
         and "[Mod Update Checker] loaded" not in console,
         "check_ran": "Mod 更新检查 — 服务端 26.3" in console,
-        "detected_version": "服务端：26.3" in console,
+        "detected_version": "服务端: 26.3" in console,
         "found_update": updates >= 1,
         "reported_up_to_date": "已是最新" in console or "没有发现更新" in console,
         "no_compatible_build_reported": "无适配构建" in console,

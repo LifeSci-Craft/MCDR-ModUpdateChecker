@@ -55,6 +55,19 @@
 ## 命令
 
 命令需要 **MCDR 权限等级 3**（可在配置里调），两个写法都行：`!!modupdate` 与 `!!muc`。
+加一个 `help` 就是帮助页——**每一行都可以直接点击**（`list` 是填入输入框，方便你补一个状态筛选）：
+
+```
+===============  Mod Update Checker v1.6.0  ===============
+用法：!!muc <子命令>（!!modupdate 亦可）
+以上命令均需 MCDR 权限等级 3（与游戏内是否为 OP 无关）
+!!muc              -- 查看上次检查的汇总
+!!muc check        -- 立即检查一次
+!!muc list         -- 列出所有 Mod（可在后面加一个状态来筛选）
+!!muc status       -- 显示识别到的服务端版本、加载器与下载设置
+!!muc reload       -- 重新读取配置文件
+!!muc help         -- 显示本帮助
+```
 
 | 命令 | 作用 |
 |---|---|
@@ -64,6 +77,7 @@
 | `!!modupdate list <状态>` | 只看某个状态，例如 `!!modupdate list update_available` |
 | `!!modupdate status` | 显示识别到的服务端版本、加载器、上游开关、上次检查时间 |
 | `!!modupdate reload` | 重载配置文件 |
+| `!!modupdate help` | 帮助页：命令清单，每行可点击 |
 
 检查结果同时写入 `config/mod_update_checker/last_report.json`（给脚本用）和 `last_report.txt`（给人看）。
 

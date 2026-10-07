@@ -924,3 +924,205 @@ def test_the_console_path_logs_plain_strings():
         assert not isinstance(argument, ast.Call) or not (
             isinstance(argument.func, ast.Name) and argument.func.id == "_coloured_line"
         ), "an RText line is being logged, where the colour would be dropped"
+
+
+# --------------------------------------------------------------------------------------
+# The help and status screens
+# --------------------------------------------------------------------------------------
+
+
+class _ReplyRecorder:
+    """A command source that keeps whatever the command replied with."""
+
+    def __init__(self):
+        self.replies = []
+
+    def reply(self, text, **_kwargs):
+        self.replies.append(text)
+
+
+def _render_help(prefix, language="zh_cn"):
+    import mod_update_checker as plugin
+
+    previous = plugin._config
+    plugin._apply_language(None, _LanguageConfig(language))
+    try:
+        source = _ReplyRecorder()
+        plugin._show_help(source, prefix)
+        return source.replies
+    finally:
+        plugin._config = previous
+
+
+class _LanguageConfig:
+    def __init__(self, language):
+        self.language = language
+
+
+def test_help_is_one_rich_message_rather_than_a_line_per_reply():
+    """One ``RTextList``, not a stack of separate replies.
+
+    The screen is a single block: the title bar, the blank lines and the aligned columns only
+    make sense if they are composed together. Replying line by line also loses the colours on
+    any client that renders each reply separately.
+    """
+    from mcdreforged.api.rtext import RTextList
+
+    replies = _render_help("!!muc")
+
+    assert len(replies) == 1, replies
+    assert isinstance(replies[0], RTextList)
+
+
+def test_help_names_the_spelling_that_was_typed():
+    """``!!muc help`` must not list ``!!modupdate ...``.
+
+    Both aliases are registered and either may be the one an admin remembers; showing the
+    other one is how someone concludes the command they typed does not exist.
+    """
+    for prefix, other in (("!!muc", "!!modupdate"), ("!!modupdate", "!!muc")):
+        body = str(_render_help(prefix)[0])
+
+        assert prefix + " <" in body or prefix + " check" in body
+        assert "{} check".format(prefix) in body
+        assert "{} check".format(other) not in body
+        # The other spelling is still mentioned once, in the usage line.
+        assert other in body
+
+
+def test_help_lists_every_registered_subcommand():
+    """A subcommand missing from the help is a subcommand nobody will use.
+
+    Read off the command tree rather than a hand-kept list, so adding a subcommand without
+    adding a help row fails here instead of shipping silently. Uses the public accessors
+    (``literals`` / ``get_children``) so a reshuffle inside MCDR does not make this lie.
+    """
+    import mod_update_checker as plugin
+
+    node = plugin._command_tree("!!muc")
+    registered = set()
+    for child in node.get_children():
+        registered.update(child.literals)
+
+    assert registered, "the command tree reported no subcommands"
+    assert "help" in registered, "the help subcommand itself is missing"
+
+    body = str(_render_help("!!muc")[0])
+    for name in sorted(registered):
+        assert "!!muc {}".format(name) in body, "{} is not in the help".format(name)
+
+
+def test_help_columns_line_up_for_both_aliases():
+    """The description column starts at the same place on every row.
+
+    The padding is computed from the longest command, so the row that *is* the longest is the
+    one this fails on when the separator forgets its leading space.
+    """
+    for prefix in ("!!muc", "!!modupdate"):
+        body = str(_render_help(prefix)[0])
+        columns = [line.index("-- ") for line in body.splitlines() if "-- " in line]
+
+        assert columns, body
+        assert len(set(columns)) == 1, (prefix, columns)
+
+
+def test_every_help_row_is_clickable_and_describes_its_command():
+    """Colour and click targets are the whole point of the rich help page.
+
+    Asserted on ``to_json_object()`` rather than on private attributes: that is the form the
+    client actually receives, so it proves the colour and the click survive the trip, and it
+    is a documented interface instead of an internal one.
+    """
+    segments = list(_segments(_render_help("!!muc")[0]))
+
+    commands = [
+        item for item in segments
+        if item.get("text", "").startswith("!!muc") and item.get("color") == "aqua"
+    ]
+    assert commands, "no clickable command segments found"
+
+    for item in commands:
+        click = item.get("clickEvent")
+        assert click is not None, item
+        # Clicking runs or types the command itself, never its description.
+        assert click.get("value", "").startswith("!!muc"), item
+        assert click.get("action") in ("run_command", "suggest_command"), item
+
+    # The descriptions are present and set apart, so the screen reads as two columns.
+    descriptions = [item for item in segments if item.get("color") == "white"]
+    assert descriptions, "the help rows have no descriptions"
+
+
+def test_the_list_row_suggests_rather_than_runs():
+    """``list`` works bare, but its useful form takes a status filter.
+
+    Running it unfiltered the moment it is clicked would answer a question the admin did not
+    ask; filling the input box lets them add the status.
+    """
+    segments = list(_segments(_render_help("!!muc")[0]))
+    row = next(
+        item for item in segments
+        if item.get("text") == "!!muc list"
+    )
+    assert row["clickEvent"]["action"] == "suggest_command"
+    assert row["clickEvent"]["value"].endswith(" "), "the suggestion should be ready for an argument"
+
+
+def _segments(node):
+    """Every leaf of an ``RTextList``, as the JSON objects the client is sent."""
+    children = getattr(node, "children", None)
+    if children is None:
+        yield node.to_json_object()
+        return
+    for child in children:
+        yield from _segments(child)
+
+
+def test_the_status_screen_uses_the_same_title_bar_as_the_help():
+    """The two screens are meant to look like one plugin's.
+
+    Checked by shape rather than by exact text: the title bar is gold ``=`` bars around the
+    plugin name, and it opens both screens.
+    """
+    import mod_update_checker as plugin
+    from mcdreforged.api.rtext import RColor
+
+    class _Scan:
+        directory = "server/mods"
+        mods = []
+        disabled = []
+
+    class _Config:
+        language = "zh_cn"
+        use_modrinth = True
+        ignored_mods = []
+        check_on_server_start = True
+        check_interval_hours = 0
+        command_permission_level = 3
+
+    previous_config, previous_scan, previous_server = plugin._config, plugin._scan_current, plugin._server
+    try:
+        plugin._config = _Config()
+        plugin._apply_language(None, _Config())
+        plugin._scan_current = lambda *_a: (
+            _Scan(),
+            __import__(
+                "mod_update_checker.serverinfo", fromlist=["ServerContext"]
+            ).ServerContext(mc_version="26.3", mc_version_source="config", loader="fabric"),
+        )
+        plugin._server = object()
+
+        source = _ReplyRecorder()
+        plugin._show_status(source)
+    finally:
+        plugin._config, plugin._scan_current, plugin._server = (
+            previous_config, previous_scan, previous_server,
+        )
+
+    assert len(source.replies) == 1
+    bars = [
+        item for item in _segments(source.replies[0])
+        if item.get("text", "").startswith("=") and item.get("color") == "gold"
+    ]
+    assert bars, "the status screen has no title bar"
+    assert bars[0]["text"].strip("=") == "", bars[0]

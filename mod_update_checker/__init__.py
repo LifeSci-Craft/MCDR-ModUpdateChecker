@@ -25,8 +25,10 @@ from mcdreforged.api.all import (
     GreedyText,
     Literal,
     PluginServerInterface,
+    RAction,
     RColor,
     RText,
+    RTextList,
     Serializable,
 )
 
@@ -64,6 +66,20 @@ DOWNLOAD_LEDGER_FILE_NAME = "download-manifest.json"
 
 #: Both spellings are registered so an admin does not have to guess which one is canonical.
 ROOT_LITERALS = ("!!modupdate", "!!muc")
+
+#: Used for the title bar when the plugin metadata cannot be read.
+_FALLBACK_TITLE = "Mod Update Checker"
+
+#: Width the help and status title bars aim to fill. Roughly one line of the vanilla chat
+#: window at the default font size; going wider wraps, which looks worse than a short bar.
+_TITLE_WIDTH = 53
+#: Never fewer than this many ``=`` on each side, however long the plugin name gets.
+_TITLE_BAR_MIN = 4
+#: Left column of the help page, in characters. Derived from the literals themselves so it
+#: cannot drift from the commands it has to line up: the longest registered prefix, then the
+#: longest subcommand actually printed (``status``; a subcommand that takes an argument is
+#: shown without it).
+_HELP_COMMAND_WIDTH = max(len(name) for name in ROOT_LITERALS) + 1 + len("status")
 
 #: Cap on how many mods are listed in a one-shot notification, so a server with 150 stale
 #: mods does not dump 150 lines into the chat every restart. The full list is one command
@@ -938,34 +954,90 @@ def _show_filtered(source: CommandSource, status: str) -> None:
         source.reply(_coloured_line(render_entry_line(entry, tr, verbose=True)))
 
 
+def _field(label: str, value: str, value_colour: Any = RColor.green) -> RTextList:
+    """``Label: value`` with the label in aqua.
+
+    The trailing ``: `` is part of the translated label rather than added here, so the
+    punctuation is translatable and the two languages can disagree about it.
+
+    Shared with the help page's ``command -- description`` rows so the two screens look like
+    they come from the same plugin: aqua is always the thing you act on (a command, a label),
+    white or green is the content, gray is an aside.
+    """
+    return RTextList(RText(label, RColor.aqua), RText(value, value_colour))
+
+
 def _show_status(source: CommandSource) -> None:
+    """What the plugin currently thinks the server is, and what it is configured to do.
+
+    One rich message rather than a line per ``reply`` call: the lines are a single screen, and
+    building them as one ``RTextList`` is what lets colours and the title bar survive. (A
+    ``server.logger`` call cannot do this — MCDR's log formatter stringifies its argument and
+    ``RTextBase.__str__`` drops the colour, which is why the console paths log plain strings.)
+    """
     server = _server
     if server is None:
         return
     scan, context = _scan_current(server, _config)
-    source.reply(tr("command.status.header"))
-    source.reply(tr("command.status.server", version=context.mc_version or "?",
-                    loader=context.loader, source=context.mc_version_source))
-    source.reply(tr("command.status.mods_dir", directory=scan.directory,
-                    count=len(scan.mods)))
+
     modrinth_state = (
         tr("command.status.enabled") if _config.use_modrinth else tr("command.status.disabled")
     )
-    source.reply(tr("command.status.upstream", modrinth=modrinth_state))
+    parts = RTextList(
+        _title_line(server),
+        "\n",
+        _field(
+            tr("command.status.server_label"),
+            tr("command.status.server", version=context.mc_version or "?",
+               loader=context.loader, source=context.mc_version_source),
+            RColor.white,
+        ),
+        "\n",
+        _field(
+            tr("command.status.mods_dir_label"),
+            tr("command.status.mods_dir", directory=scan.directory, count=len(scan.mods)),
+            RColor.white,
+        ),
+        "\n",
+        _field(tr("command.status.upstream_label"),
+               tr("command.status.upstream", modrinth=modrinth_state),
+               RColor.white),
+    )
     if _config.ignored_mods:
-        source.reply(tr("command.status.ignored", count=len(_config.ignored_mods),
-                        names=", ".join(_config.ignored_mods[:8])))
+        parts.append("\n")
+        parts.append(
+            _field(
+                tr("command.status.ignored_label"),
+                tr("command.status.ignored", count=len(_config.ignored_mods),
+                   names=", ".join(_config.ignored_mods[:8])),
+                RColor.white,
+            )
+        )
+    parts.append("\n")
     if _last_report is None:
-        source.reply(tr("command.status.never_checked"))
+        parts.append(_field(tr("command.status.last_report_label"),
+                            tr("command.status.never_checked"), RColor.gray))
     else:
-        source.reply(tr("command.status.last_report", when=_last_report.generated_at,
-                        actionable=_last_report.actionable_count))
-    source.reply(tr(
-        "command.status.scheduling",
-        on_start=tr("command.status.yes") if _config.check_on_server_start
-        else tr("command.status.no"),
-        hours=_config.check_interval_hours,
-    ))
+        parts.append(
+            _field(
+                tr("command.status.last_report_label"),
+                tr("command.status.last_report", when=_last_report.generated_at,
+                   actionable=_last_report.actionable_count),
+                RColor.white,
+            )
+        )
+    parts.append("\n")
+    parts.append(
+        _field(
+            tr("command.status.scheduling_label"),
+            tr("command.status.scheduling",
+               on_start=tr("command.status.yes") if _config.check_on_server_start
+               else tr("command.status.no"),
+               hours=_config.check_interval_hours),
+            RColor.white,
+        )
+    )
+    source.reply(parts)
 
 
 def _reload_config(source: CommandSource) -> None:
@@ -980,17 +1052,102 @@ def _reload_config(source: CommandSource) -> None:
     source.reply(tr("console.config_reloaded"))
 
 
-def _show_help(source: CommandSource) -> None:
-    source.reply(tr("command.help.title"))
-    for key in (
-        "command.help.summary",
-        "command.help.check",
-        "command.help.list",
-        "command.help.status",
-        "command.help.reload",
-        "command.help.help",
-    ):
-        source.reply(tr(key))
+def _plugin_title(server: Optional[PluginServerInterface]) -> Tuple[str, str]:
+    """``(name, version)`` from the plugin metadata, falling back to a constant.
+
+    Reading the metadata is not allowed to raise: it is only used to draw a title bar, and a
+    missing version is worth far less than a command that errors out. The fallback name is the
+    plugin id so it is at least recognisable.
+    """
+    getter = getattr(server, "get_self_metadata", None)
+    if getter is None:
+        return _FALLBACK_TITLE, ""
+    try:
+        metadata = getter()
+    except Exception:  # noqa: BLE001 - a title is not worth failing a command over
+        return _FALLBACK_TITLE, ""
+    name = str(getattr(metadata, "name", "") or _FALLBACK_TITLE)
+    version = str(getattr(metadata, "version", "") or "")
+    return name, version
+
+
+def _title_line(server: Optional[PluginServerInterface] = None) -> RTextList:
+    """``========  Mod Update Checker v1.5.0  ========``
+
+    The bar is sized to the name so the two sides stay even, with a floor so a very long or
+    very short name still looks deliberate. Name and version are coloured differently because
+    the version is the part an admin is usually looking for when they report a problem.
+    """
+    name, version = _plugin_title(server)
+    core = "{} v{}".format(name, version) if version else name
+    bars = max(_TITLE_BAR_MIN, (_TITLE_WIDTH - len(core) - 4) // 2)
+    rule = "=" * bars
+    line = RTextList(RText(rule, RColor.gold), "  ", RText(name, RColor.aqua))
+    if version:
+        line.append(RText(" v" + version, RColor.yellow))
+    line.append("  ")
+    line.append(RText(rule, RColor.gold))
+    return line
+
+
+def _help_line(description: str, command: str, action: Any) -> RTextList:
+    """One ``!!muc <subcommand>  -- description`` row, left column padded to line up.
+
+    The separator carries its own leading space, so the column width is the longest command
+    itself and the descriptions all start at the same place — no command needs a gap jammed
+    against it, and the longest one is not pushed out of alignment by one.
+
+    The click event goes on the command only: the padding that makes the column straight is not
+    part of what gets typed when the row is clicked.
+    """
+    padding = " " * max(0, _HELP_COMMAND_WIDTH - len(command))
+    click = command + (" " if action is RAction.suggest_command else "")
+    return RTextList(
+        RText(command, RColor.aqua).set_click_event(action, click),
+        RText(padding + " -- ", RColor.gray),
+        RText(description, RColor.white),
+    )
+
+
+def _show_help(source: CommandSource, prefix: str = ROOT_LITERALS[0]) -> None:
+    """The landing page: what this plugin's commands are, and what each one does.
+
+    ``prefix`` is the spelling actually typed, so ``!!muc help`` lists ``!!muc ...`` and not
+    the other alias. The other spelling is mentioned once in the usage line instead.
+
+    Every row is clickable: the command runs when clicked, except ``list``, which suggests
+    rather than runs — it works bare, but the useful form takes a status filter, so the input
+    box is filled in ready for one instead of firing the unfiltered listing.
+    """
+    other = next((name for name in ROOT_LITERALS if name != prefix), prefix)
+    rows = RTextList()
+    # Built with explicit ``RTextList`` calls rather than by looping over a tuple of keys: the
+    # catalogue invariant collects key literals from their call sites, so a key reached through
+    # a variable would look unused and be reported as a stale entry.
+    rows.append(_title_line(_server))
+    rows.append("\n")
+    rows.append(RText(tr("command.help.usage", command=prefix, alias=other), RColor.gray))
+    rows.append("\n")
+    rows.append(RText(tr("command.help.permission", level=_config.command_permission_level),
+                      RColor.yellow))
+    rows.append("\n")
+    rows.append(_help_line(tr("command.help.entry_summary"), prefix, RAction.run_command))
+    rows.append("\n")
+    rows.append(_help_line(tr("command.help.entry_check"), prefix + " check",
+                           RAction.run_command))
+    rows.append("\n")
+    rows.append(_help_line(tr("command.help.entry_list"), prefix + " list",
+                           RAction.suggest_command))
+    rows.append("\n")
+    rows.append(_help_line(tr("command.help.entry_status"), prefix + " status",
+                           RAction.run_command))
+    rows.append("\n")
+    rows.append(_help_line(tr("command.help.entry_reload"), prefix + " reload",
+                           RAction.run_command))
+    rows.append("\n")
+    rows.append(_help_line(tr("command.help.entry_help"), prefix + " help",
+                           RAction.run_command))
+    source.reply(rows)
 
 
 def _trigger_check(source: CommandSource) -> None:
@@ -1014,7 +1171,11 @@ def _command_tree(prefix: str):
         Literal(prefix)
         .requires(_has_permission, _denied)
         .runs(_show_summary)
-        .then(Literal("help").runs(_show_help))
+        .then(
+            Literal("help").runs(
+                lambda source: _show_help(source, prefix)
+            )
+        )
         .then(Literal("check").runs(_trigger_check))
         .then(
             Literal("list")
