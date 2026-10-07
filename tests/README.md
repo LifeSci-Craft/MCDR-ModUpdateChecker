@@ -1,5 +1,8 @@
 # 测试说明
 
+面向改这个插件的人。面向使用者的说明在 [`../README.md`](../README.md)，
+设计取舍与发版流程在 [`../README-dev.md`](../README-dev.md)。
+
 ## 一次性准备
 
 插件本身**没有**额外依赖：`requests` 是 MCDR 的硬依赖，其余全部走标准库。测试需要 `pytest`，

@@ -24,8 +24,9 @@ The ``.py`` files are shipped with their comments and docstrings blanked out
 numbers are preserved, so a traceback from the installed plugin still points at the right
 line of the repository file.
 
-``README.md`` is deliberately **excluded**: MCDR never reads it and the release page already
-says everything it says.
+``README.md`` and ``README-dev.md`` are deliberately **excluded**: they are long, MCDR never
+reads them, and the release page already says everything they say. One is written for the
+people who install this and one for the people who change it; neither belongs in the artifact.
 """
 
 import ast

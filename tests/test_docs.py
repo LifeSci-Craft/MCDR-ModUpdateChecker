@@ -1,17 +1,24 @@
-"""The prose against the code: option names, and the counts the docs quote.
+"""The prose against the code: option names, counts, and which document says what.
 
-Documentation rots in a specific way here. When the config was grouped into sections, every
-option gained a prefix — and the prose kept naming them the old way for two releases, in the
-exact places a reader goes to *check* the name (`check.ignored_mods` was still written
-``ignored_mods`` in the troubleshooting section). Nothing failed, because prose has no imports
-to break.
+Two documents, two readers. ``README.md`` is for whoever installs the plugin: what it does, how
+to run it, every option, and how to read a verdict. ``README-dev.md`` is for whoever changes it:
+how a verdict is reached, why the version comparison is the way it is, how each claim was
+verified, and how to build and release. The split has a rule worth keeping — a user should be
+able to read the whole of README.md without meeting an implementation detail, and a developer
+should not have to reconstruct the design from the source.
+
+Documentation also rots in a specific way. When the config was grouped into sections, every
+option gained a prefix — and the prose kept naming them the old way, in the exact places a
+reader goes to *check* the name (``check.ignored_mods`` was still written ``ignored_mods`` in
+the troubleshooting section). Nothing failed, because prose has no imports to break.
 
 Same story with the numbers: ``32 项检查`` and ``456 项`` stayed in the README long after both
 had moved. A count in prose is a claim, so the ones that can be derived from code are derived
 here rather than remembered.
 
-What this file deliberately does *not* do is spell-check the prose. It checks the two things
-that have a machine-readable source of truth: option paths, and counts.
+What this file deliberately does *not* do is spell-check the prose. It checks the things that
+have a machine-readable source of truth: option paths, counts, links between the two documents,
+and the audience split itself.
 """
 
 import json
@@ -23,7 +30,14 @@ import pytest
 REPO = Path(__file__).resolve().parent.parent
 PACKAGE = REPO / "mod_update_checker"
 
-DOCS = ("README.md", "CHANGELOG.md", "tests/README.md")
+#: The user-facing document, written for whoever installs this.
+USER_DOC = "README.md"
+
+#: The developer-facing one. Both are scanned for the invariants below; the checks that are
+#: about *what a user is told* name ``USER_DOC`` explicitly.
+DEVELOPER_DOC = "README-dev.md"
+
+DOCS = (USER_DOC, DEVELOPER_DOC, "CHANGELOG.md", "tests/README.md")
 
 SECTIONS = ("server", "check", "report", "sources", "download", "network")
 
@@ -122,7 +136,7 @@ def test_every_option_path_in_the_docs_exists(name):
 
 
 def test_the_documented_check_count_is_the_real_one():
-    """The README quotes how many checks the matrix compares across MCDR versions.
+    """The developer README quotes how many checks the matrix compares across MCDR versions.
 
     ``required_keys`` is where that number lives, and it changes whenever a check is added — so
     the sentence is derived from it rather than maintained beside it. (It sat at "32" for two
@@ -139,9 +153,10 @@ def test_the_documented_check_count_is_the_real_one():
 
     download_checks = len(tool.required_keys(False))
     assert download_checks > 0
-    assert "{} 项检查逐项一致".format(download_checks) in _doc("README.md"), (
-        "the README quotes a different check count than required_keys() reports "
-        "({})".format(download_checks)
+    assert "{} 项检查逐项一致".format(download_checks) in _doc(DEVELOPER_DOC), (
+        "{} quotes a different check count than required_keys() reports ({})".format(
+            DEVELOPER_DOC, download_checks
+        )
     )
 
 
@@ -181,12 +196,57 @@ def test_the_readme_lists_every_command_the_tree_registers():
     for child in plugin._command_tree("!!muc").get_children():
         registered.update(child.literals)
 
-    readme = _doc("README.md")
+    readme = _doc(USER_DOC)
     missing = sorted(
         name for name in registered
         if "!!modupdate {}".format(name) not in readme
     )
-    assert missing == [], "not documented in README.md: {}".format(missing)
+    assert missing == [], "not documented in {}: {}".format(USER_DOC, missing)
+
+
+def test_the_user_readme_points_at_the_developer_readme():
+    """A document nobody can find is a document nobody reads.
+
+    The split only works if each side names the other: someone who installs the plugin and then
+    wonders how a verdict was reached has to be able to get from one to the other without
+    guessing a file name. Asserted on the link *target*, not on the label — whether the label
+    is code-formatted is not the point.
+    """
+    assert "]({})".format(DEVELOPER_DOC) in _doc(USER_DOC), (
+        "{} never links to {}".format(USER_DOC, DEVELOPER_DOC)
+    )
+    assert "]({})".format(USER_DOC) in _doc(DEVELOPER_DOC), (
+        "{} never links back to {}".format(DEVELOPER_DOC, USER_DOC)
+    )
+
+
+def test_the_user_readme_carries_no_implementation_detail():
+    """The audience split, asserted on its most mechanical symptom.
+
+    A user reads ``README.md`` to install the plugin and act on a report. Sections about how
+    the comparison algorithm works, how each claim was verified, and how to build the artifact
+    belong in the other document — they are the reason the other document exists, and having
+    them in both is how the two drift apart again. Their headings are listed here so that
+    pasting one back fails.
+    """
+    forbidden_headings = (
+        "它是怎么判断的",
+        "版本比对的取舍",
+        "这些结论是怎么核验的",
+        "开发",
+        "发布一个新版本",
+    )
+    headings = [
+        line.lstrip("#").strip()
+        for line in _doc(USER_DOC).splitlines()
+        if line.startswith("#")
+    ]
+    intruders = [h for h in headings if any(f in h for f in forbidden_headings)]
+    assert intruders == [], "{} has developer sections: {}".format(USER_DOC, intruders)
+
+    developer = _doc(DEVELOPER_DOC)
+    for heading in forbidden_headings:
+        assert heading in developer, "{} lost the {} section".format(DEVELOPER_DOC, heading)
 
 
 _REPO_URL = re.compile(r"https://github\.com/([^/\"')\s]+)/([^/\"')\s#]+)")

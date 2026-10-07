@@ -46,8 +46,12 @@ EXPECTED_ROOT_FILES = {"mcdreforged.plugin.json", "LICENSE", "CHANGELOG.md"}
 
 #: Root-level entries that must never ship. MCDR rejects a packed plugin containing a
 #: root-level module, so these are not merely untidy — they break loading.
+#:
+#: Both READMEs are listed. ``README-dev.md`` would not match the ``README.md`` prefix, so
+#: leaving it out here is how the developer notes end up inside a user's plugin folder.
 FORBIDDEN_ROOTS = (
     "README.md",
+    "README-dev.md",
     "README_en.md",
     "pack.py",
     "conftest.py",
