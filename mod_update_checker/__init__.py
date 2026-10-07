@@ -17,6 +17,7 @@ import json
 import os
 import threading
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from mcdreforged.api.all import (
@@ -32,7 +33,12 @@ from mcdreforged.api.all import (
 from . import i18n
 from .checker import CheckOptions, Checker
 from .report import ALL_STATUSES, Report, render_entry_line, render_full, render_summary
-from .scanner import ScanResult, resolve_mods_directory, scan_mods
+from .scanner import (
+    ScanResult,
+    iter_mod_jars,
+    resolve_mods_directory,
+    scan_mods,
+)
 from .serverinfo import detect as detect_server_context
 
 CONFIG_FILE_NAME = "config.json"
@@ -300,8 +306,12 @@ def _run_check(
         checker = Checker(
             _check_options(config, context.mc_version, context.loader), logger=server.logger
         )
+        # ``Path`` rather than the ``os.path.join`` result: the cache is a filesystem object
+        # and every method on it uses the pathlib API. Passing a bare string here is what
+        # made the shipped default config crash on the first check, so the type is made
+        # explicit at the boundary rather than left to whatever the join returned.
         cache_path = (
-            os.path.join(server.get_data_folder(), CACHE_FILE_NAME)
+            Path(server.get_data_folder()) / CACHE_FILE_NAME
             if config.use_resolve_cache
             else None
         )
@@ -704,13 +714,29 @@ def on_load(server: PluginServerInterface, prev_module: Any) -> None:
         server.logger.info("[Mod Update Checker] disabled by config")
         return
 
+    # Count the jars by listing the directory — deliberately NOT by scanning them.
+    #
+    # `scan_mods` reads and hashes every jar, and this runs on MCDR's plugin-loading thread,
+    # so using it here would block `!!MCDR reload plugin` and MCDR's own startup for as long
+    # as it takes to read the whole `mods/` folder: seconds on a real modpack, against
+    # milliseconds for the handful of tiny jars a test builds. A count is all this line wants,
+    # and a directory listing gives it for free. The hashing belongs in the check, which runs
+    # on its own thread.
     try:
-        scan, _context = _scan_current(server, _config)
-        server.logger.info(
-            tr("console.loaded", count=len(scan.mods), directory=scan.directory)
+        directory = resolve_mods_directory(
+            _working_directory(server), _config.mods_directory
         )
+        if not os.path.isdir(directory):
+            server.logger.warning(
+                tr("console.no_mods_directory", directory=str(directory))
+            )
+        else:
+            jars, _disabled = iter_mod_jars(directory)
+            server.logger.info(
+                tr("console.loaded", count=len(jars), directory=str(directory))
+            )
     except Exception as error:  # noqa: BLE001 - a broken mods folder is not fatal
-        server.logger.warning("could not scan the mods folder: {}".format(error))
+        server.logger.warning("could not inspect the mods folder: {}".format(error))
 
     if _config.use_curseforge and not (_config.curseforge_api_key or "").strip():
         server.logger.info(tr("console.curseforge_hint"))

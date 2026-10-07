@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 
 PACKAGE = Path(__file__).resolve().parent.parent / "mod_update_checker"
+REPO = PACKAGE.parent
 ENTRY = PACKAGE / "__init__.py"
 
 #: MCDR discovers entry-module handlers by these names (see MCDRPluginEvents).
@@ -33,15 +34,52 @@ class _FakeLogger:
     def debug(self, *_args, **_kwargs):
         pass
 
-    def warning(self, *_args, **_kwargs):
+    def warning(self, message, *_args, **_kwargs):
+        self.messages.append("WARN " + str(message))
+
+    def error(self, message, *_args, **_kwargs):
+        self.messages.append("ERROR " + str(message))
+
+    def exception(self, *_args, **_kwargs):
         pass
 
 
 class _FakeServer:
-    """Just enough of PluginServerInterface for the scheduling helpers."""
+    """Just enough of PluginServerInterface to run ``on_load`` head-less.
 
-    def __init__(self):
+    ``on_load`` needs the data folder (for the config), the MCDR config (for
+    ``working_directory``), the MCDR language, and the two registration calls. Everything
+    else it might touch is a no-op here.
+    """
+
+    def __init__(self, tmp_path):
         self.logger = _FakeLogger()
+        self._folder = Path(tmp_path) / "config" / "mod_update_checker"
+        self._folder.mkdir(parents=True, exist_ok=True)
+        self._mcdr_config = {"working_directory": str(tmp_path), "language": "zh_cn"}
+        self.help_messages = []
+        self.commands = []
+
+    def get_data_folder(self):
+        return str(self._folder)
+
+    def load_config_simple(self, file_name=None, *, target_class=None, **_kwargs):
+        return target_class.get_default()
+
+    def get_mcdr_config(self):
+        return dict(self._mcdr_config)
+
+    def get_mcdr_language(self):
+        return self._mcdr_config["language"]
+
+    def register_help_message(self, prefix, message, permission=0):
+        self.help_messages.append((prefix, message, permission))
+
+    def register_command(self, node, **_kwargs):
+        self.commands.append(node)
+
+    def get_permission_level(self, _obj):
+        return 4
 
 
 def _entry_source() -> str:
@@ -100,7 +138,7 @@ def test_load_stops_the_previous_modules_scheduler():
     assert "prev_module" in body, "on_load ignores the previous module handed to it"
 
 
-def test_the_stop_event_is_cleared_before_a_new_scheduler_starts(monkeypatch):
+def test_the_stop_event_is_cleared_before_a_new_scheduler_starts(tmp_path, monkeypatch):
     """``!!modupdate reload`` stops the old thread and then starts a new one.
 
     If the stop event is not cleared in between, the new loop's very first ``wait`` returns
@@ -119,7 +157,7 @@ def test_the_stop_event_is_cleared_before_a_new_scheduler_starts(monkeypatch):
     plugin._stop_scheduler()            # leaves _stop_event set, exactly as a reload does
     assert plugin._stop_event.is_set()
 
-    server = _FakeServer()
+    server = _FakeServer(tmp_path)
     try:
         plugin._start_interval_scheduler(server)
         assert not plugin._stop_event.is_set(), "a stale stop event survived"
@@ -132,7 +170,7 @@ def test_the_stop_event_is_cleared_before_a_new_scheduler_starts(monkeypatch):
     assert not plugin._scheduler_thread
 
 
-def test_no_scheduler_thread_when_the_interval_is_zero(monkeypatch):
+def test_no_scheduler_thread_when_the_interval_is_zero(tmp_path, monkeypatch):
     import mod_update_checker as plugin
 
     class _Config:
@@ -142,7 +180,7 @@ def test_no_scheduler_thread_when_the_interval_is_zero(monkeypatch):
 
     monkeypatch.setattr(plugin, "_config", _Config(), raising=False)
     plugin._scheduler_thread = None
-    plugin._start_interval_scheduler(_FakeServer())
+    plugin._start_interval_scheduler(_FakeServer(tmp_path))
     assert plugin._scheduler_thread is None
 
 
@@ -153,6 +191,59 @@ def test_stopping_twice_is_harmless(monkeypatch):
     plugin._stop_scheduler()
     plugin._stop_scheduler()
     assert plugin._scheduler_thread is None
+
+
+def test_on_load_counts_jars_without_hashing_them(tmp_path, monkeypatch):
+    """``on_load`` must count, not read.
+
+    It runs on MCDR's plugin-loading thread, so walking and hashing every jar there would
+    block MCDR's startup and every ``!!MCDR reload plugin`` for as long as it takes to read
+    the whole ``mods/`` folder — seconds on a real modpack. A fixture of five tiny jars makes
+    that invisible, which is exactly why it is pinned: the first version of this plugin did
+    hash the whole folder during load.
+    """
+    import mod_update_checker as plugin
+
+    from support import fabric_metadata, write_jar
+
+    mods = Path(tmp_path) / "mods"
+    mods.mkdir(parents=True)
+    for index in range(3):
+        write_jar(
+            mods / "mod{}.jar".format(index),
+            fabric=fabric_metadata(id="mod{}".format(index)),
+        )
+    (mods / "stale.jar.disabled").write_bytes(b"not a jar")
+
+    def explode(*_args, **_kwargs):
+        raise AssertionError("on_load hashed the mods folder; that belongs in the check")
+
+    monkeypatch.setattr(plugin, "scan_mods", explode, raising=False)
+    plugin._stop_event.clear()
+
+    server = _FakeServer(tmp_path)
+    plugin.on_load(server, None)
+
+    joined = "\n".join(server.logger.messages)
+    assert "3" in joined, joined                    # the three jars were counted
+    assert "mod0.jar" not in joined                 # and not one of them was opened
+    assert len(server.commands) == 2                # both root aliases registered
+    assert {prefix for prefix, _m, _p in server.help_messages} == {"!!modupdate", "!!muc"}
+
+    plugin._stop_scheduler()
+
+
+def test_on_load_warns_when_the_mods_folder_is_missing(tmp_path):
+    import mod_update_checker as plugin
+
+    plugin._stop_event.clear()
+    server = _FakeServer(tmp_path)
+    plugin.on_load(server, None)
+
+    joined = "\n".join(server.logger.messages)
+    assert "WARN" in joined and "mods" in joined, joined
+
+    plugin._stop_scheduler()
 
 
 def test_config_defaults_are_the_documented_ones():
@@ -174,8 +265,76 @@ def test_config_defaults_are_the_documented_ones():
     assert config.notify_in_game is False          # never broadcast to players by default
     assert config.notify_on_updates_only is True
     assert config.command_permission_level == 3
-    assert config.use_resolve_cache is True
-    assert config.requests_per_minute == 240       # under Modrinth's documented 300/min
+    assert config.use_resolve_cache is True          # and therefore must work for a user
+    assert config.requests_per_minute == 240         # under Modrinth's documented 300/min
+
+
+def test_the_end_to_end_run_uses_the_shipped_defaults():
+    """The real-MCDR run must execute the config a user actually gets.
+
+    This test exists because of a specific escape. The matrix tool used to write a config with
+    ``use_resolve_cache: False`` for convenience; that disabled the cache code path, so it was
+    never executed against a real MCDR, and it turned out to crash on the *default* config. A
+    green end-to-end run therefore proved nothing about the shipped behaviour.
+
+    Every override now has to be declared in ``CONFIG_OVERRIDES`` with a reason, and this
+    test fails if the dict drifts from that list — so switching a code path off cannot happen
+    silently again.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "mcdr_matrix", REPO / "tools" / "mcdr_matrix.py"
+    )
+    assert spec is not None and spec.loader is not None
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+
+    class _Upstream:
+        modrinth_base = "http://127.0.0.1:1/v2"
+        curseforge_base = "http://127.0.0.1:1/v1"
+
+    config = tool.plugin_config(_Upstream())
+
+    assert set(config) == set(tool.CONFIG_OVERRIDES), (
+        "the matrix config drifted from its declared overrides:\n"
+        "  extra: {}\n  missing: {}".format(
+            sorted(set(config) - set(tool.CONFIG_OVERRIDES)),
+            sorted(set(tool.CONFIG_OVERRIDES) - set(config)),
+        )
+    )
+
+    # The keys whose defaults must be in force, i.e. absent from the override dict. These are
+    # the ones that decide whether a code path runs at all.
+    for key in (
+        "use_resolve_cache",   # the crash that hid here
+        "enabled",
+        "write_report_file",
+        "notify_on_updates_only",
+        "loader",
+        "language",
+        "mc_version",
+        "mods_directory",
+        "check_on_server_start",
+    ):
+        assert key not in config, (
+            "{} must stay at its shipped default in the end-to-end run, otherwise the "
+            "behaviour a user gets is never exercised".format(key)
+        )
+
+    # ``notify_in_game`` is the one exception, and a deliberate one: its default is off, and
+    # off means the tellraw path never executes. That path builds a command out of mod names
+    # and sends it with ``server.execute``, so it is worth running. The override is declared
+    # above, and the run asserts the payload is valid JSON addressed to the right player.
+    assert config["notify_in_game"] is True
+
+    # And every override has to be one the plugin's own config class knows about, so a typo
+    # cannot silently become a no-op.
+    import mod_update_checker as plugin
+
+    known = set(plugin.Config.get_field_annotations())
+    unknown = set(tool.CONFIG_OVERRIDES) - known
+    assert not unknown, "overrides for options that do not exist: {}".format(sorted(unknown))
 
 
 def test_config_round_trips_through_json():

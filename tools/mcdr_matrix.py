@@ -56,6 +56,9 @@ MINIMUM_MCDR = (2, 13, 0)
 RUN_SECONDS = 60
 COMMAND_INTERVAL = 1.2
 
+#: The player the fake server announces, so the in-game notification path has a recipient.
+TEST_PLAYER = "MucTester"
+
 FAKE_SERVER = '''\
 """A stand-in Minecraft server: prints a Fabric-style startup, then obeys ``stop``."""
 import sys
@@ -70,16 +73,33 @@ def out(message):
 out("Loading Minecraft {mc} with Fabric Loader 0.18.1")
 out('Starting minecraft server version {mc}')
 out('Done (1.234s)! For help, type "help"')
+# Announced before the plugin's delayed check fires, so the in-game notification has an
+# online recipient to target. The shape is what MCDR's player-joined regex expects.
+out("{player}[/127.0.0.1:41234] logged in with entity id 42 at (0.0, 64.0, 0.0)")
+time.sleep(0.4)
 
 for line in sys.stdin:
     command = line.strip()
     if command == "stop":
         break
+    # Echo the command back so the test can see what the plugin sent, and check the payload.
     if command.startswith("tellraw"):
         out("(tellraw) " + command)
 
 out("Stopping server")
 '''
+
+#: MCDR's permission file. The test player is an owner so the notification is addressed to
+#: them — the plugin only messages players at or above ``notify_in_game_permission``.
+PERMISSION_YML = """\
+default_level: user
+owner:
+- {player}
+admin: []
+helper: []
+user: []
+guest: []
+""".format(player=TEST_PLAYER)
 
 MCDR_CONFIG = """\
 language: zh_cn
@@ -135,9 +155,27 @@ def write(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8", newline="\n")
 
 
+def _ensure_dependencies_importable() -> None:
+    """Put this repo and ``.testlibs`` on ``sys.path`` for the *driver* process.
+
+    The driver is not just a launcher: it imports the scenario builder, which imports the
+    plugin package, which imports MCDR. So the driver needs MCDR too — and asking whoever runs
+    this to get ``PYTHONPATH`` right is a footgun, as two bashes of mine demonstrated
+    (``.testlibs:tests`` is mangled by MSYS path conversion, and a relative entry does not
+    survive the ``cwd`` change into a temp instance directory).
+
+    Done here rather than documented, so ``python tools/mcdr_matrix.py`` works from a clean
+    checkout in either layout: dependencies in ``.testlibs`` or in the interpreter.
+    """
+    for entry in (REPO, REPO / "tests", REPO / ".testlibs"):
+        text = str(entry)
+        if entry.is_dir() and text not in sys.path:
+            sys.path.insert(0, text)
+
+
 def build_plugin() -> Path:
     """Build the distributable artifact, so the tested thing is what a user installs."""
-    sys.path.insert(0, str(REPO))
+    _ensure_dependencies_importable()
     import pack
 
     out = Path(tempfile.mkdtemp(prefix="muc_matrix_art_")) / "ModUpdateChecker.mcdr"
@@ -145,20 +183,56 @@ def build_plugin() -> Path:
     return out
 
 
-def _child_env() -> dict:
-    """The environment for the MCDR subprocesses.
+#: Memoised "can this interpreter import mcdreforged by itself?" answers, keyed by python path.
+_OWN_MCDR: dict = {}
 
-    The test dependencies may live in ``.testlibs`` (the documented ``pip install --target``
-    layout, and what CI uses) rather than in the interpreter's own site-packages (what a
-    local MCDR virtualenv looks like). MCDR is launched with ``cwd`` set to a temporary
-    instance directory, and a *relative* ``PYTHONPATH`` does not resolve from there — so the
-    path is made absolute here, or the subprocess would fail to import MCDR on CI while
-    working perfectly on a developer machine.
+
+def _interpreter_has_own_mcdr(python: str) -> bool:
+    """Can ``python`` import MCDR *without* help from ``.testlibs``?"""
+    if python not in _OWN_MCDR:
+        probe = subprocess.run(
+            [python, "-c", "import mcdreforged"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=120,
+            # A clean environment on purpose: this question is exactly "what does this
+            # interpreter have on its own?".
+            env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        )
+        _OWN_MCDR[python] = probe.returncode == 0
+    return _OWN_MCDR[python]
+
+
+def _child_env(python: str) -> dict:
+    """The environment for the MCDR subprocesses run with ``python``.
+
+    ``.testlibs`` may hold MCDR (the documented ``pip install --target`` layout, and what CI
+    uses) or may hold only pytest (the layout a developer with MCDR virtualenvs ends up with).
+    Deciding which matters a lot, and getting it wrong is silent:
+
+    * If the interpreter has **no** MCDR of its own, ``.testlibs`` must provide it — otherwise
+      the child cannot even start. This is the CI layout.
+    * If the interpreter **does** have its own MCDR, ``.testlibs`` must NOT be added. A
+      PYTHONPATH entry precedes site-packages, so a ``.testlibs/mcdreforged`` would shadow the
+      version being tested — and the matrix would cheerfully report "5 versions pass" while
+      running one version five times. That happened: every interpreter reported 2.16.0.
+
+    So the probe decides, once per interpreter.
+
+    ``cwd`` is also why the path must be absolute: the children run in temporary instance
+    directories, where a relative ``.testlibs`` does not resolve.
     """
     env = dict(os.environ)
     testlibs = REPO / ".testlibs"
-    if not testlibs.is_dir():
+
+    if not testlibs.is_dir() or _interpreter_has_own_mcdr(python):
+        # Drop any inherited PYTHONPATH too: the same shadowing argument applies to whatever
+        # the caller exported.
+        env.pop("PYTHONPATH", None)
         return env
+
     existing = env.get("PYTHONPATH", "")
     parts = [str(testlibs)] + [part for part in existing.split(os.pathsep) if part]
     env["PYTHONPATH"] = os.pathsep.join(parts)
@@ -173,7 +247,7 @@ def mcdr_version(python: str) -> str:
         encoding="utf-8",
         errors="replace",
         timeout=120,
-        env=_child_env(),
+        env=_child_env(python),
     )
     return completed.stdout.strip() or "unknown"
 
@@ -186,40 +260,67 @@ def version_tuple(text: str):
     return tuple(parts[:3])
 
 
+#: The plugin-config keys this tool is allowed to deviate from ``Config.get_default()`` on,
+#: with the reason. Everything else must be left at its shipped default.
+#:
+#: This is an allow-list rather than a free-form dict for a specific reason: an earlier
+#: version of this file set ``use_resolve_cache: False`` for convenience, which meant the
+#: cache path was never executed against a real MCDR — and that path turned out to crash on
+#: the shipped default config. Anything that switches a code path off has to be justified
+#: here, and ``tests/test_mcdr_entry.py`` fails if the dict drifts from this list.
+CONFIG_OVERRIDES = (
+    # The fake upstream is not reachable at the real URLs.
+    "modrinth_api_base",
+    "curseforge_api_base",
+    "curseforge_api_key",
+    # Waiting the shipped 60 seconds would make every job three times as long.
+    "start_check_delay_seconds",
+    # A test must not sit in the self-imposed rate limiter, and the retry path is covered by
+    # its own unit test.
+    "requests_per_minute",
+    "http_retries",
+    # The shipped default is off, and off means the tellraw path never executes. It builds a
+    # command out of arbitrary mod names and sends it with ``server.execute``, so it is worth
+    # running rather than trusting — the fake server echoes the command back and the run
+    # asserts the payload is valid JSON.
+    "notify_in_game",
+)
+
+
+def plugin_config(upstream) -> dict:
+    """The config for one MCDR instance: the shipped defaults, plus the allow-list."""
+    config = {
+        "modrinth_api_base": upstream.modrinth_base,
+        "curseforge_api_base": upstream.curseforge_base,
+        "curseforge_api_key": "matrix-key",
+        "start_check_delay_seconds": 2,
+        "requests_per_minute": 0,
+        "http_retries": 0,
+        "notify_in_game": True,
+    }
+    unexpected = set(config) - set(CONFIG_OVERRIDES)
+    assert not unexpected, "override not declared in CONFIG_OVERRIDES: {}".format(unexpected)
+    return config
+
+
 def build_tree(root: Path, python: str, plugin: Path, upstream, jars) -> None:
     """Lay out one MCDR instance plus a planted mods folder."""
     (root / "plugins").mkdir(parents=True, exist_ok=True)
     (root / "server" / "mods").mkdir(parents=True, exist_ok=True)
     shutil.copy2(plugin, root / "plugins" / plugin.name)
-    write(root / "server" / "fake_server.py", FAKE_SERVER.format(mc="26.3"))
+    write(
+        root / "server" / "fake_server.py",
+        FAKE_SERVER.format(mc="26.3", player=TEST_PLAYER),
+    )
 
     for jar_path in jars:
         shutil.copy2(jar_path, root / "server" / "mods" / jar_path.name)
 
     write(
         root / "config" / PLUGIN_ID / "config.json",
-        json.dumps(
-            {
-                "language": "auto",
-                "loader": "fabric",
-                "mc_version": "auto",
-                "check_on_server_start": True,
-                "start_check_delay_seconds": 2,
-                "check_interval_hours": 0,
-                "notify_on_updates_only": True,
-                "notify_in_game": False,
-                "write_report_file": True,
-                "modrinth_api_base": upstream.modrinth_base,
-                "curseforge_api_base": upstream.curseforge_base,
-                "curseforge_api_key": "matrix-key",
-                "ignored_mods": [],
-                "use_resolve_cache": False,
-                "requests_per_minute": 0,
-                "http_retries": 0,
-            },
-            indent=2,
-        ),
+        json.dumps(plugin_config(upstream), indent=2),
     )
+    write(root / "permission.yml", PERMISSION_YML)
 
 
 def feed_commands(process, delay: float) -> None:
@@ -260,7 +361,7 @@ def run_one(python: str, plugin: Path, workdir: Path, scenario_builder) -> dict:
             cwd=str(root),
             capture_output=True,
             timeout=180,
-            env=_child_env(),
+            env=_child_env(python),
         )
         write(root / "config.yml", MCDR_CONFIG.format(python=python.replace("\\", "/")))
 
@@ -274,7 +375,7 @@ def run_one(python: str, plugin: Path, workdir: Path, scenario_builder) -> dict:
             encoding="utf-8",
             errors="replace",
             bufsize=1,
-            env=_child_env(),
+            env=_child_env(python),
         )
         feed_commands(process, delay=RUN_SECONDS - 25)
 
@@ -305,8 +406,35 @@ def run_one(python: str, plugin: Path, workdir: Path, scenario_builder) -> dict:
         upstream.stop()
 
 
+def _inspect_tellraw(console: str) -> tuple:
+    """Find the in-game notification the plugin sent and validate its payload.
+
+    The fake server echoes ``tellraw`` commands it receives, so the console carries the exact
+    command that went to the game. Parsing it back out is the only way to check the two things
+    that matter and that a mere "it didn't crash" would miss: the argument is addressed to the
+    right player, and the JSON is well-formed — the payload is built from mod names, which are
+    attacker-controlled text as far as this plugin is concerned.
+    """
+    marker = "(tellraw) tellraw {} ".format(TEST_PLAYER)
+    for line in console.splitlines():
+        index = line.find(marker)
+        if index == -1:
+            continue
+        raw = line[index + len(marker):].strip()
+        try:
+            payload = json.loads(raw)
+        except ValueError:
+            return False, "not valid JSON: {}".format(raw[:120])
+        text = payload.get("text")
+        if not isinstance(text, str) or not text.strip():
+            return False, "no text in the payload: {}".format(raw[:120])
+        return True, text
+    return False, "no tellraw command was sent"
+
+
 def summarise(console: str, root: Path, version: str, python: str) -> dict:
-    report_path = root / "config" / PLUGIN_ID / "last_report.json"
+    plugin_folder = root / "config" / PLUGIN_ID
+    report_path = plugin_folder / "last_report.json"
     report = {}
     if report_path.is_file():
         try:
@@ -314,12 +442,25 @@ def summarise(console: str, root: Path, version: str, python: str) -> dict:
         except ValueError:
             report = {}
 
+    # The resolve cache is enabled by default, and its code path is only reachable when it is
+    # — so whether the file appeared is a real check, not decoration. An earlier version of
+    # this tool disabled the cache, and that hid a crash on the shipped default config.
+    cache_path = plugin_folder / "resolve-cache.json"
+    cache_records = 0
+    if cache_path.is_file():
+        try:
+            cache_records = len(json.loads(cache_path.read_text(encoding="utf-8")).get("records") or {})
+        except (ValueError, AttributeError):
+            cache_records = -1
+
     updates = report.get("counts", {}).get("update_available", 0)
     # Keyed by file name, not mod id: a jar with no mod metadata has an empty mod id, and two
     # jars of one mod share an id — neither is a usable key for "what happened to this jar".
     statuses = {
         entry["file_name"]: entry["status"] for entry in report.get("entries", [])
     }
+
+    tellraw_valid, tellraw_text = _inspect_tellraw(console)
 
     return {
         "mcdr": version,
@@ -338,6 +479,10 @@ def summarise(console: str, root: Path, version: str, python: str) -> dict:
         "report_file_written": report_path.is_file(),
         "report_has_entries": bool(report.get("entries")),
         "report_entry_count": len(report.get("entries", [])),
+        "cache_written": cache_path.is_file(),
+        "cache_records": cache_records,
+        "notify_in_game_sent": tellraw_valid,
+        "notify_in_game_text": tellraw_text,
         "statuses": statuses,
         "command_summary": COMMAND_EXPECTATIONS["summary"] in console,
         "command_help": COMMAND_EXPECTATIONS["help"] in console,
@@ -361,6 +506,8 @@ CHECK_KEYS = [
     "no_compatible_build_reported",
     "report_file_written",
     "report_has_entries",
+    "cache_written",
+    "notify_in_game_sent",
     "command_summary",
     "command_help",
     "command_status",
@@ -404,10 +551,9 @@ def main() -> int:
     if not pythons:
         parser.error("give at least one interpreter, or use --current")
 
-    # The scenario builder imports the plugin package and the test fixtures, so both the repo
-    # root and tests/ have to be importable before it is loaded.
-    sys.path.insert(0, str(REPO))
-    sys.path.insert(0, str(REPO / "tests"))
+    # The scenario builder imports the plugin package and the test fixtures; the helper puts
+    # the repo, tests/ and .testlibs on sys.path so this works without a hand-set PYTHONPATH.
+    _ensure_dependencies_importable()
     from matrix_scenario import build_scenario_jars
 
     plugin = build_plugin()
@@ -420,6 +566,26 @@ def main() -> int:
         result = run_one(python, plugin, workdir, build_scenario_jars)
         results.append(result)
         print("  {:<14} {}".format(result["mcdr"], verdict(result)))
+
+    # A distinct interpreter that reports a version already seen means the run is not testing
+    # what it claims. This is not hypothetical: pointing ``.testlibs`` at a Python where it
+    # shadows the interpreter's own MCDR made five different interpreters all report 2.16.0,
+    # and the summary said "5 versions pass" while running one version five times. A warning
+    # would have been easy to skim past, so this is fatal.
+    seen: dict = {}
+    for item in results:
+        key = item["mcdr"]
+        if key in seen and seen[key] != item["python"]:
+            raise SystemExit(
+                "FAILED: two different interpreters both report MCDR {}:\n"
+                "  {}\n  {}\n"
+                "Something is shadowing the per-interpreter MCDR — most likely a "
+                "PYTHONPATH/.testlibs MCDR that takes precedence over site-packages. "
+                "This run would not compare versions.".format(
+                    key, seen[key], item["python"]
+                )
+            )
+        seen[key] = item["python"]
 
     loaded = [item for item in results if item["loaded"]]
     refused = [item for item in results if not item["loaded"]]

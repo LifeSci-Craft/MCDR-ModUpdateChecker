@@ -51,11 +51,11 @@ def _interpreter() -> str:
 
 
 def _has_mcdr(python: str, tool) -> bool:
-    """Is MCDR importable by ``python``?
+    """Would MCDR be importable by the child process this test is about to launch?
 
-    Checked through the tool's own child environment, which puts an absolute ``.testlibs`` on
-    ``PYTHONPATH``. That is what makes this test run under the CI layout (MCDR installed with
-    ``pip install --target .testlibs``) as well as against a local MCDR virtualenv.
+    Asks the tool rather than guessing, because the answer depends on the environment: under
+    the CI layout MCDR lives in ``.testlibs`` and has to be added to ``PYTHONPATH``; against a
+    local MCDR virtualenv it must *not* be, or the version under test would be shadowed.
     """
     import subprocess
 
@@ -63,7 +63,7 @@ def _has_mcdr(python: str, tool) -> bool:
         [python, "-c", "import mcdreforged"],
         capture_output=True,
         timeout=180,
-        env=tool._child_env(),
+        env=tool._child_env(python),
     )
     return completed.returncode == 0
 

@@ -708,6 +708,39 @@ def test_cache_is_disabled_cleanly(tmp_path):
     assert not (tmp_path / "unused.json").exists()
 
 
+@pytest.mark.parametrize("as_string", [False, True])
+def test_resolve_cache_accepts_a_string_path(tmp_path, as_string):
+    """The plugin hands the cache an ``os.path.join`` result, i.e. a ``str``.
+
+    This is a regression test with a specific history: the unit tests only ever passed a
+    ``Path``, so the ``str`` form went untested, and every method on the cache uses the
+    pathlib API — ``is_file``, ``parent``, ``with_suffix``. A real first check therefore died
+    with ``AttributeError: 'str' object has no attribute 'is_file'`` on the shipped default
+    config, which enables the cache. Both forms are now valid and both are exercised.
+    """
+    path = tmp_path / "resolve-cache.json"
+    argument = str(path) if as_string else path
+
+    cache = ResolveCache(argument, ttl_hours=24)
+    assert cache.enabled
+    cache.put("b" * 40, {"resolved": False})
+    cache.save()
+
+    assert path.is_file(), "the cache did not reach the filesystem"
+    reloaded = ResolveCache(argument, ttl_hours=24)
+    record = reloaded.get("b" * 40)
+    assert record is not None and record["resolved"] is False
+
+
+def test_resolve_cache_with_none_is_disabled(tmp_path):
+    cache = ResolveCache(None, ttl_hours=24)
+    assert cache.enabled is False
+    assert cache.path is None
+    cache.save()  # must not raise
+    cache.put("c" * 40, {"resolved": False})
+    assert cache.get("c" * 40) is None
+
+
 def test_a_corrupt_cache_file_is_ignored(tmp_path):
     path = tmp_path / "resolve-cache.json"
     path.write_text("{ not json", encoding="utf-8")

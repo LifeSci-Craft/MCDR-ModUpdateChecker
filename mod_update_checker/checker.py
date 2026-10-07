@@ -38,7 +38,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 from .curseforge import CfFile, CurseForgeClient, RELEASE_TYPES
 from .modrinth import ModrinthClient, ModrinthProject, ModrinthVersion
@@ -131,10 +131,17 @@ class ResolveCache:
 
     VERSION = 1
 
-    def __init__(self, path: Optional[Path], ttl_hours: float, enabled: bool = True) -> None:
-        self.path = path
+    def __init__(
+        self, path: Union[str, Path, None], ttl_hours: float, enabled: bool = True
+    ) -> None:
+        # Accepts ``str`` as well as ``Path``, and coerces once here rather than trusting
+        # every caller. The two callers genuinely disagreed — the tests pass a ``Path``, the
+        # plugin passes the result of ``os.path.join`` — and the cache only reached the
+        # filesystem methods when enabled, so the mismatch survived a green test suite and
+        # crashed on the first real check. A single coercion makes both forms correct.
+        self.path: Optional[Path] = Path(path) if path is not None else None
         self.ttl_seconds = max(0.0, float(ttl_hours) * 3600.0)
-        self.enabled = enabled and path is not None
+        self.enabled = enabled and self.path is not None
         self._lock = threading.Lock()
         self._data: Dict[str, Any] = self._load()
 
@@ -211,7 +218,7 @@ class Checker:
 
     # -- lifecycle ---------------------------------------------------------------------
 
-    def _setup(self, cache_path: Optional[Path]) -> None:
+    def _setup(self, cache_path: Union[str, Path, None]) -> None:
         from .curseforge import DEFAULT_BASE_URL as CF_BASE
         from .modrinth import DEFAULT_BASE_URL as MR_BASE
 
@@ -246,7 +253,7 @@ class Checker:
         self,
         scan: ScanResult,
         server: ServerContext,
-        cache_path: Optional[Path] = None,
+        cache_path: Union[str, Path, None] = None,
     ) -> Report:
         started = time.monotonic()
         self._setup(cache_path)

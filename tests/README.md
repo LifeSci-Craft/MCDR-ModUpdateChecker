@@ -90,4 +90,14 @@ python tools/check_artifact.py some.mcdr  # 检查一个已有的产物
 > PYTHONPATH=/abs/path/to/.testlibs python -m pytest
 > ```
 > 相对路径会有一个坑：MCDR 子进程的 `cwd` 是临时目录，相对 `PYTHONPATH` 在那里解析不到。
-> `tools/mcdr_matrix.py` 的 `_child_env()` 已把 `.testlibs` 转成绝对路径，正是为了这个。
+
+### `.testlibs` 里的 MCDR 会不会遮蔽被测版本？（会，而且很隐蔽）
+
+`PYTHONPATH` 优先于 site-packages，所以如果 `.testlibs` 里也有一份 `mcdreforged`，
+它就会**盖住每个解释器自己装的版本** —— 结果是「跑了五个版本」实际是同一个版本跑五遍，
+而输出看起来完全正常。
+
+`tools/mcdr_matrix.py` 的 `_child_env(python)` 为此先探测「这个解释器能否独立 import
+mcdreforged」：能则**不**加 `.testlibs`（尊重它自己的版本），不能才加（CI 布局）。
+并且矩阵结尾会**硬失败**：两个不同解释器报出同一版本时直接报错，而不是打个警告。
+
