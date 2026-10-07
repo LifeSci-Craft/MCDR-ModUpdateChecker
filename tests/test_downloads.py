@@ -502,6 +502,121 @@ def test_outcomes_are_matched_back_to_the_entry_they_came_from(tmp_path, cdn, ht
 
 
 # --------------------------------------------------------------------------------------
+# Retrying a failed download
+# --------------------------------------------------------------------------------------
+
+
+def _request_count(cdn, name):
+    return len([path for path in cdn.request_paths() if path.endswith("/" + name)])
+
+
+def test_a_flaky_link_recovers_within_the_retry_budget(tmp_path, cdn, http):
+    """The point of the setting: a transfer that fails once is not a failed mod.
+
+    The server corrupts the first two responses and then serves the file properly. With the
+    default budget of three extra attempts this must succeed — that is the whole value of
+    retrying, and asserting only "it did not crash" would not show it.
+    """
+    blob = b"PK\x03\x04" + b"genuine" * 200
+    entry = _entry(**_publish(cdn, "demo-1.1.0.jar", blob))
+    cdn.flaky_downloads["demo-1.1.0.jar"] = 2
+
+    outcomes = _run(tmp_path, http, [entry])
+
+    assert outcomes[0].status == STATUS_DOWNLOADED, outcomes[0].detail
+    assert Path(outcomes[0].path).read_bytes() == blob
+    assert _request_count(cdn, "demo-1.1.0.jar") == 3, "expected two failures then a success"
+
+
+def test_the_retry_budget_is_respected(tmp_path, cdn, http):
+    """Always corrupt: the attempts stop at the configured number, not at some other number."""
+    blob = b"PK\x03\x04" + b"genuine" * 50
+    entry = _entry(**_publish(cdn, "demo-1.1.0.jar", blob))
+    cdn.fail_downloads.add("demo-1.1.0.jar")
+
+    options = DownloadOptions(folder=tmp_path / "downloads", max_bytes=10 * MEGABYTE, retries=2)
+    from mod_update_checker.downloads import Downloader
+
+    outcomes = Downloader(http, options).run([entry])
+
+    assert outcomes[0].status == STATUS_FAILED
+    assert "hash mismatch" in outcomes[0].detail
+    assert "after 3 attempts" in outcomes[0].detail, outcomes[0].detail
+    assert _request_count(cdn, "demo-1.1.0.jar") == 3, "1 initial attempt + 2 retries"
+    assert not list((tmp_path / "downloads").iterdir()), "a failed retry left something behind"
+
+
+def test_zero_retries_means_exactly_one_attempt(tmp_path, cdn, http):
+    """Switching retrying off has to be honoured, or it is not a setting."""
+    blob = b"PK\x03\x04" + b"genuine" * 50
+    entry = _entry(**_publish(cdn, "demo-1.1.0.jar", blob))
+    cdn.fail_downloads.add("demo-1.1.0.jar")
+
+    options = DownloadOptions(folder=tmp_path / "downloads", max_bytes=10 * MEGABYTE, retries=0)
+    from mod_update_checker.downloads import Downloader
+
+    outcomes = Downloader(http, options).run([entry])
+
+    assert outcomes[0].status == STATUS_FAILED
+    assert _request_count(cdn, "demo-1.1.0.jar") == 1
+
+
+def test_a_missing_file_is_not_retried(tmp_path, cdn, http):
+    """404 means the file is not there. Asking four times cannot change that, and repeating a
+    request against a host that just said no is how a client gets itself blocked."""
+    entry = _entry(
+        download_url=cdn.file_url("never-published.jar"),
+        download_filename="never-published.jar",
+        download_sha1="b" * 40,
+    )
+
+    outcomes = _run(tmp_path, http, [entry])
+
+    assert outcomes[0].status == STATUS_FAILED
+    assert _request_count(cdn, "never-published.jar") == 1, "a 404 was retried"
+
+
+def test_retry_state_does_not_leak_between_attempts(tmp_path, cdn, http):
+    """Each attempt hashes only its own bytes.
+
+    If the accumulators were shared, a successful retry would be hashing the failed attempt's
+    bytes too and would fail verification forever — a retry that can never succeed. The flaky
+    test above would catch it, but this pins the specific number of attempts.
+    """
+    blob = b"PK\x03\x04" + b"only-the-last-attempt-counts" * 30
+    entry = _entry(**_publish(cdn, "demo-1.1.0.jar", blob))
+    cdn.flaky_downloads["demo-1.1.0.jar"] = 1
+
+    outcomes = _run(tmp_path, http, [entry])
+
+    assert outcomes[0].status == STATUS_DOWNLOADED, outcomes[0].detail
+    assert outcomes[0].bytes_written == len(blob), "the byte count carried over from the failure"
+    assert Path(outcomes[0].path).read_bytes() == blob
+
+
+def test_a_failed_attempt_leaves_no_part_file_for_the_retry(tmp_path, cdn, http):
+    """The partial file from the failed attempt must be gone before the next one starts.
+
+    Otherwise the retry would append to it and the verified length would be wrong.
+    """
+    blob = b"PK\x03\x04" + b"x" * 3000
+    entry = _entry(**_publish(cdn, "demo-1.1.0.jar", blob))
+    cdn.flaky_downloads["demo-1.1.0.jar"] = 1
+
+    outcomes = _run(tmp_path, http, [entry])
+
+    assert outcomes[0].status == STATUS_DOWNLOADED
+    assert outcomes[0].bytes_written == len(blob)
+    folder = tmp_path / "downloads"
+    assert [p.name for p in folder.iterdir()] == ["demo-1.1.0.jar"]
+
+
+def test_the_default_budget_comes_from_the_options(tmp_path, cdn, http):
+    """Pinned so the shipped default cannot drift without a test noticing."""
+    assert DownloadOptions(folder=tmp_path).retries == 3
+
+
+# --------------------------------------------------------------------------------------
 # The ledger: which downloaded file belongs to which mod
 # --------------------------------------------------------------------------------------
 

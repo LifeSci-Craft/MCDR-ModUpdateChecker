@@ -192,4 +192,25 @@ def build_scenario_jars(upstream: FakeUpstream, workdir: Path) -> List[Path]:
         )
     )
 
+    # 7. A transfer that fails twice and then works. This is the case the retry budget exists
+    #    for, and the only way to show it recovering is to have a real transfer fail for real.
+    #    Succeeds on the third attempt, which is inside the shipped budget of 1 + 3.
+    flaky = add("flaky.jar", id="flaky", version="1.0.0", name="Flaky Mod")
+    flaky_build = published("flaky-1.1.0.jar", id="flaky", version="1.1.0", name="Flaky Mod")
+    upstream.flaky_downloads[flaky_build["filename"]] = 2
+    upstream.add_project(
+        FakeProject(
+            id="proj-flaky",
+            slug="flaky",
+            title="Flaky Mod",
+            versions=[
+                version("proj-flaky", "f-1", "1.0.0", sha1_of(flaky),
+                        "2026-01-01T00:00:00Z", "flaky-1.0.0.jar"),
+                version("proj-flaky", "f-2", "1.1.0", flaky_build["sha1"],
+                        "2026-02-01T00:00:00Z", flaky_build["filename"],
+                        sha512=flaky_build["sha512"], size=flaky_build["size"]),
+            ],
+        )
+    )
+
     return jars

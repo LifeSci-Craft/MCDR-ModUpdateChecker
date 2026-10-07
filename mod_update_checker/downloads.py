@@ -29,13 +29,14 @@ import hashlib
 import json
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 from .report import STATUS_AWAITING_INSTALL, STATUS_UPDATE_AVAILABLE, UpdateEntry
-from .upstream import UpstreamError
+from .upstream import NotFound, Unauthorised, UpstreamError
 
 __all__ = [
     "STATUS_DOWNLOADED",
@@ -77,6 +78,12 @@ _RESERVED_NAMES = frozenset(
 _MAX_STEM = 120
 
 _CHUNK = 65536
+
+#: Backoff between download attempts: doubling, capped. Short on purpose — a mod jar is a
+#: handful of megabytes and the whole thing is re-verifiable, so there is nothing to be gained
+#: by waiting a minute; the point is only to not hammer a host that just refused us.
+_RETRY_BACKOFF_SECONDS = 0.25
+_RETRY_BACKOFF_CAP = 2.0
 
 
 def _safe_stem(raw: str, fallback: str) -> str:
@@ -170,6 +177,9 @@ class DownloadOptions:
 
     folder: Path
     max_bytes: int = 128 * 1024 * 1024
+    #: *Extra* attempts after the first one fails, so the total is ``1 + retries``. Follows the
+    #: same convention as the ``http_retries`` setting, so the two do not read differently.
+    retries: int = 3
     #: Modrinth's own project, for the advisory in the log. Cosmetic.
     source_name: str = "modrinth"
 
@@ -558,17 +568,71 @@ class Downloader:
     # -- writing -----------------------------------------------------------------------
 
     def _fetch(self, entry: UpdateEntry, target: Path) -> DownloadOutcome:
-        """Download, verify and move into place. Anything less is a failure."""
-        expected_sha1 = entry.download_sha1.lower()
+        """Fetch the file, retrying a failed attempt up to ``options.retries`` times.
+
+        The retry lives here rather than in :meth:`HttpClient.download` because a retry has to
+        restart the *verification*, not the transfer: the hash accumulator and the byte count
+        are per-attempt, and the partial file has to go. Doing it at that level would mean
+        asking the sink to rewind, which is why the HTTP layer deliberately does not retry.
+
+        What is retried and what is not:
+
+        * **Transport errors, 5xx, an empty body, a body over the limit** — retried. These are
+          the transient failures a retry exists for.
+        * **A hash mismatch** — also retried. Corruption in transit is the commonest cause, and
+          a second attempt is the standard remedy; if the upstream is simply serving the wrong
+          bytes then every attempt fails the same way and the mismatch is what gets reported,
+          so the cost is a little bandwidth for a real chance of recovery.
+        * **404 and 401/403** — not retried. The file is gone or we are not allowed to have it;
+          repeating the request cannot change either, and hammering a 403 is how a host decides
+          to block you.
+        * **A write error on our own disk** — not retried. The disk will still be full.
+
+        The last outcome is what gets returned, so the reported reason is the one the final
+        attempt produced.
+        """
+        attempts = max(1, int(self.options.retries) + 1)
+        part = target.with_name(target.name + ".part")
+        outcome = None
+        for attempt in range(1, attempts + 1):
+            if attempt > 1:
+                self._log(
+                    "debug",
+                    "retrying the download of {} (attempt {}/{})".format(
+                        entry.name, attempt, attempts
+                    ),
+                )
+            outcome, retryable = self._transfer_once(entry, target, part)
+            if outcome.status == STATUS_DOWNLOADED:
+                return outcome
+            if not retryable or attempt == attempts:
+                break
+            delay = min(_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)), _RETRY_BACKOFF_CAP)
+            time.sleep(delay)
+
+        if attempts > 1 and outcome is not None and outcome.status == STATUS_FAILED:
+            # Say how hard it was tried, otherwise "download failed" reads like a single attempt
+            # and the admin has no way to tell a flaky link from a file that is not there.
+            outcome.detail = "{} (after {} attempts)".format(outcome.detail or "failed", attempts)
+        return outcome  # type: ignore[return-value]
+
+    def _transfer_once(
+        self, entry: UpdateEntry, target: Path, part: Path
+    ) -> Tuple[DownloadOutcome, bool]:
+        """One transfer. Returns the outcome and whether another attempt is worth making."""
+        expected_sha1 = (entry.download_sha1 or "").lower()
         expected_sha512 = (entry.download_sha512 or "").lower()
+        # Per-attempt state: a retry must verify what *it* fetched, not the concatenation of
+        # every attempt so far.
         sha1 = hashlib.sha1()
         sha512 = hashlib.sha512()
         written = 0
 
         # Same folder as the target, so the final move is a rename and therefore atomic.
-        part = target.with_name(target.name + ".part")
+        self._discard(part)
         try:
             with open(part, "wb") as handle:
+
                 def sink(chunk: bytes) -> None:
                     nonlocal written
                     written += len(chunk)
@@ -577,44 +641,58 @@ class Downloader:
                     handle.write(chunk)
 
                 self.http.download(entry.download_url, sink, max_bytes=self.options.max_bytes)
+        except (NotFound, Unauthorised) as error:
+            self._discard(part)
+            return self._failed(entry, "upstream: {}".format(error)), False
         except UpstreamError as error:
             self._discard(part)
-            return self._failed(entry, "upstream: {}".format(error))
+            return self._failed(entry, "upstream: {}".format(error)), True
         except OSError as error:
             self._discard(part)
-            return self._failed(entry, "could not write to the folder: {}".format(error))
+            return self._failed(entry, "could not write to the folder: {}".format(error)), False
 
         if written <= 0:
             self._discard(part)
-            return self._failed(entry, "the file was empty")
+            return self._failed(entry, "the file was empty"), True
 
         got = sha1.hexdigest()
         if got != expected_sha1:
             self._discard(part)
-            return self._failed(
-                entry,
-                "hash mismatch: expected {}, got {}".format(expected_sha1[:12], got[:12]),
+            return (
+                self._failed(
+                    entry,
+                    "hash mismatch: expected {}, got {}".format(expected_sha1[:12], got[:12]),
+                ),
+                True,
             )
         if expected_sha512 and sha512.hexdigest() != expected_sha512:
             self._discard(part)
-            return self._failed(entry, "sha512 mismatch")
+            return self._failed(entry, "sha512 mismatch"), True
 
         try:
             os.replace(part, target)
         except OSError as error:
+            # The file is downloaded and correct; only the rename failed. Retrying would fetch
+            # it all over again to hit the same wall.
             self._discard(part)
-            return self._failed(entry, "could not put the file in place: {}".format(error))
+            return (
+                self._failed(entry, "could not put the file in place: {}".format(error)),
+                False,
+            )
 
         self._log(
             "debug", "downloaded {} -> {} ({} bytes)".format(entry.name, target, written)
         )
-        return DownloadOutcome(
-            file_name=entry.file_name,
-            mod_id=entry.mod_id,
-            name=entry.name,
-            status=STATUS_DOWNLOADED,
-            path=str(target),
-            bytes_written=written,
+        return (
+            DownloadOutcome(
+                file_name=entry.file_name,
+                mod_id=entry.mod_id,
+                name=entry.name,
+                status=STATUS_DOWNLOADED,
+                path=str(target),
+                bytes_written=written,
+            ),
+            False,
         )
 
     def _failed(self, entry: UpdateEntry, detail: str) -> DownloadOutcome:

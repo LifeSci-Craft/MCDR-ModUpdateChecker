@@ -303,6 +303,16 @@ class _Handler(BaseHTTPRequestHandler):
             if blob is None:
                 self._send(404, {"detail": "no such file"})
                 return
+
+            with self.upstream.lock:
+                remaining = self.upstream.flaky_downloads.get(name, 0)
+                if remaining > 0:
+                    # Fail the next N requests for this file, then serve it properly. That is
+                    # what a flaky link looks like from the client's side, and it is the only
+                    # way to prove a retry actually recovers rather than merely being present.
+                    self.upstream.flaky_downloads[name] = remaining - 1
+                    blob = blob + b"corrupted in transit"
+
             if name in self.upstream.fail_downloads:
                 # Bytes that do not match the declared hash, to prove the downloader verifies.
                 blob = blob + b"tampered"
@@ -348,6 +358,9 @@ class FakeUpstream:
         self.fail_downloads: set = set()
         #: Names in here are served without a ``Content-Length``, like a streaming proxy.
         self.no_content_length: set = set()
+        #: name -> how many more requests to answer with corrupted bytes before serving the
+        #: file properly. Drives the "a retry recovers from a flaky link" test.
+        self.flaky_downloads: Dict[str, int] = {}
         self.lock = threading.Lock()
         self._server: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None

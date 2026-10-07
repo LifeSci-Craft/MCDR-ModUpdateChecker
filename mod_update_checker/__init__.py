@@ -115,11 +115,12 @@ class Config(Serializable):
     admin_join_permission: int = 3
     """多少权限等级算「管理员」。MCDR 等级 3 = admin，2 = helper。"""
 
-    admin_join_max_report_age_minutes: int = 30
+    admin_join_max_report_age_minutes: int = 1440
     """管理员上线时，多久以内的上次检查结果可以直接复用而不重新查。
 
-    ``0`` = 每次都重新检查。默认复用是为了两件事：管理员一进服**马上**就能看到结果，
-    而不用等一次完整扫描；以及避免几位管理员接连上线时反复打接口。"""
+    ``0`` = 每次都重新检查。默认 24 小时：一位管理员上线时想要的是**立刻看到结论**，而不是等一次
+    完整扫描；而且几个管理员接连上线时，这个窗口能避免反复打接口。
+    想每次都重查就设为 ``0``。"""
 
     write_report_file: bool = True
     """把每次检查的结果写成 JSON / 文本文件，便于外部脚本或事后排查。"""
@@ -138,6 +139,14 @@ class Config(Serializable):
 
     download_max_size_mb: int = 128
     """单个文件的大小上限（MB）。超过就跳过并说明原因。"""
+
+    download_retries: int = 3
+    """下载失败后**额外**重试几次。总尝试次数 = 1 + 该值（默认 3 → 最多尝试 4 次）。
+
+    与 ``http_retries`` 同一套语义。会重试的：传输中断、5xx、空响应、超过大小限制、哈希不符
+    （传输过程中被损坏是哈希不符最常见的原因，重试是标准做法）。不会重试的：404、401/403
+    （文件不在或没权限，重试改变不了结果，反复打一个 403 只会招来封禁）、本地写盘失败。
+    设为 ``0`` 即不重试。"""
 
     include_beta: bool = False
     """是否把 beta 版本也算作「可用更新」。默认只认正式版。"""
@@ -495,6 +504,7 @@ def _reconcile_downloads(
         options = DownloadOptions(
             folder=folder,
             max_bytes=max(1, int(config.download_max_size_mb)) * 1024 * 1024,
+            retries=max(0, int(config.download_retries)),
         )
         http = _make_http_client(config)
         outcomes = Downloader(http, options, logger=server.logger, ledger=ledger).run(
@@ -534,8 +544,10 @@ def _make_http_client(config: Config) -> HttpClient:
     Its own client, not the checker's, for two reasons: the checker closes its session when it
     finishes, and the two want different tuning. A JSON call should give up in seconds; a
     multi-megabyte transfer over a slow link should not be cut off at the same timeout.
-    ``retries=0`` because :meth:`HttpClient.download` does not retry mid-stream — a partial
-    transfer is discarded and the next check tries again.
+
+    ``retries=0`` because :meth:`HttpClient.download` cannot retry a half-written stream. The
+    retrying is done by :class:`Downloader`, where the hash accumulator and the partial file can
+    be reset per attempt; see its ``_fetch``.
     """
     return HttpClient(
         user_agent=USER_AGENT,

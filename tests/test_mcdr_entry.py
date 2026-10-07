@@ -292,6 +292,11 @@ def test_config_defaults_are_the_documented_ones():
     assert config.download_updates is False
     assert config.download_folder_name == "downloads"
     assert config.download_max_size_mb == 128
+    # Extra attempts after the first, matching the ``http_retries`` convention.
+    assert config.download_retries == 3
+    # A day, not half an hour: an admin logging in wants the answer, and the answer from
+    # yesterday is still the answer unless something has been installed since.
+    assert config.admin_join_max_report_age_minutes == 1440
 
 
 def test_the_end_to_end_run_uses_the_shipped_defaults():
@@ -346,6 +351,8 @@ def test_the_end_to_end_run_uses_the_shipped_defaults():
         # quietly passing.
         "download_folder_name",
         "download_max_size_mb",
+        # And so must the retry budget, so the matrix keeps exercising the number a user gets.
+        "download_retries",
     ):
         assert key not in config, (
             "{} must stay at its shipped default in the end-to-end run, otherwise the "
@@ -473,15 +480,16 @@ def test_a_recent_report_is_reused_instead_of_rechecking(entry_env):
     told = server.told("Admin")
     assert len(told) == 1
     assert "2 分钟前" in told[0], told[0]
+    # 120 seconds is well inside the 24-hour default, so nothing was re-fetched.
 
 
 def test_a_stale_report_triggers_a_fresh_check(entry_env):
     plugin, server, calls = entry_env
-    plugin._last_report = _report(updates=1, age_seconds=3600)
+    plugin._last_report = _report(updates=1, age_seconds=25 * 3600)
 
     plugin._admin_join_worker(server, "Admin")
 
-    assert len(calls) == 1, "a 1-hour-old report is past the 30-minute window"
+    assert len(calls) == 1, "a 25-hour-old report is past the 24-hour window"
     assert "分钟前" not in server.told("Admin")[0]
 
 
@@ -552,7 +560,8 @@ def test_a_disabled_plugin_does_nothing_on_join(entry_env, monkeypatch):
 def test_a_check_that_cannot_start_still_answers(entry_env, monkeypatch):
     """If another check holds the lock, the admin gets the previous report, not silence."""
     plugin, server, calls = entry_env
-    previous = _report(updates=1, age_seconds=6000)
+    # Past the reuse window, so a check is genuinely attempted — and refused the lock.
+    previous = _report(updates=1, age_seconds=25 * 3600)
 
     monkeypatch.setattr(plugin, "_run_check", lambda *a, **k: None, raising=False)
     plugin._last_report = previous

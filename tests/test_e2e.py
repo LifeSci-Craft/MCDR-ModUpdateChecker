@@ -102,8 +102,15 @@ def test_the_packed_plugin_works_inside_a_real_mcdr(tmp_path):
     # is written its build is on disk and it must no longer be described as an update waiting
     # to be fetched — that is the whole point of the awaiting_install status.
     assert result["statuses"].get("outdated.jar") == "awaiting_install", detail
+    # ``flaky.jar`` had its transfer corrupted twice before succeeding, so it is on disk only
+    # because the retry budget was honoured — and its per-attempt hash state was reset, or the
+    # third attempt would have failed verification forever.
+    assert result["statuses"].get("flaky.jar") == "awaiting_install", detail
     # ``cfonly.jar`` is on CurseForge only, so its download is skipped and it stays an update.
     assert result["statuses"].get("cfonly.jar") == "update_available", detail
+    # ``tampered.jar`` is served with bytes that never match, so it stays an update to fetch
+    # however many times it is retried.
+    assert result["statuses"].get("tampered.jar") == "update_available", detail
     assert result["statuses"].get("current.jar") == "up_to_date", detail
     assert result["statuses"].get("blocked.jar") == "no_compatible_build", detail
     assert result["statuses"].get("library.jar") == "not_a_mod", detail

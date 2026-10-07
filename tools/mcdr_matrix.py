@@ -43,6 +43,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from typing import Optional
 
 REPO = Path(__file__).resolve().parent.parent
 PLUGIN_ID = "mod_update_checker"
@@ -446,7 +447,19 @@ def run_one(python: str, plugin: Path, workdir: Path, scenario_builder) -> dict:
 
         console = "\n".join(lines)
         write(root / "console.txt", console + "\n")
-        result = summarise(console, root, version, python)
+        # What the CDN actually published decides what must and must not land on disk. Taken
+        # from the fake upstream rather than inferred from the report's statuses, so the check
+        # would still fail if a bug stopped an entry being reported at all.
+        result = summarise(
+            console, root, version, python,
+            expected_downloads={
+                name: hashlib.sha1(blob).hexdigest()
+                for name, blob in upstream.cdn_files.items()
+                if name not in upstream.fail_downloads
+            },
+            forbidden_downloads=set(upstream.fail_downloads),
+            flaky_downloads=set(upstream.flaky_downloads),
+        )
         result["root"] = str(root)
         result["upstream_requests"] = len(upstream.request_paths())
         return result
@@ -510,7 +523,15 @@ def _collect_tellraw(console: str) -> tuple:
     return payloads, wrapped, errors
 
 
-def summarise(console: str, root: Path, version: str, python: str) -> dict:
+def summarise(
+    console: str,
+    root: Path,
+    version: str,
+    python: str,
+    expected_downloads: Optional[dict] = None,
+    forbidden_downloads: Optional[set] = None,
+    flaky_downloads: Optional[set] = None,
+) -> dict:
     plugin_folder = root / "config" / PLUGIN_ID
     report_path = plugin_folder / "last_report.json"
     report = {}
@@ -541,20 +562,19 @@ def summarise(console: str, root: Path, version: str, python: str) -> dict:
     tellraws, tellraw_wrapper, tellraw_errors = _collect_tellraw(console)
     joined = "\n".join(tellraws)
 
-    # What the auto-download stage actually put on disk. The expected hash is read back from
-    # the report, so this compares the file against the identity the *check* recorded rather
-    # than against a constant baked into the test.
+    # What the auto-download stage actually put on disk, compared against what the CDN
+    # published. Every file that is downloadable must be there byte for byte, and the ones that
+    # are deliberately served wrong must not be there at all.
     downloads = plugin_folder / "downloads"
     downloaded = sorted(p.name for p in downloads.iterdir()) if downloads.is_dir() else []
-    expected_files = {
-        entry.get("download_filename"): entry.get("download_sha1")
-        for entry in report.get("entries", [])
-        if entry.get("status") == "update_available" and entry.get("download_sha1")
+    expected_downloads = dict(expected_downloads or {})
+    forbidden_downloads = set(forbidden_downloads or set())
+    verified = {
+        name: (downloads / name).is_file() and _sha1_of(downloads / name) == digest
+        for name, digest in expected_downloads.items()
     }
-    verified = {}
-    for name, expected in expected_files.items():
-        path = downloads / name
-        verified[name] = path.is_file() and _sha1_of(path) == expected
+    forbidden_present = sorted(name for name in forbidden_downloads if name in downloaded)
+    flaky_downloads = set(flaky_downloads or set())
     # A build that has been fetched is no longer an update to fetch. Asserted on the file name
     # level so that a regression which puts it back into the "not downloaded" list is caught
     # even if the download itself still works.
@@ -567,9 +587,8 @@ def summarise(console: str, root: Path, version: str, python: str) -> dict:
         if entry.get("status") == "update_available"
         and entry.get("download_filename") in downloaded
     }
-    # The scenario serves one file with bytes that do not match its declared hash. Nothing may
-    # be left behind for it, and a partial ``.part`` file counts as left behind.
-    tampered_names = [name for name in expected_files if "tampered" in name]
+    # A partial ``.part`` file counts as left behind: it looks complete to everything
+    # downstream, which makes it worse than nothing.
     leftovers = sorted(p.name for p in downloads.iterdir() if p.suffix != ".jar")
 
     return {
@@ -604,19 +623,16 @@ def summarise(console: str, root: Path, version: str, python: str) -> dict:
         "downloads_leftovers": leftovers,
         "downloads_awaiting": sorted(awaiting),
         "downloads_still_announced": sorted(announced_updates),
-        "downloads_tampered_refused": bool(tampered_names)
-        and all(name not in downloaded for name in tampered_names),
-        # The three checks the run is judged on, reduced from the details above.
+        "downloads_forbidden_present": forbidden_present,
+        # The checks the run is judged on, reduced from the details above.
         "download_written": bool(downloaded),
-        # Only the files expected to succeed. The tampered one is *meant* to fail verification,
-        # and it is asserted on its own below — folding it in here would make this check
-        # impossible to satisfy and hide which of the two behaviours regressed.
-        "download_hash_verified": bool(verified)
-        and all(
-            ok for name, ok in verified.items() if name not in tampered_names
-        ),
-        "download_tampered_refused": bool(tampered_names)
-        and all(name not in downloaded for name in tampered_names),
+        "download_hash_verified": bool(verified) and all(verified.values()),
+        "download_tampered_refused": bool(forbidden_downloads) and not forbidden_present,
+        # A file the CDN serves wrong twice and then serves properly. It is only on disk
+        # because the retry happened, so this is the end-to-end proof that the budget works —
+        # with retrying off, or with the per-attempt state not reset, it would never land.
+        "download_flaky_recovered": bool(flaky_downloads)
+        and all(verified.get(name) for name in flaky_downloads),
         "download_no_leftovers": not leftovers,
         # The downloaded build must have left the "update to fetch" list, and the notification
         # must say both things: what still needs fetching, and what is fetched but not installed.
@@ -663,6 +679,7 @@ CHECK_KEYS = [
     "download_written",
     "download_hash_verified",
     "download_tampered_refused",
+    "download_flaky_recovered",
     "download_no_leftovers",
     "download_reclassified",
     "stale_download_removed",
