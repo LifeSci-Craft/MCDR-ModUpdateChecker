@@ -26,7 +26,7 @@
   "check.in_game_awaiting": "已下载待安装：{count} 个",
   "status.awaiting_install": "已下载，待安装",
   "line.awaiting_install": "{name}  {latest}（已下载，未安装）",
-  "report.awaiting_install_hint": "  （就在 {folder}，确认无误后复制到 mods/ 即可）",
+  "report.awaiting_install_hint": "  （就在 {folder}；要插件自己在关服时装就说 !!modupdate install <编号>，否则复制到 mods/ 即可）",
   "report.awaiting_install_found": "有 {count} 个 Mod 的新版本已下载，等待放入 mods：",
   "note.download_skipped": "未下载：{reason}",
   "note.download_failed": "下载失败：{reason}",
@@ -166,7 +166,7 @@
   "command.help.entry_install": "安排关服时安装某个已下载的 Mod（编号来自 list）",
   "command.help.entry_confirm": "确认上一条 download / install 操作",
   "command.status.install_pending": "关（但有 {count} 个已授权，关服时安装）",
-  "install.header": "[Mod Update Checker] 已自动替换 {count} 个 Mod（{when}）：",
+  "install.header": "[Mod Update Checker] 已替换 {count} 个 Mod（{when}）：",
   "install.line": "  {name} {version} —— 旧 jar 已保留为 {old}",
   "install.skipped_header": "  有 {count} 个已下载的版本没有被安装：",
   "install.skipped_line": "    {name}：{reason}",
@@ -183,5 +183,5 @@
   "command.status.install_label": "关服自动安装: ",
   "command.status.install_on": "开（旧 jar 保留为 .old）",
   "command.status.install_off": "关",
-  "install.done": "[Mod Update Checker] 已自动替换 {count} 个 Mod，详情见下次启动日志。"
+  "install.done": "[Mod Update Checker] 已替换 {count} 个 Mod，详情见下次启动日志。"
 }

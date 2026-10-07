@@ -30,7 +30,7 @@ import sys
 
 import requests
 
-USER_AGENT = "Pau1am/MCDR-ModUpdateChecker-probe (server admin tool)"
+USER_AGENT = "LifeSci-Craft/MCDR-ModUpdateChecker-probe (server admin tool)"
 MODRINTH = "https://api.modrinth.com/v2"
 
 #: Big enough to be a plausible jar, small enough that the probe stays quick.

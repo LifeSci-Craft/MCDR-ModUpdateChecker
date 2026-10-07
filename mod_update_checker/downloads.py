@@ -189,7 +189,7 @@ class DownloadOptions:
     folder: Path
     max_bytes: int = 128 * 1024 * 1024
     #: *Extra* attempts after the first one fails, so the total is ``1 + retries``. Follows the
-    #: same convention as the ``http_retries`` setting, so the two do not read differently.
+    #: same convention as ``network.retries``, so the two do not read differently.
     retries: int = 3
 
 

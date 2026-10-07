@@ -1242,7 +1242,7 @@ def _permitted_players(
 
     The threshold is a parameter rather than read from the config inside, because the two
     callers genuinely mean different things: ``notify_in_game_permission`` is "who may be
-    told about updates", while ``admin_join_permission`` is "who counts as an admin worth
+    told about updates", while ``report.admin_permission`` is "who counts as an admin worth
     waking up for". Folding them into one setting would make the option that is no longer
     read look like it still works.
 
@@ -1270,7 +1270,7 @@ def _admin_join_worker(server: PluginServerInterface, player: str) -> None:
       about mod updates when they log in, so an answer from ten minutes ago serves that goal
       better than a fresh scan: it arrives instantly instead of after a full read of ``mods/``,
       and three admins logging in together do not each fire a round of API calls. The window
-      is ``admin_join_max_report_age_minutes``; set it to ``0`` to always re-check.
+      is ``report.reuse_report_minutes``; set it to ``0`` to always re-check.
     * **A check that could not start still answers.** If another check holds the lock, the
       admin gets the previous report with its age, which beats silence.
     """

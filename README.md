@@ -3,7 +3,8 @@
 > 给 MCDR 用的 **Mod Update Checker 插件**：扫一遍服务端 `mods/` 里的每个 jar，拿去 **Modrinth** 比对，
 > 告诉你哪些 Mod 有新版本、哪些没有适配当前加载器/游戏版本的构建、哪些压根查不到来源。
 
-**不需要任何 API key，不需要额外依赖，从不动 `mods/`。**
+**不需要任何 API key，不需要额外依赖。默认只读**——它只有在你明确要求时才会改动 `mods/`，
+方式见[关服后自动安装](#关服后自动安装默认关闭唯一会动-mods-的功能)。
 
 | | |
 |---|---|
@@ -29,8 +30,10 @@ Fabric 服务端**没有任何原生手段**能发现 Mod 过期。加载器只�
 - [它做什么](#它做什么)
 - [安装](#安装)
 - [命令](#命令)
+- [手动下载与安装：两步确认](#手动下载与安装两步确认)
 - [报告的读法](#报告的读法)
 - [配置](#配置)
+- [关服后自动安装](#关服后自动安装默认关闭唯一会动-mods-的功能)
 - [排除某些 Mod 不检查](#排除某些-mod-不检查)
 - [网络与镜像](#网络与镜像)
 - [它是怎么判断的](#它是怎么判断的)
@@ -51,13 +54,16 @@ Fabric 服务端**没有任何原生手段**能发现 Mod 过期。加载器只�
 | **状态有意义** | 区分「可更新 / 已是最新 / 本地版本更新 / 无适配构建 / 查不到来源 / 出错 / 不是 Mod / 已忽略」，而不是笼统地说一句「版本不同」。 |
 | **顺带诊断** | 同一个 mod id 装了两份、仅客户端 Mod 装在服务端、Mod 声明的 Minecraft 版本范围与当前服务端不符——这三件事比「版本旧」更能解释一次崩溃。 |
 | **省请求额度** | 哈希查询是**批量**的：上百个 Mod 通常只需要个位数次请求，而不是每个 Mod 一次。 |
-| **可选下载** | 可以（默认关闭）把新版本下载到插件自己的文件夹，并校验哈希。**但绝不会装进 `mods/`**。 |
+| **可选下载** | 可以（默认关闭）把新版本下载到插件自己的文件夹，并校验哈希。 |
+| **可选安装** | 可以（默认关闭）在**服务端停止后**把下载好的新版本装进 `mods/`，旧的 jar 改名保留为 `.old`。装了哪些、回滚怎么做，见[关服后自动安装](#关服后自动安装默认关闭唯一会动-mods-的功能)。 |
 | **不打扰** | 默认只在控制台报告。游戏内提醒是可选项，且只发给权限足够的在线管理员。 |
 | **日志留白** | 每行最多一个链接（项目页），下载地址只写进 JSON 报告。一行读得完，才有人愿意读。 |
 | **中英双语** | `language: auto` 跟随 MCDR 的语言设置。 |
 
-> **它从不改动 `mods/`。** 就算是开启下载之后，文件也只是落到插件自己的数据文件夹里，等你自己检查、
-> 自己复制过去。Mod 更新可能改配置格式或破坏存档，这个决定必须由人做。
+> **默认状态下它不改动 `mods/`。** 只查、只报，下载也只会落到插件自己的数据文件夹里。
+> 写 `mods/` 的能力需要你显式开启 `download.install_on_stop`，或者逐个 `!!muc install`——
+> 而且两者都只在**服务端已经停止**之后才动手。Mod 更新可能改配置格式或破坏存档，
+> 所以这个决定始终由人做出，插件只负责把它执行到位并留下退路。
 
 ---
 
@@ -193,15 +199,15 @@ Sodium
 
 | 状态 | 含义 | 该做什么 |
 |---|---|---|
-| `update_available` | 有适配当前加载器与游戏版本的新版本，**尚未下载** | 下载并替换 jar |
-| `awaiting_install` | 新版本**已经下载到插件文件夹**，还没放进 `mods/` | 检查后复制进 `mods/` |
+| `update_available` | 有适配当前加载器与游戏版本的新版本，**尚未下载** | `!!modupdate download <编号>` 抓下来，或开启自动下载 |
+| `awaiting_install` | 新版本**已经下载到插件文件夹**，还没放进 `mods/` | `!!modupdate install <编号>` 安排关服时替换，或自己复制进 `mods/` |
 | `no_compatible_build` | 项目存在，但**没有**适配当前加载器或游戏版本的构建 | 通常发生在大版本升级后。停用该 Mod，或等作者更新 |
 | `local_ahead` | 本地版本比上游发布过的都新 | 多半是自己编译的开发版，正常 |
 | `up_to_date` | 本地文件就是最新构建 | 无需处理 |
 | `unresolved` | Modrinth 不认识这个 jar | 自己编译的、重新打包过的，或者从未发布过 |
 | `not_a_mod` | 是合法 jar，但不含 Mod 元数据（库、数据包等） | 无需处理 |
 | `error` | 这个 jar 读取失败 | 看错误详情 |
-| `ignored` | 在 `ignored_mods` 里被排除 | 无需处理 |
+| `ignored` | 在 `check.ignored_mods` 里被排除 | 无需处理 |
 
 「无适配构建」还分两种，报告会写清是哪一种：项目**根本没发布过该加载器的构建**，还是
 **发布过、但没有面向当前 Minecraft 版本**。这两种该做的事不一样，所以没有合并。
@@ -230,7 +236,7 @@ Sodium
 ```
 
 下面每张表的选项名都带上章节，也就是你在文件里写的完整路径（`check.ignored_mods` 表示
-`check` 章节下的 `ignored_mods`）。
+`check` 章节下的忽略名单）。
 
 ### 顶层
 
@@ -294,29 +300,44 @@ Sodium
 | `sources.modrinth.enabled` | `true` | 是否查询 Modrinth |
 | `sources.modrinth.api_base` | `""` | 留空 = 官方 `https://api.modrinth.com/v2`；可改成镜像 |
 
-### `download` —— 自动下载（默认关闭）
+### `download` —— 下载与关服安装（默认关闭）
+
+这个章节管两件事：**要不要去抓新的**，以及**抓下来的要不要装**。它们刻意分开，
+因为「想装一个已经下好的文件」不该逼你先允许它去抓更多。
 
 | 选项 | 默认 | 说明 |
 |---|---|---|
-| `download.enabled` | `false` | 总开关 |
+| `download.enabled` | `false` | 下载总开关。发现更新时把新版本抓到插件自己的文件夹 |
 | `download.folder_name` | `"downloads"` | 下载到哪个子文件夹 |
 | `download.max_size_mb` | `128` | 单个文件大小上限，超过就跳过 |
-| `download.install_on_stop` | `false` | **关服后自动安装**已下载的新版本到 `mods/`。见下一节 |
+| `download.install_on_stop` | `false` | **关服后自动安装**已下载的新版本到 `mods/`。不依赖 `download.enabled`，见下一节 |
 | `download.retries` | `3` | 下载失败后**额外**重试几次。总尝试 = `1 + 该值`（默认最多 4 次） |
+
+两项都关着时，插件仍然能做事——只是要你点名：
+
+| 想做的事 | 命令 | 依赖开关吗 |
+|---|---|---|
+| 抓某一个 Mod 的新版本 | `!!modupdate download <编号>` | 不依赖 |
+| 安排下一次关服时装某一个 | `!!modupdate install <编号>` | 不依赖 |
+| 发现更新就全都抓 | `download.enabled: true` | 是 |
+| 抓到的全都装 | `download.install_on_stop: true` | 是 |
 
 ### 关服后自动安装（默认关闭，唯一会动 `mods/` 的功能）
 
-开启 `download.install_on_stop` 后，**服务端停止时**插件会把已下载的新版本装进 `mods/`，
-并把被替换的旧 jar 改名为 `<原名>.old` 保留下来。
+两种方式都会**在服务端停止后**把已下载的新版本装进 `mods/`，并把被替换的旧 jar 改名为
+`<原名>.old` 保留下来：
+
+- `download.install_on_stop: true` —— 装**所有**已下载的；
+- `!!modupdate install <编号>` —— 只装**你点名的那个**（见[手动下载与安装](#手动下载与安装两步确认)）。
 
 ```
-[Mod Update Checker] 已自动替换 3 个 Mod，详情见下次启动日志。
+[Mod Update Checker] 已替换 3 个 Mod，详情见下次启动日志。
 ```
 
 下次启动时列出明细，第一位上线的管理员也会收到同样的内容（各只发一次）：
 
 ```
-[Mod Update Checker] 已自动替换 3 个 Mod（2026-10-08T10:12:03+08:00）：
+[Mod Update Checker] 已替换 3 个 Mod（2026-10-08T10:12:03+08:00）：
   Lithium 0.15.0 —— 旧 jar 已保留为 [锂-性能优化]Lithium.jar.old
   Sodium 0.6.0 —— 旧 jar 已保留为 sodium.jar.old
   Outdated Mod 1.1.0 —— 旧 jar 已保留为 outdated.jar.old
@@ -328,12 +349,17 @@ Sodium
 
 - **只在关服之后动手**，不会在运行中替换 jar。
 - **只处理插件自己下载过的文件**（下载清单里记着的那几个）。手动放进 `mods/` 的东西一概不碰。
+- **`install_on_stop` 开着时是「清单里的全部」，关着时只有你 `!!muc install` 点过名的那几个。**
+  一台服挂着五个已下载的版本时，逐条授权不会顺手把其余四个也装进去。
 - **旧 jar 只改名、不删除**；已经有同名 `.old` 时会用 `.old.2`，**绝不覆盖**任何已有备份。
 - **安装前校验哈希**；对不上就不装。
 - **目标文件名被占用时跳过并说明**，不会为了腾位置而替换别的文件。
 - **`mods/` 里那个 jar 已经不在了就跳过**——那多半是你主动删掉的，插件不会把它加回来。
 - **安装失败会回滚**：旧 jar 先挪走，新 jar 放不进去就把它挪回来。
 - 它**不依赖 `download.enabled`**：那项只管「要不要去抓新的」，这项只管「抓下来的要不要装」。
+
+`!!modupdate status` 会显示这一项的当前状态；如果是「关，但有 N 个已授权」，说明 `!!muc install`
+已经排好了队但还没到关服那一刻。
 
 #### 文件名里的中括号备注会被保留
 
@@ -375,7 +401,7 @@ Sodium
   Another Mod  1.0.0 -> 1.1.0  (可更新, …)
 有 1 个 Mod 的新版本已下载，等待放入 mods：
   Outdated Mod  1.1.0（已下载，未安装）  (已下载，待安装, …)
-  （就在 config/mod_update_checker/downloads，确认无误后复制到 mods/ 即可）
+  （就在 config/mod_update_checker/downloads；要插件自己在关服时装就说 !!modupdate install <编号>，否则复制到 mods/ 即可）
 ```
 
 一个 Mod 只会出现在其中一组里。所以**已经下载过的 Mod 不会在下次启动时被重复当成「有更新」提醒**——
@@ -389,10 +415,11 @@ Sodium
 ### 下载新版本怎么工作
 
 开启 `download.enabled` 后，检查发现更新会把新版本**从 Modrinth 下载**到插件数据文件夹的子文件夹里。
+（`!!modupdate download <编号>` 做的是同一件事，只是限定在一个 Mod 上，而且不需要开这个开关。）
 
 下载位置：`config/mod_update_checker/downloads/`，日志会给出每个文件的完整路径。
 
-**它只下载，不会装进 `mods/`。** 请自行检查后手动替换。
+**下载本身不会装进 `mods/`。** 装进去是另一步、另一个开关，见上一节。
 
 几条硬性规则（都是刻意设计的，不是限制）：
 
@@ -416,10 +443,10 @@ Sodium
 
 ## 排除某些 Mod 不检查
 
-有些 Mod 你并不想更新：自己写的、故意固定在某个版本的、不需要提醒的。把它们填进 `ignored_mods`：
+有些 Mod 你并不想更新：自己写的、故意固定在某个版本的、不需要提醒的。把它们填进 `check.ignored_mods`：
 
 ```json
-"ignored_mods": ["my-own-mod", "pinned-lib.jar", "Fabric API"]
+"check": { "ignored_mods": ["my-own-mod", "pinned-lib.jar", "Fabric API"] }
 ```
 
 三种写法都可以，大小写与空格 / 连字符等符号都不计较（`Fabric-API` 与 `fabricapi` 等价）：
@@ -483,10 +510,11 @@ MC 的 Mod 版本号是一团乱麻：`1.2.3`、`v1.2.3`、`0.162.0+26.3`、`1.1
 - **重新打包过的 jar 查不到。** 同一个 Mod 若被别的渠道重新打包成不同字节，SHA-1 就与发布版本对不上，
   只能靠名称兜底；兜底不上就是 `unresolved`，报告会明说，而不是猜一个给你。
 - **不检查嵌套 jar。** Fabric 的 jar-in-jar 里打包的库不会单独检查（数量会在报告里说明）。
-- **不会自动安装。** 插件不会替换 `mods/` 里的任何文件。开启 `download.enabled` 也只是把新版本下到
-  它自己的文件夹。Mod 更新可能改变配置格式或破坏存档，这一步必须由人做。
-- **`mc_version` 推断可能不准。** 报告里每一条都会写明版本来源（`config` / `server_info` / `log` /
-  `mods`），来源是 `mods`（猜测）时还会额外提醒。**升级大版本后建议显式写死 `mc_version`。**
+- **不会自己决定装什么。** 写 `mods/` 的能力要先开启 `download.install_on_stop`，或者逐个
+  `!!muc install` 点名——两者都只在**服务端停止后**执行，旧 jar 一律改名保留。
+  它永远不会在运行中替换 jar，也不会碰任何不是它自己下载的文件。
+- **`server.mc_version` 推断可能不准。** 报告里每一条都会写明版本来源（`config` / `server_info` /
+  `log` / `mods`），来源是 `mods`（猜测）时还会额外提醒。**升级大版本后建议显式写死 `server.mc_version`。**
 - **只查 Modrinth。** 这是刻意的：其他站点要么需要 API key、要么不提供直链下载，留着会让「能不能查到」
   变成一件说不清的事。不在 Modrinth 上的 Mod 会明确报 `unresolved`。
 
@@ -497,16 +525,19 @@ MC 的 Mod 版本号是一团乱麻：`1.2.3`、`v1.2.3`、`0.162.0+26.3`、`1.1
 | 结论 | 核验方式 |
 |---|---|
 | 能在真实 MCDR 里加载、跑完检查、注册全部命令 | `tools/mcdr_matrix.py`：在指定解释器里起真实 MCDR + 假服务端 + 假上游，驱动全流程（`tests/test_e2e.py` 是它的 pytest 封装） |
-| 能跑在 2.13 / 2.14 / 2.15 / 2.16 | 同上，跨 5 个 MCDR 版本跑矩阵；四个低版本与 2.16.0 的 32 项检查逐项一致 |
+| 能跑在 2.13 / 2.14 / 2.15 / 2.16 | 同上，跨 5 个 MCDR 版本跑矩阵；四个低版本与 2.16.0 的 **36 项检查逐项一致**（`--with-install` 那次是 34 项，差的两项是下载目录专属的断言，安装会把它搬空） |
 | Modrinth 的请求形状正确 | `tests/test_clients.py`。假上游的回答形状是**照线上实测抄的**（例如 `version_files/update` 无匹配时返回 `{}`），不是一个想当然的替身 |
 | 哈希识别在真实数据上成立 | 拿真实 Mod jar 对线上 API 跑完整流程，核对报告的版本号与下载链接 |
 | 单次遍历的摘要计算正确 | `tests/test_digests.py`：对整块缓冲区用 `hashlib` 交叉验证，并在**读块边界**两侧取样；另有一条断言证明内存不随文件大小增长 |
 | 版本比对不会判反 | `tests/test_versioning.py`，含 `1.21.10 > 1.21.4` 这类反字典序用例 |
 | 下载的拒绝与重试两条路径都会被走到 | 假 CDN 提供三种坏情况：校验必定失败的字节、前两次损坏随后正常的抖动、不带 `Content-Length` 的流式响应；真实 MCDR 运行证明「抖动的文件最终落盘且哈希通过」「被篡改的文件 4 次尝试后放弃且不留残留」 |
+| 手动 `!!muc download` / `install` / `confirm` 真的能走通 | 上面那个矩阵运行里**真敲了** `!!muc download 1` → `!!muc confirm`：1 号的文件字节与哈希故意对不上，所以这条断言证明的是「真的开了 socket、真的被拒绝、下载目录里没留下残渣」；`!!muc install` 的两条分支（未下载要先 download、已下载要 `confirm`）也各有一条断言 |
+| 授权安装只装点名的那一个 | `test_install_on_stop_installs_only_what_was_authorised`：清单里放两条、只授权一条，断言另一条的 jar 连 `.old` 都没出现过 |
 | MCDR 生命周期语义（重复注册、reload 不触发 `on_unload`） | 逐条对照安装的 MCDR 源码核实，并用 AST 级测试钉住「模块级按名注册、不得再显式注册」这条约束 |
 | 上游行为与代码假设一致 | `tools/probe_upstream.py`——上线后上游若有变化，重跑它就能看出差别 |
 
-测试套件共 **456 项**，细节见 [`tests/README.md`](tests/README.md)。
+测试套件共 **496 项**（当前数量用 `pytest --collect-only -q | tail -1` 查；这一行是快照，
+所以上面那张表里的「36 项检查」才是被测试自动核对的那个数字），细节见 [`tests/README.md`](tests/README.md)。
 
 ---
 
@@ -514,14 +545,14 @@ MC 的 Mod 版本号是一团乱麻：`1.2.3`、`v1.2.3`、`0.162.0+26.3`、`1.1
 
 **Q：为什么大部分 Mod 都能查到，有几个查不到？**
 A：那些多半不在 Modrinth 上，或者是你自己编译 / 重新打包过的。哈希对不上，插件会明说 `unresolved`，
-而不是猜一个给你。想让它别再被检查，用 `ignored_mods`。
+而不是猜一个给你。想让它别再被检查，用 `check.ignored_mods`。
 
 **Q：某个 Mod 我永远不想更新，怎么办？**
-A：加进 `ignored_mods`（见[排除某些 Mod 不检查](#排除某些-mod-不检查)）。它会被彻底跳过——不查询、
+A：加进 `check.ignored_mods`（见[排除某些 Mod 不检查](#排除某些-mod-不检查)）。它会被彻底跳过——不查询、
 不提醒、不下载——但报告里仍列出并标注 `ignored`，方便你确认拼写没错。
 
 **Q：装完却什么都没发生？**
-A：默认要等服务端启动完成 + 60 秒（`start_check_delay_seconds`）。想立刻看到结果就
+A：默认要等服务端启动完成 + 60 秒（`check.start_delay_seconds`）。想立刻看到结果就
 `!!modupdate check`。如果 Mods 目录识别错了，`!!modupdate status` 会显示它实际用的路径。
 
 **Q：`no_compatible_build` 和「无法识别」有什么区别？**
@@ -530,17 +561,20 @@ jar 是什么**。两者该做的事完全不同，所以分成了两个状态�
 
 **Q：升级 Minecraft 大版本后满屏 `no_compatible_build`？**
 A：先确认 `!!modupdate status` 里的版本号是不是对的。如果来源显示 `mods`（从 Mod 元数据猜的），
-请显式设置 `mc_version`——用错误的游戏版本去过滤，会把每个 Mod 都报成无适配构建，而这个结果
+请显式设置 `server.mc_version`——用错误的游戏版本去过滤，会把每个 Mod 都报成无适配构建，而这个结果
 **看起来和真答案一模一样**。
 
 **Q：会不会很吃请求额度？**
 A：不会。哈希识别是批量的：一个 100 Mod 的服务端通常是 3~5 次请求；只有「批量答不出来」和「需要按名称
 兜底」的少数 Mod 才会各自再问一次。另有 240 次/分钟的自限速，以及 429/5xx 的自动重试与退避。
-被 `ignored_mods` 排除的 Mod 完全不产生请求。
+被 `check.ignored_mods` 排除的 Mod 完全不产生请求。
 
 **Q：能自动更新 Mod 吗？**
-A：不会自动**替换**。Mod 更新可能改配置格式、破坏存档，这个决定应该由人做。插件给你新版本号、下载链接，
-可选地（`download.enabled`）把新版本下到插件自己的文件夹，装不装由你决定。
+A：能，但**只有在你明确要求时**，而且永远发生在服务端停止之后。两种方式：开启
+`download.install_on_stop`（装所有已下载的），或者逐个 `!!modupdate install <编号>`（只装你点名的）。
+两者都会先把旧 jar 改名成 `.old` 保留，所以不满意就改回来。默认状态是**不装**——插件给你新版本号、
+项目页和下载链接，可选地把新版本下到它自己的文件夹。
+Mod 更新可能改配置格式、破坏存档，所以这一步刻意留给你决定，只是不必再手动搬文件。
 
 ---
 
@@ -554,14 +588,19 @@ PYTHONPATH=.testlibs python -m pytest                  # 含真实 MCDR 端到�
 
 # 跨 MCDR 版本
 python tools/mcdr_matrix.py --current
+python tools/mcdr_matrix.py --current --with-install   # 额外验证关服安装
 
-# 打包 + 校验产物（可复现、内容白名单、注释剥离、包内代码仍能编译）
+# 打包 + 校验产物（可复现、换行归一、内容白名单、注释剥离、包内代码仍能编译）
 python pack.py
 python tools/check_artifact.py
 
 # 上游 API 行为变了？重跑探测
 python tools/probe_upstream.py
 ```
+
+> **Windows（Git Bash）**：`PYTHONPATH` 的多个路径要用**分号**分隔，即 `PYTHONPATH=".testlibs;tests"`。
+> 用冒号的话 Python 会把整串当成一个目录名，症状是 `No module named pytest`——那看起来像 conftest
+> 的问题，其实不是。
 
 ### 发布一个新版本
 
@@ -577,13 +616,18 @@ python tools/probe_upstream.py
 发版的顺序：**建分支 → 推分支 → 开 PR → 合并 → 再在合并后的 `main` 上打 tag 发 Release**。
 这样每个版本「新增/删除了什么」在 PR 页面里是逐行可见的。
 
+发版前还要看一眼**仓库地址**：`mcdreforged.plugin.json` 的 `links`、`checker.py` 的 `USER_AGENT`、
+CHANGELOG 的 Releases 链接必须指向真实存在的仓库。四处是否**互相一致**由
+`tests/test_docs.py` 自动核对，但「这个 owner 是不是对的」只有线上远端知道——
+曾经这四处一起指向一个 404 的仓库，测试全绿而链接全废。
+
 推送到 `main` 时会自动跑 CI（`.github/workflows/ci.yml`）：
 
 | 作业 | 内容 |
 |---|---|
 | `unit` | Python 3.10 与 3.13 上跑单元与集成测试（3.10 无 `tomllib`，顺带覆盖 Forge 元数据的正则回退路径） |
 | `mcdr-matrix` | **2.13.0 / 2.14.1 / 2.15.0 / 2.15.7 / 2.16.0 各一个作业**，各自起真实 MCDR 跑完整流程 |
-| `artifact` | 连打两次产物比字节（可复现）、检查包内不含 tests/tools/README、确认包内 `.py` 已无注释与 docstring 且仍能编译 |
+| `artifact` | 连打两次产物比字节（可复现）、把源码临时改成 CRLF 再打一次要求字节一致（换行归一）、检查包内不含 tests/tools/README、确认包内 `.py` 已无注释与 docstring 且仍能编译 |
 
 目录结构：
 

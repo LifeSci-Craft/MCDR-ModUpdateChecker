@@ -91,7 +91,7 @@ ALL_STATUSES: Tuple[str, ...] = (
 #:
 #: ``awaiting_install`` belongs here: there is nothing left to download, but the work is not
 #: finished — somebody still has to move the file. Leaving it out would mean the "ready to
-#: install" section is suppressed by ``notify_on_updates_only``, which is the one setting most
+#: install" section is suppressed by ``report.updates_only``, which is the one setting most
 #: servers run with.
 ACTIONABLE_STATUSES: Tuple[str, ...] = (
     STATUS_UPDATE_AVAILABLE,

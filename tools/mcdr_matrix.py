@@ -398,7 +398,7 @@ def plugin_config(upstream, install: bool = False) -> dict:
 #: on an install that never announced itself.
 #: The marker both install messages carry, so the check does not depend on which of the two
 #: a given run happens to print.
-INSTALL_LOG_HEADER = plugin_badge() + " 已自动替换"
+INSTALL_LOG_HEADER = plugin_badge() + " 已替换"
 
 #: What the prefixed mod's jar should be called once its note has been carried over.
 PREFIXED_INSTALLED_NAME = "[测试-前缀]prefixed-fabric-1.1.0.jar"
