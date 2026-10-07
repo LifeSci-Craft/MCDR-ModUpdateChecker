@@ -138,6 +138,8 @@ COMMANDS = [
     "!!modupdate status",
     "!!modupdate list",
     "!!modupdate list update_available",
+    # The listing is a numbered index now; this is the click target on one of its rows.
+    "!!modupdate info 1",
     "!!modupdate reload",
     "!!muc help",
     "!!modupdate check",
@@ -150,8 +152,11 @@ COMMAND_EXPECTATIONS = {
     "help": "!!modupdate list",
     # ASCII colon: the separator is part of the translated label, not hardcoded.
     "status_mc": "服务端: 26.3",
-    "list_all": "全部 Mod：",
-    "list_filtered": "[update_available]",
+    # The listing is a numbered index: one line per mod plus a clickable detail label.
+    "list_all": "点 [详细信息] 看版本变更与链接",
+    "list_filtered": "[详细信息]",
+    # The detail view a click lands on: a version change and the two links.
+    "info_detail": "版本: ",
     "reload": "配置已重载",
     # Runs ``!!muc help`` and looks for a row naming that alias. The status screen cannot
     # serve here any more: both aliases now print the same title bar, so it would pass without
@@ -305,10 +310,14 @@ CONFIG_OVERRIDES = (
     # excluded is genuinely left alone. The scenario plants one with a newer build upstream,
     # so if the exclusion were ignored it would show up as an update.
     "check.ignored_mods",
+    # Off by default, and the one setting that lets the plugin write to mods/. Switched on only
+    # by ``--with-install``, which is a separate run because installing moves the fetched files
+    # out of the download folder that the default run's assertions inspect.
+    "download.install_on_stop",
 )
 
 
-def plugin_config(upstream) -> dict:
+def plugin_config(upstream, install: bool = False) -> dict:
     """The config for one MCDR instance: the shipped defaults, plus the allow-list.
 
     Shaped like the file the plugin actually ships — grouped into sections — so what the run
@@ -323,6 +332,11 @@ def plugin_config(upstream) -> dict:
         "report": {"in_game": True},
         "download": {"enabled": True},
     }
+    if install:
+        # Only the install run switches this on. It has to be a separate run rather than part
+        # of the default one because installing *moves the fetched files out of the download
+        # folder*, which is exactly what the download assertions look at.
+        config["download"]["install_on_stop"] = True
     _ensure_dependencies_importable()
     from support import flatten_options
 
@@ -332,6 +346,15 @@ def plugin_config(upstream) -> dict:
     )
     return config
 
+
+#: The install summary line, as the plugin writes it. Checked verbatim so a run cannot pass
+#: on an install that never announced itself.
+#: The marker both install messages carry, so the check does not depend on which of the two
+#: a given run happens to print.
+INSTALL_LOG_HEADER = "[Mod 更新检查] 已自动替换"
+
+#: What the prefixed mod's jar should be called once its note has been carried over.
+PREFIXED_INSTALLED_NAME = "[测试-前缀]prefixed-fabric-1.1.0.jar"
 
 #: A build left in the downloads folder from an earlier run, for a mod whose newer build is
 #: available now. Seeded so the run has to notice it is superseded, remove it, and fetch the new
@@ -368,7 +391,7 @@ def seed_stale_download(root: Path) -> None:
     )
 
 
-def build_tree(root: Path, python: str, plugin: Path, upstream, jars) -> None:
+def build_tree(root: Path, python: str, plugin: Path, upstream, jars, install: bool = False) -> None:
     """Lay out one MCDR instance plus a planted mods folder."""
     (root / "plugins").mkdir(parents=True, exist_ok=True)
     (root / "server" / "mods").mkdir(parents=True, exist_ok=True)
@@ -383,7 +406,7 @@ def build_tree(root: Path, python: str, plugin: Path, upstream, jars) -> None:
 
     write(
         root / "config" / PLUGIN_ID / "config.json",
-        json.dumps(plugin_config(upstream), indent=2),
+        json.dumps(plugin_config(upstream, install=install), indent=2),
     )
     write(root / "permission.yml", PERMISSION_YML)
     seed_stale_download(root)
@@ -406,7 +429,8 @@ def feed_commands(process, delay: float) -> None:
     threading.Thread(target=run, daemon=True).start()
 
 
-def run_one(python: str, plugin: Path, workdir: Path, scenario_builder) -> dict:
+def run_one(python: str, plugin: Path, workdir: Path, scenario_builder,
+            install: bool = False) -> dict:
     """Boot one MCDR instance, drive it, and report what happened."""
     from fake_upstream import FakeUpstream
 
@@ -420,7 +444,7 @@ def run_one(python: str, plugin: Path, workdir: Path, scenario_builder) -> dict:
     upstream.start()
     try:
         scenario_jars = scenario_builder(upstream, root)
-        build_tree(root, python, plugin, upstream, scenario_jars)
+        build_tree(root, python, plugin, upstream, scenario_jars, install=install)
 
         subprocess.run(
             [python, "-m", "mcdreforged", "init"],
@@ -478,6 +502,7 @@ def run_one(python: str, plugin: Path, workdir: Path, scenario_builder) -> dict:
             forbidden_downloads=set(upstream.fail_downloads) | set(upstream.unwanted_downloads),
             flaky_downloads=set(upstream.flaky_downloads),
             unwanted_downloads=set(upstream.unwanted_downloads),
+            install=install,
         )
         result["root"] = str(root)
         result["upstream_requests"] = len(upstream.request_paths())
@@ -549,6 +574,7 @@ def summarise(
     python: str,
     expected_downloads: Optional[dict] = None,
     forbidden_downloads: Optional[set] = None,
+    install: bool = False,
     flaky_downloads: Optional[set] = None,
     unwanted_downloads: Optional[set] = None,
 ) -> dict:
@@ -589,10 +615,23 @@ def summarise(
     downloaded = sorted(p.name for p in downloads.iterdir()) if downloads.is_dir() else []
     expected_downloads = dict(expected_downloads or {})
     forbidden_downloads = set(forbidden_downloads or set())
-    verified = {
-        name: (downloads / name).is_file() and _sha1_of(downloads / name) == digest
-        for name, digest in expected_downloads.items()
-    }
+
+    # With install on, the fetched builds have been moved into mods/ — so "was this file
+    # verified" is asked of both places. Same assertion, either destination: the point is that
+    # the bytes the CDN published are on disk untouched, not where the plugin put them.
+    mods_folder = root / "server" / "mods"
+
+    def _find_published(name):
+        for folder in (downloads, mods_folder):
+            candidate = folder / name
+            if candidate.is_file():
+                return candidate
+        return None
+
+    verified = {}
+    for name, digest in expected_downloads.items():
+        found = _find_published(name)
+        verified[name] = found is not None and _sha1_of(found) == digest
     forbidden_present = sorted(name for name in forbidden_downloads if name in downloaded)
     # Published but not wanted: a mod the config excluded. Named separately from the
     # verification failures, because "we refused a bad file" and "we correctly ignored a mod"
@@ -661,6 +700,27 @@ def summarise(
         "download_flaky_recovered": bool(flaky_downloads)
         and all(verified.get(name) for name in flaky_downloads),
         "download_no_leftovers": not leftovers,
+        # -- install stage (only meaningful with --with-install) -----------------------
+        # Read off the mods folder rather than off the log: a message claiming an install is
+        # worth nothing if the files did not actually move.
+        "install_logged": INSTALL_LOG_HEADER in console,
+        "install_replaced_old_body": (
+            (mods_folder / "outdated-1.1.0.jar").is_file()
+            and _sha1_of(mods_folder / "outdated-1.1.0.jar")
+            == expected_downloads.get("outdated-1.1.0.jar")
+        ),
+        "install_backup_kept": (mods_folder / "outdated.jar.old").is_file(),
+        # The admin's bracket note carried onto the new file name. This is the prefix feature,
+        # and the only place it is observable is a real install.
+        "install_prefix_kept": (
+            (mods_folder / PREFIXED_INSTALLED_NAME).is_file()
+            and (mods_folder / "[测试-前缀]prefixed.jar.old").is_file()
+        ),
+        # The replaced jar is gone from its old name: one jar per mod, not two.
+        "install_left_a_single_jar": sorted(
+            item.name for item in mods_folder.glob("*outdated*")
+        ) == ["outdated-1.1.0.jar", "outdated.jar.old"],
+        "install_untouched_mods_intact": (mods_folder / "current.jar").is_file(),
         # A mod the admin excluded is not fetched even though its build is published: that is
         # the whole point of the setting, and with downloading on it is the observable part.
         "download_ignored_not_fetched": bool(unwanted_downloads)
@@ -686,15 +746,18 @@ def summarise(
         "command_status": COMMAND_EXPECTATIONS["status_mc"] in console,
         "command_list_all": COMMAND_EXPECTATIONS["list_all"] in console,
         "command_list_filtered": COMMAND_EXPECTATIONS["list_filtered"] in console,
+        "command_info": COMMAND_EXPECTATIONS["info_detail"] in console,
         "command_reload": COMMAND_EXPECTATIONS["reload"] in console,
         "command_alias": COMMAND_EXPECTATIONS["alias"] in console,
         "command_check": COMMAND_EXPECTATIONS["check_started"] in console,
+        "mode": "install" if install else "download",
         "modrinth_used": any(entry["platform"] == "modrinth" for entry in report.get("entries", [])),
         "tracebacks": console.count("Traceback (most recent call last)"),
         "plugin_errors": console.count("[Mod Update Checker] 检查失败"),
     }
 
 
+#: Checks that hold whatever mode the run is in.
 CHECK_KEYS = [
     "check_ran",
     "detected_version",
@@ -706,6 +769,27 @@ CHECK_KEYS = [
     "notify_in_game_sent",
     "admin_join_notified",
     "notify_payloads_valid",
+    "notify_lists_both_groups",
+    "command_summary",
+    "command_help",
+    "command_status",
+    "command_list_all",
+    "command_list_filtered",
+    "command_info",
+    "command_reload",
+    "command_alias",
+    "command_check",
+    "modrinth_used",
+    "spoke_chinese",
+]
+
+#: Checks about where a *download* lands, which only apply while nothing installs it.
+#:
+#: The two modes cannot share one list: install-on-stop moves the fetched files out of the
+#: download folder and may rename them, so every assertion about that folder — was it written,
+#: was it superseded, is nothing left over — becomes the wrong question rather than a failing
+#: one. Each mode asks its own.
+DOWNLOAD_KEYS = [
     "download_written",
     "download_hash_verified",
     "download_tampered_refused",
@@ -715,23 +799,28 @@ CHECK_KEYS = [
     "download_reclassified",
     "stale_download_removed",
     "stale_download_replaced",
-    "notify_lists_both_groups",
-    "command_summary",
-    "command_help",
-    "command_status",
-    "command_list_all",
-    "command_list_filtered",
-    "command_reload",
-    "command_alias",
-    "command_check",
-    "modrinth_used",
-    "spoke_chinese",
 ]
+
+#: Checks about what the *stop* replaced, which only apply with install-on-stop on.
+INSTALL_KEYS = [
+    "install_logged",
+    "install_replaced_old_body",
+    "install_backup_kept",
+    "install_prefix_kept",
+    "install_left_a_single_jar",
+    "install_untouched_mods_intact",
+]
+
+
+def required_keys(install: bool) -> list:
+    """The checks a run is judged on, for the mode it ran in."""
+    return CHECK_KEYS + (INSTALL_KEYS if install else DOWNLOAD_KEYS)
 
 
 def verdict(result: dict) -> str:
     if result["loaded"]:
-        problems = [key for key in CHECK_KEYS if not result.get(key)]
+        keys = required_keys(result.get("mode") == "install")
+        problems = [key for key in keys if not result.get(key)]
         if problems:
             return "FAIL (" + ", ".join(problems) + ")"
         if result["tracebacks"]:
@@ -752,6 +841,11 @@ def main() -> int:
     )
     parser.add_argument("interpreters", nargs="*", help="python executables with MCDR installed")
     parser.add_argument("--current", action="store_true", help="only the running interpreter")
+    parser.add_argument(
+        "--with-install",
+        action="store_true",
+        help="also switch on install-on-stop, which moves the fetched builds into mods/",
+    )
     args = parser.parse_args()
 
     pythons = [sys.executable] if args.current else args.interpreters
@@ -770,7 +864,9 @@ def main() -> int:
 
     results = []
     for python in pythons:
-        result = run_one(python, plugin, workdir, build_scenario_jars)
+        result = run_one(
+            python, plugin, workdir, build_scenario_jars, install=args.with_install
+        )
         results.append(result)
         print("  {:<14} {}".format(result["mcdr"], verdict(result)))
 
@@ -814,7 +910,9 @@ def main() -> int:
     if len(loaded) > 1:
         print()
         print("  跨版本一致性（成功加载的 {} 个版本）".format(len(loaded)))
-        for key in CHECK_KEYS + ["report_entry_count", "tracebacks"]:
+        for key in required_keys(results[0].get("mode") == "install") + [
+            "report_entry_count", "tracebacks"
+        ]:
             values = {str(item[key]) for item in loaded}
             print("    {:<28} {}".format(key, "一致" if len(values) == 1 else "不一致: " + str(values)))
 

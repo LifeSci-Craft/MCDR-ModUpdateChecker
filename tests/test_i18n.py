@@ -41,7 +41,7 @@ MATCHED_BY_VALUES = ("hash", "name")
 #: list is a deliberate allow-list of the dotted prefixes that mean something to this plugin.
 _KEY_IN_CODE = re.compile(
     r'"('
-    r'(?:line|note|advisory|report|command|console|check|help|language|download)'
+    r'(?:line|note|advisory|report|command|console|check|help|language|download|detail)'
     r'\.[a-z_0-9]+(?:\.[a-z_0-9]+)*'
     r')"'
 )

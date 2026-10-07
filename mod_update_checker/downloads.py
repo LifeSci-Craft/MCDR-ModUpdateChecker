@@ -272,6 +272,11 @@ class DownloadLedger:
         record = self._records.get(key)
         return str(record.get("file", "")) if record else ""
 
+    def records(self) -> List[str]:
+        """Every key with a record. A list, not the dict, so a caller cannot mutate the
+        bookkeeping by accident — forgetting a record is :meth:`forget`'s job."""
+        return list(self._records)
+
     def prune(self, folder: Union[str, Path]) -> List[str]:
         """Drop records whose file is no longer there. Returns the keys dropped.
 
@@ -288,12 +293,31 @@ class DownloadLedger:
 
     # -- writing -----------------------------------------------------------------------
 
-    def record(self, key: str, file_name: str, sha1: str, version: str, at: str) -> None:
+    def record(
+        self,
+        key: str,
+        file_name: str,
+        sha1: str,
+        version: str,
+        at: str,
+        installed_file: str = "",
+        name: str = "",
+    ) -> None:
+        """File the download under ``key``.
+
+        ``installed_file`` is the jar this build is meant to replace, as the scanner saw it —
+        which means it already carries any renaming the admin did. ``name`` is the display name,
+        for the log. Both are needed by the install stage: without them it would know a file had
+        been fetched but not which mod it was for, and matching on names alone is how the wrong
+        jar gets replaced.
+        """
         self._records[key] = {
             "file": file_name,
             "sha1": (sha1 or "").lower(),
             "version": version or "",
             "at": at,
+            "local": installed_file or "",
+            "name": name or "",
         }
 
     def forget(self, key: str) -> None:
@@ -780,5 +804,7 @@ class Downloader:
             entry.download_sha1 or "",
             entry.latest_version or "",
             datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+            installed_file=entry.file_name,
+            name=entry.name,
         )
         self.ledger.save()

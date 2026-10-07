@@ -1160,19 +1160,23 @@ def test_every_help_row_is_clickable_and_describes_its_command():
     assert descriptions, "the help rows have no descriptions"
 
 
-def test_the_list_row_suggests_rather_than_runs():
-    """``list`` works bare, but its useful form takes a status filter.
+def test_only_the_row_that_needs_an_argument_suggests_instead_of_running():
+    """Help rows run, except where the command is useless without an argument.
 
-    Running it unfiltered the moment it is clicked would answer a question the admin did not
-    ask; filling the input box lets them add the status.
+    ``list`` runs: it is a read-only listing and the useful thing to see. ``info`` does not —
+    it needs a mod, so clicking it fills the input box rather than firing an error, which is
+    what makes the number in the listing worth copying.
     """
     segments = list(_segments(_render_help("!!muc")[0]))
-    row = next(
-        item for item in segments
-        if item.get("text") == "!!muc list"
-    )
-    assert row["clickEvent"]["action"] == "suggest_command"
-    assert row["clickEvent"]["value"].endswith(" "), "the suggestion should be ready for an argument"
+    rows = {
+        item["text"]: item
+        for item in segments
+        if item.get("text", "").startswith("!!muc ") and "clickEvent" in item
+    }
+
+    assert rows["!!muc list"]["clickEvent"]["action"] == "run_command"
+    assert rows["!!muc info"]["clickEvent"]["action"] == "suggest_command"
+    assert rows["!!muc info"]["clickEvent"]["value"].endswith(" ")
 
 
 def _segments(node):
