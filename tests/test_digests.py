@@ -1,12 +1,15 @@
 """How a jar's identity is computed.
 
-One pass hashes the file once and produces everything a lookup needs. That "one pass" is the
-property worth testing: the obvious implementation reads the file once per digest, which on a
-300 MB modpack means reading 600 MB per check — on a path that runs while MCDR is loading
-plugins, so it would show up as a slow server start.
+One pass reads the file once and produces the digest a lookup needs plus the size. That "one
+pass" is the property worth testing: the obvious implementation reads the file once per
+digest, and this runs over every jar in the folder.
 
-The digests themselves are checked against ``hashlib`` applied to the whole buffer, so a
-streaming bug (a dropped final block, an off-by-one in the chunk loop) cannot pass.
+There used to be a second digest here — a SHA-512 nothing consumed. It is gone, and the test
+that would have kept it honest is gone with it: a number no caller reads cannot be verified by
+asserting it equals ``hashlib``, only by asserting nobody computes it.
+
+The digest itself is checked against ``hashlib`` applied to the whole buffer, so a streaming
+bug (a dropped final block, an off-by-one in the chunk loop) cannot pass.
 """
 
 import hashlib
@@ -47,10 +50,9 @@ def test_digests_match_hashlib_on_the_whole_buffer(tmp_path, payload):
     path = tmp_path / "payload.bin"
     path.write_bytes(payload)
 
-    sha1, sha512, size = _digests_of(path)
+    sha1, size = _digests_of(path)
 
     assert sha1 == hashlib.sha1(payload).hexdigest()
-    assert sha512 == hashlib.sha512(payload).hexdigest()
     assert size == len(payload)
 
 
@@ -58,11 +60,10 @@ def test_an_empty_file_is_a_valid_input(tmp_path):
     path = tmp_path / "empty.jar"
     path.write_bytes(b"")
 
-    sha1, sha512, size = _digests_of(path)
+    sha1, size = _digests_of(path)
 
     assert size == 0
     assert sha1 == hashlib.sha1(b"").hexdigest()
-    assert sha512 == hashlib.sha512(b"").hexdigest()
 
 
 def test_the_read_is_bounded_by_the_chunk_size(tmp_path):
@@ -87,7 +88,7 @@ def test_the_read_is_bounded_by_the_chunk_size(tmp_path):
             return self._handle.read(size)
 
     with open(path, "rb") as handle:
-        sha1, _sha512, size = digests_of_file(Watched(handle))
+        sha1, size = digests_of_file(Watched(handle))
 
     assert size == len(payload)
     assert sha1 == hashlib.sha1(payload).hexdigest()
@@ -101,20 +102,18 @@ def test_a_modpack_scale_file_still_hashes_correctly(tmp_path):
     path = tmp_path / "large.jar"
     path.write_bytes(payload)
 
-    sha1, sha512, size = _digests_of(path)
+    sha1, size = _digests_of(path)
 
     assert size == len(payload)
     assert sha1 == hashlib.sha1(payload).hexdigest()
-    assert sha512 == hashlib.sha512(payload).hexdigest()
 
 
-def test_the_digests_are_lowercase_hex_of_the_expected_length(tmp_path):
-    """The lookup sends these as-is, so the shape matters as much as the value."""
+def test_the_digest_is_lowercase_hex_of_the_expected_length(tmp_path):
+    """The lookup sends this as-is, so the shape matters as much as the value."""
     path = tmp_path / "shape.jar"
     path.write_bytes(b"some jar bytes")
 
-    sha1, sha512, size = _digests_of(path)
+    sha1, size = _digests_of(path)
 
     assert len(sha1) == 40 and sha1 == sha1.lower()
-    assert len(sha512) == 128 and sha512 == sha512.lower()
     assert size == len(b"some jar bytes")

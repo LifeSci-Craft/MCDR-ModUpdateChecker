@@ -82,7 +82,7 @@ Fabric 服务端**没有任何原生手段**能发现 Mod 过期。加载器只�
 加一个 `help` 就是帮助页——**每一行都可以直接点击**：
 
 ```
-===============  Mod Update Checker v1.1.0  ===============
+===============  Mod Update Checker v1.1.1  ===============
 用法：!!muc <子命令>（!!modupdate 亦可）
 以上命令均需 MCDR 权限等级 3（与游戏内是否为 OP 无关）
 !!muc              -- 查看上次检查的汇总
@@ -110,7 +110,7 @@ Fabric 服务端**没有任何原生手段**能发现 Mod 过期。加载器只�
 | `!!modupdate download <编号>` | 从 Modrinth 下载这一个 Mod 的新版本（见下） |
 | `!!modupdate install <编号>` | 安排下次关服时把它装进 `mods/`（见下） |
 | `!!modupdate confirm` | 确认上一条 `download` / `install` |
-| `!!modupdate status` | 显示识别到的服务端版本、加载器、上游开关、上次检查时间、已排除的 Mod |
+| `!!modupdate status` | 显示识别到的服务端版本、加载器、上游开关、本地映射表、上次检查时间、已排除的 Mod |
 | `!!modupdate reload` | 重载配置文件 |
 | `!!modupdate help` | 帮助页（每行可点击） |
 

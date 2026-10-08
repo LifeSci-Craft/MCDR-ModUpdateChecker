@@ -17,7 +17,7 @@ python -m pip install --target .testlibs -r tests/requirements-test.txt
 ## 跑测试
 
 ```bash
-PYTHONPATH=.testlibs python -m pytest          # 全量（582 项，约 4 分钟，含端到端）
+PYTHONPATH=.testlibs python -m pytest          # 全量（590 项，约 4 分钟，含端到端）
 PYTHONPATH=.testlibs python -m pytest -m "not e2e"   # 跳过端到端，约 1.5 分钟
 ```
 
@@ -32,7 +32,7 @@ PYTHONPATH=.testlibs python -m pytest -m "not e2e"   # 跳过端到端，约 1.5
 | 文件 | 覆盖 |
 |---|---|
 | `test_versioning.py` | 版本比较（数值比较、预发布、`+build`、`1.19.2-0.5.3`）、MC 版本范围匹配（`>=1.21 <1.22`、`~`、`^`、通配、区间、OR 列表），以及「垃圾输入不抛异常」 |
-| `test_digests.py` | 单次遍历算出的 SHA-1 / SHA-512 / 大小；对整块缓冲区用 `hashlib` 交叉验证，并有一条断言证明内存不随文件大小增长 |
+| `test_digests.py` | 单次遍历算出的 SHA-1 与大小；对整块缓冲区用 `hashlib` 交叉验证，并有一条断言证明内存不随文件大小增长 |
 | `test_scanner.py` | 真 jar 的元数据解析（fabric / quilt / forge / neoforge 四种格式）、宽容 JSON、无法读取的文件降级、重复 mod id、仅客户端 Mod、**必装依赖的收集与「缺失」判定**（平台 id 剔除、`provides` 认可、`recommends` 忽略、`mandatory = false` 忽略） |
 | `test_serverinfo.py` | MC 版本与加载器的推断顺序：配置覆盖 → MCDR ServerInformation → 日志 → Mod 元数据投票 |
 | `test_clients.py` | Modrinth 客户端的协议形状：批量哈希、**空过滤数组不发送**、chunk 分段、429/5xx 重试、401/403 与 404 处理 |

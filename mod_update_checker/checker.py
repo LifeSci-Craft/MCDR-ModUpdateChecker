@@ -399,39 +399,60 @@ class Checker:
             if version is not None:
                 local[mod.file_name] = (mod, version)
 
-        # 1b. The newest build matching loader (+ game version) for those same files.
+        # 1b and 1c. Both need nothing but the identities from 1a, and neither needs the
+        #     other, so they share one round trip instead of queueing behind each other.
         #
-        # A failure here is tracked separately from "the answer was empty", and that
-        # distinction is load-bearing. If the batched call fails, every hash is absent from
-        # the result, and treating absence as an answer would make the plugin state, about
-        # every single mod, that its project publishes no build for this loader. That is a
-        # confident false claim produced by a transient 503.
+        #     A failure in 1b is tracked separately from "the answer was empty", and that
+        #     distinction is load-bearing. If the batched call fails, every hash is absent from
+        #     the result, and treating absence as an answer would make the plugin state, about
+        #     every single mod, that its project publishes no build for this loader. That is a
+        #     confident false claim produced by a transient 503. 1c has no such trap — an empty
+        #     title map just means the report shows file names instead of pretty ones — but it
+        #     is fetched on the same round trip because there is no reason to pay for two.
+        #
+        #     The two failures are collected as values rather than appended to the report from
+        #     inside the workers: two threads appending to one list would be a race on ordering
+        #     that the report's own tests could not see.
         latest_by_hash: Dict[str, ModrinthVersion] = {}
+        projects: Dict[str, ModrinthProject] = {}
         latest_failed = False
         if local:
             game_versions = [server.mc_version] if server.mc_version else []
-            try:
-                latest_by_hash = self._modrinth.latest_from_hashes(
-                    [mod.sha1 for mod, _ in local.values()],
-                    loaders=[self.options.loader],
-                    game_versions=game_versions,
-                )
-            except UpstreamError as error:
-                latest_failed = True
-                report.upstream_notes.append(
-                    ("note.modrinth_unavailable", {"error": str(error)})
-                )
+            modrinth = self._modrinth
 
-        # 1c. Titles for the project pages.
-        project_ids = [version.project_id for _, version in local.values()]
-        projects: Dict[str, ModrinthProject] = {}
-        if project_ids:
-            try:
-                projects = self._modrinth.projects(project_ids)
-            except UpstreamError as error:
-                report.upstream_notes.append(
-                    ("note.modrinth_unavailable", {"error": str(error)})
-                )
+            def ask_for_latest() -> Any:
+                try:
+                    return (
+                        modrinth.latest_from_hashes(
+                            [mod.sha1 for mod, _ in local.values()],
+                            loaders=[self.options.loader],
+                            game_versions=game_versions,
+                        ),
+                        None,
+                    )
+                except UpstreamError as error:
+                    return {}, error
+
+            def ask_for_projects() -> Any:
+                try:
+                    return modrinth.projects(
+                        [version.project_id for _, version in local.values()]
+                    ), None
+                except UpstreamError as error:
+                    return {}, error
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                latest_job = pool.submit(ask_for_latest)
+                projects_job = pool.submit(ask_for_projects)
+                latest_by_hash, latest_error = latest_job.result()
+                projects, projects_error = projects_job.result()
+
+            latest_failed = latest_error is not None
+            for error in (latest_error, projects_error):
+                if error is not None:
+                    report.upstream_notes.append(
+                        ("note.modrinth_unavailable", {"error": str(error)})
+                    )
 
         # 1d. A hash absent from step 1b means the project publishes nothing for this
         #     loader/game-version pair, but the endpoint cannot say which of the two is
