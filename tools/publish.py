@@ -193,6 +193,35 @@ def run_with_token(token: str, args: list, timeout: int = 120) -> subprocess.Com
     )
 
 
+#: GitHub's own words for "this ref is behind the remote". The only refusal the advice about
+#: reconciling histories is correct for — matched on these rather than on the bare word
+#: ``rejected``, which appears in *every* refusal GitHub issues. Keying on it meant a token
+#: missing the ``workflow`` scope printed "the remote already has commits this repository does
+#: not", sending the reader to hunt for a divergence that was not there.
+_STALE_REF_MARKERS = ("non-fast-forward", "fetch first", "behind its remote counterpart")
+
+
+def _push_hint(message: str) -> str:
+    """The advice worth printing for a rejected push, or ``""`` when it is not a known case."""
+    if any(marker in message for marker in _STALE_REF_MARKERS):
+        return (
+            "\n  The remote already has commits this repository does not. Nothing was "
+            "overwritten.\n  Either push to a new branch, or reconcile the histories "
+            "deliberately — do not force-push."
+        )
+    # Told apart from the above because the remedy is unrelated and the refusal does not name
+    # it: GitHub's message quotes the *file* it refused, never the scope that is missing.
+    if "workflow" in message and "scope" in message:
+        return (
+            "\n  A token needs the `workflow` scope to push a branch that creates or updates a "
+            "file under `.github/workflows/`,\n  and this one does not have it. Nothing was "
+            "pushed, so the branch state on the remote is untouched.\n"
+            "  Add that scope to the token — editing a classic token's scopes does not change "
+            "the token itself — then wait a\n  minute for it to take effect and push again."
+        )
+    return ""
+
+
 def push_with_token(token: str, ref: str, ref_prefix: str = "refs/heads/") -> None:
     """Push ``HEAD`` to one ref on ``origin``, explaining a rejection in plain words.
 
@@ -202,14 +231,7 @@ def push_with_token(token: str, ref: str, ref_prefix: str = "refs/heads/") -> No
     result = run_with_token(token, ["push", "--quiet", "origin", "HEAD:{}".format(ref_prefix + ref)])
     if result.returncode != 0:
         message = ((result.stderr or "") + (result.stdout or "")).replace(token, "***")
-        hint = ""
-        if "non-fast-forward" in message or "rejected" in message:
-            hint = (
-                "\n  The remote already has commits this repository does not. Nothing was "
-                "overwritten.\n  Either push to a new branch, or reconcile the histories "
-                "deliberately — do not force-push."
-            )
-        raise Failure("push rejected:\n{}{}".format(message.strip(), hint))
+        raise Failure("push rejected:\n{}{}".format(message.strip(), _push_hint(message)))
 
 
 def assert_no_token_in_config(token: str) -> None:
