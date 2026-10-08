@@ -64,11 +64,15 @@ from .report import (
     STATUS_UP_TO_DATE,
     STATUS_UPDATE_AVAILABLE,
     Report,
+    SummarySection,
     UpdateEntry,
+    action_row,
     entry_detail_rows,
     render_full,
     render_index,
+    render_index_row,
     render_summary,
+    summarise,
 )
 from .upstream import HttpClient
 from .projectmap import MAP_FILE_NAME, ProjectMap, resolve_map_file
@@ -874,15 +878,16 @@ def _notify(
     if report.actionable_count or announce_clean:
         # Plain strings, not RText: MCDR's log formatter runs the message through ``str()``
         # and ``RTextBase.__str__`` returns plain text, so colour logged here would be
-        # silently discarded. See ``_coloured_line`` — colour is applied on the reply path,
-        # which is the one that actually renders it.
+        # silently discarded. So is every click: the log line is text. The screens in
+        # ``_reply_summary`` are where the colour and the buttons are, because that is the
+        # path that actually renders them.
         for line in lines:
             server.logger.info(line)
     else:
         server.logger.info(tr("check.finished_clean"))
 
     if source is not None:
-        _reply_lines(source, lines)
+        _reply_summary(source, report)
 
     if broadcast and _config.report.in_game and report.has_updates:
         _notify_in_game(server, report)
@@ -1268,28 +1273,56 @@ def _format_size(count: int) -> str:
     return "{} B".format(count)
 
 
-def _coloured_line(line: str) -> RText:
-    """Colour a summary line for a command *reply*.
+# --------------------------------------------------------------------------------------
+# In-game screens
+#
+# Every command that prints more than a sentence opens with the same title bar and then draws
+# its own body, so the six of them read as one plugin's output rather than six. The colour
+# vocabulary is the same on every screen, and small enough to hold in the head:
+#
+#   gold    the title bar, and nothing else
+#   aqua    anything the reader can act on — a button, a command, a field's label
+#   white   content: a mod's name, a version, a section heading, a field's value
+#   yellow  a row that needs somebody to do something about it
+#   gray    the rest: a hint, a footnote, a row that needs nothing
+#
+# The rows used to be coloured by guessing from their text — ``"->" in line`` meant yellow —
+# which coloured a row by what it happened to contain rather than by what it meant, and made
+# the same mod a different colour on two different screens.
+# --------------------------------------------------------------------------------------
 
-    Only for ``source.reply``. MCDR does render an RText there — ``StdoutReplier.reply`` calls
-    ``to_colored_text()`` for the console, and a player receives it as a chat component.
 
-    The same RText must NOT be handed to ``server.logger.info``, which is why the console path
-    above logs plain strings on purpose. Logging an RText looks like it colours the output and
-    quietly does not, so the asymmetry is deliberate rather than an oversight.
+def _title(source: CommandSource, server: Optional[PluginServerInterface] = None) -> None:
+    """Open a screen. Every screen starts here, which is what makes them look alike."""
+    source.reply(_title_line(server or _server))
+
+
+def _context_field(report: Report) -> RTextList:
+    """``服务端: 26.3 / Fabric（版本来源：server_info）`` — the line under the title bar.
+
+    Built from the same two catalogue entries the status screen uses, so the screens that show
+    it cannot drift apart. The log keeps its own form (``report.header``, prefixed with the
+    plugin's badge) because a log line has to name the plugin while a screen already has the
+    title bar for that.
     """
-    if "->" in line:
-        colour = RColor.yellow
-    elif line.startswith("  "):
-        colour = RColor.gray
-    else:
-        colour = RColor.white
-    return RText(line, colour)
+    server = report.server
+    return _field(
+        tr("command.status.server_label"),
+        tr("command.status.server", version=server.mc_version or "?",
+           loader=server.loader, source=server.mc_version_source),
+        RColor.white,
+    )
+
+
+def _row_colour(entry: UpdateEntry) -> Any:
+    """Yellow while this row needs somebody; gray once it does not."""
+    return RColor.yellow if entry.actionable else RColor.gray
 
 
 def _reply_lines(source: CommandSource, lines) -> None:
+    """One grey line per message — for a screen's closing lines, which are never the point."""
     for line in lines:
-        source.reply(_coloured_line(line))
+        source.reply(RText(line, RColor.gray))
 
 
 def _detail_link(command: str) -> RText:
@@ -1304,6 +1337,22 @@ def _detail_link(command: str) -> RText:
     )
 
 
+def _entry_row(number: Optional[int], entry: UpdateEntry, prefix: str,
+               verbose: bool = True) -> RTextList:
+    """One mod as a clickable row: the text, then the button that opens its detail.
+
+    Shared by the listing and the summary so a row looks and behaves the same on both, and so
+    the button always carries the number the command takes. A row with no number — impossible
+    for a real report, but the summary indexes by identity — simply has no button.
+    """
+    row = RTextList(RText(render_index_row(number, entry, tr, verbose=verbose),
+                          _row_colour(entry)))
+    if number is not None:
+        row.append(RText("  "))
+        row.append(_detail_link("{} info {}".format(prefix, number)))
+    return row
+
+
 def _reply_index(
     source: CommandSource, report: Report, entries=None, prefix: str = ROOT_LITERALS[0]
 ) -> None:
@@ -1313,72 +1362,69 @@ def _reply_index(
     Keeping the two apart is what stops the chat reply from being the place where the page
     budget is computed — which it was, briefly, and it came out two lines too long.
     """
-    head, rows, tail = render_index(report, tr, entries=entries, budget=CHAT_PAGE_LINES)
-    source.reply(_coloured_line(head))
-    for number, _entry, text in rows:
-        source.reply(
-            RTextList(
-                _coloured_line("  " + text),
-                RText("  "),
-                _detail_link("{} info {}".format(prefix, number)),
-            )
-        )
-    for line in tail:
-        source.reply(_coloured_line(line))
+    rows, tail = render_index(report, tr, entries=entries, budget=CHAT_PAGE_LINES)
+    _title(source)
+    source.reply(_context_field(report))
+    for number, entry, _text in rows:
+        source.reply(_entry_row(number, entry, prefix))
+    _reply_lines(source, tail)
 
 
-def _action_link(label_key: str, command: str) -> RText:
-    """A clickable label that runs ``command``."""
-    return RText(tr(label_key), RColor.green).set_click_event(RAction.run_command, command)
+def _reply_summary(source: CommandSource, report: Report,
+                   prefix: str = ROOT_LITERALS[0]) -> None:
+    """The summary as a screen: the same sections the log gets, with clickable rows.
 
+    Sections, headings, truncation and the "and N more" arithmetic all come from
+    :func:`report.summarise`, which is also what builds the log form — so the two can disagree
+    about colour and about links, which is the point, but not about what happened.
 
-def _action_rows(entry: UpdateEntry, prefix: str) -> List[RText]:
-    """The one action this mod can be given right now, as a clickable label.
-
-    Only the detail view offers it: in the listing, an action per row would have to carry its
-    number through the click anyway, and one link per row is the rule that keeps a listing
-    scannable. Here exactly one mod is on screen, so the row already knows which mod it is —
-    which is the whole reason the commands take a number at all.
-
-    ``update_available`` offers the fetch and ``awaiting_install`` offers the install, never
-    both: the second is what the first produces, and offering a step the mod is not ready for
-    is how a command comes to answer with an error.
+    The project url is not repeated here, and that is deliberate. In the chat it wrapped every
+    row onto a second line and could not be clicked; the reading it was meant to serve is one
+    button away, which is also where the number the next command needs is. The url is still in
+    the log line and in ``last_report.json``, which is where something that fetches files
+    automatically would look for it.
     """
-    report = _last_report
-    if report is None:
-        return []
-    number = _number_of(report, entry)
-    if number is None:
-        return []
-    if entry.status == STATUS_UPDATE_AVAILABLE and entry.download_url and entry.download_sha1:
-        return [_action_link("command.detail.download",
-                             "{} download {}".format(prefix, number))]
-    if entry.status == STATUS_AWAITING_INSTALL:
-        return [_action_link("command.detail.install",
-                             "{} install {}".format(prefix, number))]
-    return []
+    _context, blocks, closing = summarise(report, tr)
+    numbers = {id(entry): number for number, entry in report.indexed_entries()}
+
+    _title(source)
+    source.reply(_context_field(report))
+    for block in blocks:
+        if isinstance(block, SummarySection):
+            source.reply(RText(block.heading, RColor.white))
+            for entry in block.entries:
+                source.reply(_entry_row(numbers.get(id(entry)), entry, prefix, verbose=False))
+            _reply_lines(source, block.trailing)
+        else:
+            source.reply(RText(block, RColor.gray))
+    _reply_lines(source, closing)
 
 
 def _reply_detail(
     source: CommandSource, entry: UpdateEntry, prefix: str = ROOT_LITERALS[0]
 ) -> None:
-    """One mod's detail: the version change, the links, its notes, and the action it affords.
+    """One mod's detail: its versions, its project page, the one action, and its notes.
 
-    Links are labels with an ``open_url`` click and the url on hover, not the url itself —
-    which is what lets a mod's detail afford two of them while a listing cannot afford one.
+    The rows come from ``report.entry_detail_rows``, which also decides where the action goes —
+    where the download link used to sit. This only turns a row into a reply: a url opens in the
+    browser, a command runs, and everything else is text.
     """
-    for label, value, url in entry_detail_rows(entry, tr):
-        if not label:
-            source.reply(RText(value, RColor.white))
-            continue
-        rendered = (
-            RText(value, RColor.aqua).set_click_event(RAction.open_url, url).set_hover_text(url)
-            if url
-            else RText(value, RColor.green)
-        )
-        source.reply(RTextList(RText(label, RColor.gray), rendered))
-    for link in _action_rows(entry, prefix):
-        source.reply(link)
+    report = _last_report
+    number = _number_of(report, entry) if report is not None else None
+    action = action_row(entry, number, prefix, tr)
+
+    _title(source)
+    for row in entry_detail_rows(entry, tr, action=action):
+        if row.url:
+            value = (RText(row.value, RColor.aqua)
+                     .set_click_event(RAction.open_url, row.url)
+                     .set_hover_text(row.url))
+        elif row.command:
+            value = (RText(row.value, RColor.aqua)
+                     .set_click_event(RAction.run_command, row.command))
+        else:
+            value = RText(row.value, RColor.white)
+        source.reply(RTextList(RText(row.label, RColor.aqua), value) if row.label else value)
 
 
 def _notification_lines(report: Report) -> List[str]:
@@ -1659,7 +1705,7 @@ def _show_summary(source: CommandSource) -> None:
     if _last_report is None:
         source.reply(tr("command.no_report_yet"))
         return
-    _reply_lines(source, render_summary(_last_report, tr))
+    _reply_summary(source, _last_report)
 
 
 def _show_list(source: CommandSource, prefix: str = ROOT_LITERALS[0]) -> None:
@@ -2056,15 +2102,15 @@ def _reply_to(source: CommandSource, message: str) -> None:
             server.logger.debug("could not reply to {}: {}".format(source, error))
 
 
-def _field(label: str, value: str, value_colour: Any = RColor.green) -> RTextList:
+def _field(label: str, value: str, value_colour: Any = RColor.white) -> RTextList:
     """``Label: value`` with the label in aqua.
 
     The trailing ``: `` is part of the translated label rather than added here, so the
     punctuation is translatable and the two languages can disagree about it.
 
-    Shared with the help page's ``command -- description`` rows so the two screens look like
-    they come from the same plugin: aqua is always the thing you act on (a command, a label),
-    white or green is the content, gray is an aside.
+    Shared with the help page's ``command -- description`` rows so the screens look like they
+    come from the same plugin: aqua is always the thing you act on (a command, a button, a
+    label), white is the content, gray is an aside.
     """
     return RTextList(RText(label, RColor.aqua), RText(value, value_colour))
 

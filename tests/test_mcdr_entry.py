@@ -1120,36 +1120,46 @@ def test_config_round_trips_through_json():
     assert restored.command_permission_level == config.command_permission_level
 
 
-def test_coloured_lines_are_only_used_where_colour_survives():
+def test_colour_survives_the_reply_path_and_only_there():
     """The colour paths differ, and mixing them up loses the colour silently.
 
-    ``source.reply`` renders an RText (MCDR's ``StdoutReplier`` calls ``to_colored_text``, a
-    player gets a chat component), while ``server.logger.info`` runs the message through
-    ``str()`` — and ``RTextBase.__str__`` returns plain text. So a line built for a reply must
-    still stringify back to exactly the original text, or logging it would be lossy.
+    ``source.reply`` renders an RText (MCDR's ``StdoutReplier`` calls ``to_colored_text``, and
+    a player receives a chat component), while ``server.logger.info`` runs the message through
+    ``str()`` — and ``RTextBase.__str__`` returns plain text. So a screen is built from RText
+    and the log is built from strings, and this is what keeps the two apart: the same screen
+    text stringifies back to exactly itself, and is coloured only when it is rendered.
 
     Empirically checked against the installed MCDR: ``str(RText('hello', RColor.yellow))`` is
     ``'hello'`` with no ANSI escape in it.
     """
     import mod_update_checker as plugin
+    from mod_update_checker.report import UpdateEntry
 
-    update_line = "Alpha  1.0.0 -> 1.1.0"
-    coloured = plugin._coloured_line(update_line)
+    title = plugin._title_line(None)
+    assert "\x1b[" not in str(title)                 # nothing depends on ANSI surviving
+    assert "\x1b[" in title.to_colored_text()        # but the reply path does colour it
+    assert str(title).startswith("=") and "Mod Update Checker" in str(title)
 
-    assert str(coloured) == update_line
-    assert "\x1b[" not in str(coloured)              # nothing depends on ANSI surviving
-    assert "\x1b[" in coloured.to_colored_text()     # but the reply path does colour it
-
-    header = plugin._coloured_line("Mod update check — server 26.3")
-    assert str(header) == "Mod update check — server 26.3"
-    # A header and an update line must not end up the same colour.
-    assert coloured.to_colored_text() != header.to_colored_text()
+    # A row is coloured by what it *means*, not by what it contains. The heuristic this
+    # replaced read ``"->" in line``, which coloured by coincidence of text and made the same
+    # mod one colour in the listing and another in the summary.
+    needs_work = UpdateEntry(mod_id="a", name="A -> B", file_name="a.jar",
+                             status=plugin.STATUS_UP_TO_DATE)
+    done = UpdateEntry(mod_id="b", name="B", file_name="b.jar",
+                       status=plugin.STATUS_UPDATE_AVAILABLE)
+    assert plugin._row_colour(needs_work) != plugin._row_colour(done)
+    assert plugin._row_colour(done) == plugin.RColor.yellow
 
 
 def test_the_console_path_logs_plain_strings():
-    """Guards the asymmetry: passing RText to the logger is a silent no-op for colour."""
+    """Guards the asymmetry: passing RText to the logger is a silent no-op for colour.
+
+    Also for the buttons: a click event logged to the console is a click event nobody can use,
+    and the text it decorates arrives as its bare label.
+    """
     import ast
 
+    rtext_builders = {"_title_line", "_entry_row", "_field", "RText", "RTextList"}
     tree = ast.parse(_entry_source())
     notify = next(
         node for node in ast.walk(tree)
@@ -1166,8 +1176,8 @@ def test_the_console_path_logs_plain_strings():
         assert call.args, "logger.info called with no message"
         argument = call.args[0]
         assert not isinstance(argument, ast.Call) or not (
-            isinstance(argument.func, ast.Name) and argument.func.id == "_coloured_line"
-        ), "an RText line is being logged, where the colour would be dropped"
+            isinstance(argument.func, ast.Name) and argument.func.id in rtext_builders
+        ), "an RText line is being logged, where the colour and the buttons would be dropped"
 
 
 # --------------------------------------------------------------------------------------
@@ -1397,6 +1407,109 @@ def test_the_status_screen_uses_the_same_title_bar_as_the_help(tmp_path):
     ]
     assert bars, "the status screen has no title bar"
     assert bars[0]["text"].strip("=") == "", bars[0]
+
+
+def _one_screen_setup(tmp_path, monkeypatch, entries):
+    """The plugin wired to a fake server with a report, for driving one screen at a time."""
+    import mod_update_checker as plugin
+    from mod_update_checker.serverinfo import ServerContext
+
+    class _Scan:
+        directory = "server/mods"
+        mods = []
+        disabled = []
+
+    server = _FakeServer(tmp_path)
+    monkeypatch.setattr(plugin, "_server", server, raising=False)
+    monkeypatch.setattr(plugin, "_last_report", _report_with(entries), raising=False)
+    monkeypatch.setattr(plugin, "_config", _config_with({"language": "zh_cn"}), raising=False)
+    monkeypatch.setattr(
+        plugin, "_scan_current",
+        lambda *_a, **_k: (
+            _Scan(),
+            ServerContext(mc_version="26.3", mc_version_source="config", loader="fabric"),
+        ),
+        raising=False,
+    )
+    plugin._apply_language(server, plugin._config)
+    return plugin, server
+
+
+def _entry_for_screens():
+    """One mod with everything a screen can show: a version change, a page and an action."""
+    from mod_update_checker.report import UpdateEntry
+
+    entry = UpdateEntry(
+        mod_id="alpha", name="Alpha", file_name="alpha.jar",
+        local_version="1.0.0", latest_version="1.1.0", status="update_available",
+    )
+    entry.project_url = "https://modrinth.com/mod/alpha"
+    entry.download_url = "https://cdn.example/alpha-1.1.0.jar"
+    entry.download_sha1 = "a" * 40
+    return entry
+
+
+def test_every_screen_opens_with_the_same_title_bar(tmp_path, monkeypatch):
+    """One bar, five screens.
+
+    They used to disagree: ``help`` and ``status`` drew a gold bar, the listing and the summary
+    opened with the plugin's badge line, and a mod's detail had no header at all. A reader who
+    has to recognise the layout afresh on every command is reading the layout instead of the
+    answer — and this is asserted on the segments that actually go to the client, so a screen
+    that quietly drops the bar fails rather than looking merely inconsistent.
+    """
+    entry = _entry_for_screens()
+    plugin, _server = _one_screen_setup(tmp_path, monkeypatch, [entry])
+    report = plugin._last_report
+
+    screens = {
+        "summary": lambda source: plugin._reply_summary(source, report),
+        "list": lambda source: plugin._reply_index(source, report),
+        "info": lambda source: plugin._reply_detail(source, entry),
+        "status": plugin._show_status,
+        "help": plugin._show_help,
+    }
+
+    bars = {}
+    for name, call in screens.items():
+        source = _ReplyRecorder()
+        call(source)
+        assert source.replies, "{} replied with nothing".format(name)
+        gold = [item["text"] for item in _segments(source.replies[0])
+                if item.get("color") == "gold"]
+        assert gold, "{} does not open with the title bar".format(name)
+        bars[name] = gold
+
+    assert len({tuple(value) for value in bars.values()}) == 1, bars
+
+
+def test_the_chat_summary_offers_a_button_where_the_log_offers_a_url(tmp_path, monkeypatch):
+    """The url belongs in the log, the button in the chat — and both read the same sections.
+
+    A raw url in a chat line wraps onto a second row on any real mod, and cannot be clicked
+    from inside the game at all. The log keeps it: a log line cannot be clicked either, so
+    there the url is the only way through, and it can at least be copied.
+    """
+    entry = _entry_for_screens()
+    plugin, _server = _one_screen_setup(tmp_path, monkeypatch, [entry])
+    report = plugin._last_report
+
+    source = _ReplyRecorder()
+    plugin._reply_summary(source, report)
+    segments = [item for reply in source.replies for item in _segments(reply)]
+
+    body = "\n".join(str(reply) for reply in source.replies)
+    assert entry.project_url not in body
+    assert "cdn.example" not in body
+
+    clicks = [item.get("clickEvent", {}).get("value") for item in segments]
+    assert "!!modupdate info 1" in clicks, clicks
+
+    # And the log form really does still carry it, so the two are not the same screen twice.
+    from mod_update_checker.i18n import make_translator
+    from mod_update_checker.report import render_summary
+
+    assert entry.project_url in "\n".join(render_summary(report, make_translator("zh_cn")))
 
 
 # --------------------------------------------------------------------------------------

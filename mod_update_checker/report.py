@@ -24,10 +24,11 @@ goes through the plugin's translation catalogue.
 
 import json
 import re
+import unicodedata
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple
 
 from .serverinfo import ServerContext
 
@@ -51,16 +52,19 @@ __all__ = [
     "MATCHED_BY_MANUAL",
     "MATCHED_BY_NOTEWORTHY",
     "normalise_name",
+    "display_width",
     "UpdateEntry",
     "Report",
+    "DetailRow",
+    "SummarySection",
+    "summarise",
     "render_summary",
     "render_full",
     "render_entry_lines",
     "render_index_row",
     "render_index",
-    "render_index_body",
     "render_tally",
-    "render_detail",
+    "action_row",
     "entry_detail_rows",
     "index_selection",
     "CHAT_PAGE_LINES",
@@ -174,12 +178,20 @@ _LINK_GAP = "  "
 #: to this, and what does not fit is one command away rather than lost.
 CHAT_PAGE_LINES = 18
 
-#: One row of a mod's detail view: ``(label, value, url)``.
-#:
-#: ``label`` is empty for the heading row, and ``url`` is empty for anything that is not a
-#: link. The three parts are separate so the chat renderer can lay out a labelled field and
-#: turn the value into a clickable link, while the console renderer just joins them.
-DetailRow = Tuple[str, str, str]
+class DetailRow(NamedTuple):
+    """One row of a mod's detail view.
+
+    ``label`` is empty for the heading row. At most one of ``url`` and ``command`` is set: a
+    ``url`` opens in the browser, a ``command`` runs when the value is clicked, and both are
+    empty for a row that is only text. Keeping the click target beside the value rather than
+    inside it is what lets one row list feed both renderers — the chat one makes the value
+    clickable, the plain one just joins label and value.
+    """
+
+    label: str
+    value: str
+    url: str = ""
+    command: str = ""
 
 Translator = Callable[..., str]
 
@@ -737,6 +749,25 @@ def _entry_parts(entry: UpdateEntry, tr: Translator, verbose: bool) -> Tuple[str
     return description, link
 
 
+def display_width(text: str) -> int:
+    """How many columns ``text`` takes in a fixed-width font.
+
+    ``len`` counts characters, but the game's font draws a Chinese character twice as wide as
+    an ``A`` — and every row this plugin prints ends in a Chinese status note, so a column
+    padded by character count was out by however many ideographs the note happened to contain.
+    On the shipped language that is every row, which is how the project links came out ragged.
+
+    East Asian Wide and Fullwidth count as two columns; everything else as one. Ambiguous-width
+    characters (``→``, ``±``) are counted as one, which is how the default font draws them.
+    """
+    return sum(2 if unicodedata.east_asian_width(char) in ("W", "F") else 1 for char in text)
+
+
+def _pad_to(text: str, width: int) -> str:
+    """``text`` followed by however many spaces bring it to ``width`` *columns*."""
+    return text + " " * max(0, width - display_width(text))
+
+
 def render_entry_lines(
     entries: Sequence[UpdateEntry], tr: Translator, verbose: bool = False
 ) -> List[str]:
@@ -747,11 +778,11 @@ def render_entry_lines(
     place on every row, which is exactly the ragged look a list of URLs produces.
     """
     parts = [_entry_parts(entry, tr, verbose) for entry in entries]
-    width = max((len(description) for description, link in parts if link), default=0)
+    width = max((display_width(description) for description, link in parts if link), default=0)
     lines: List[str] = []
     for description, link in parts:
         if link:
-            lines.append("  " + description.ljust(width) + _LINK_GAP + link)
+            lines.append("  " + _pad_to(description, width) + _LINK_GAP + link)
         else:
             lines.append("  " + description)
     return lines
@@ -778,51 +809,72 @@ def render_tally(report: Report, tr: Translator) -> str:
     )
 
 
-def render_summary(report: Report, tr: Translator, max_updates: int = 12) -> List[str]:
-    """The short form: what needs attention, plus a tally. Used for the console notification.
+@dataclass
+class SummarySection:
+    """One group of the summary, before it is laid out.
 
-    The two groups are kept apart rather than merged into one "has an update" list, because the
-    next action differs completely: one needs fetching (or could not be fetched), the other
-    needs copying into ``mods/``. A single list would leave an admin re-reading a mod they
-    fetched yesterday, wondering whether the download had worked.
+    ``trailing`` holds the lines that come after its rows: the "and N more" line first, when
+    the group was truncated, then whatever the group itself adds (which part is new, where the
+    fetched files went). Kept apart from the rows so a renderer that decorates rows — with a
+    number and a click — does not have to work out which lines those are by looking at them.
     """
-    lines: List[str] = []
-    lines.append(
-        tr("report.header", version=report.server.describe(), source=report.server.mc_version_source)
-    )
 
-    def section(entries, header_key, extra=None):
+    heading: str
+    entries: List[UpdateEntry]
+    trailing: List[str] = field(default_factory=list)
+
+
+def summarise(report: Report, tr: Translator, max_updates: int = 12):
+    """``(context, blocks, closing)`` — the summary, before it is laid out.
+
+    Split rather than returned as one list of strings so the two renderers can decorate the
+    rows differently without disagreeing about what the sections are: the console and the
+    report file want one block of text, and the in-game reply wants a clickable button on every
+    row. Both callers walk the same blocks in the same order, so the headings, their order and
+    the "and N more" arithmetic cannot drift apart.
+
+    A block is a :class:`SummarySection` or a plain line — the latter for the "nothing to do"
+    sentence, which belongs where it was written: above the blocked group, not after it.
+    """
+    context = tr("report.header", version=report.server.describe(),
+                 source=report.server.mc_version_source)
+    blocks: List[Any] = []
+
+    def add_section(entries, header_key, extra=None):
         if not entries:
             return
-        lines.append(tr(header_key, count=len(entries)))
-        lines.extend(render_entry_lines(entries[:max_updates], tr, verbose=False))
+        # Sorted exactly as the listing sorts them. The sections are cut out of the same set of
+        # entries the numbers come from, so a section left in the order the scan happened to
+        # produce printed its numbers out of order — ``[2]`` above ``[1]`` — and a reader who
+        # noticed would have no way to tell that from a bug in the numbering.
+        ordered = sorted(entries, key=lambda item: item.sort_key)
+        trailing: List[str] = []
         # Only when rows were actually held back. The full listing calls this with
         # ``max_updates=0`` on purpose, to get the headings without the rows — and the
         # "and N more" line then claimed N items had been shown and N were missing, right
         # above the section that lists all of them.
-        if max_updates and len(entries) > max_updates:
-            lines.append(tr("report.and_more", count=len(entries) - max_updates))
+        if max_updates and len(ordered) > max_updates:
+            trailing.append(tr("report.and_more", count=len(ordered) - max_updates))
         if extra:
-            lines.append(extra)
+            trailing.append(extra)
+        blocks.append(SummarySection(tr(header_key, count=len(ordered)),
+                                     ordered[:max_updates], trailing))
 
     updates = report.updates
     pending = report.awaiting_install
 
-    # Appended to the update section rather than placed above it, so "there are five" is read
-    # before "two of them are new" — the other order makes the second sentence look like a
-    # correction of the first.
-    section(
+    # The new-since line is appended to the update section rather than placed above it, so
+    # "there are five" is read before "two of them are new" — the other order makes the second
+    # sentence look like a correction of the first.
+    add_section(
         updates,
         "report.updates_found",
-        tr(
-            "report.new_since_last",
-            count=len(report.new_since_last),
-            names=", ".join(report.new_since_last[:6]),
-        )
+        tr("report.new_since_last", count=len(report.new_since_last),
+           names=", ".join(report.new_since_last[:6]))
         if report.new_since_last
         else None,
     )
-    section(
+    add_section(
         pending,
         "report.awaiting_install_found",
         tr("report.awaiting_install_hint", folder=report.download_folder)
@@ -830,16 +882,40 @@ def render_summary(report: Report, tr: Translator, max_updates: int = 12) -> Lis
         else None,
     )
     if not updates and not pending:
-        lines.append(tr("report.no_updates"))
+        blocks.append(tr("report.no_updates"))
 
-    section(report.blocked, "report.blocked_found")
+    add_section(report.blocked, "report.blocked_found")
 
-    lines.append(render_tally(report, tr))
-
+    closing = [render_tally(report, tr)]
     for key, args in report.upstream_notes:
-        lines.append(tr(key, **args))
+        closing.append(tr(key, **args))
     for key, args in report.advisories:
-        lines.append(tr(key, **args))
+        closing.append(tr(key, **args))
+    return context, blocks, closing
+
+
+def render_summary(report: Report, tr: Translator, max_updates: int = 12) -> List[str]:
+    """The short form as plain lines: what needs attention, plus a tally.
+
+    The two groups are kept apart rather than merged into one "has an update" list, because the
+    next action differs completely: one needs fetching (or could not be fetched), the other
+    needs copying into ``mods/``. A single list would leave an admin re-reading a mod they
+    fetched yesterday, wondering whether the download had worked.
+
+    This is the form the console log and the report file get, which is why a row still ends
+    with the project url: a log line cannot be clicked, so the url is the only way to reach the
+    page from there.
+    """
+    context, blocks, closing = summarise(report, tr, max_updates)
+    lines = [context]
+    for block in blocks:
+        if isinstance(block, SummarySection):
+            lines.append(block.heading)
+            lines.extend(render_entry_lines(block.entries, tr, verbose=False))
+            lines.extend(block.trailing)
+        else:
+            lines.append(block)
+    lines.extend(closing)
     return lines
 
 
@@ -877,22 +953,33 @@ def render_full(report: Report, tr: Translator) -> List[str]:
     return lines
 
 
-def render_index_row(number: int, entry: UpdateEntry, tr: Translator, width: int = 0) -> str:
-    """One row of the compact listing: ``[ 3] Sodium  1.0.0 -> 1.1.0  (可更新)``.
+def render_index_row(number: Optional[int], entry: UpdateEntry, tr: Translator,
+                     verbose: bool = True) -> str:
+    """One row of the compact listing: ``[3] Sodium  1.0.0 -> 1.1.0  (可更新)``.
 
     No links and no notes. That is the whole point: with a project page, a download url and two
     or three notes per mod, a seven-mod server already ran past a screenful, and the detail is
     worth reading for exactly one mod at a time — the one the reader is about to act on.
 
-    ``width`` is the number column's width, computed by the caller from the rows it is about to
-    print. A constant of two produced ``[ 1]`` for a five-mod server, where the padding is
-    simply a gap after the bracket; a constant of one would leave ``[1]`` and ``[10]`` out of
-    line the moment there is a tenth row. Neither constant can be right, because the answer
-    depends on the list — so the list is asked.
+    The number is printed as it is, with **no padding**. Two other answers were tried and both
+    were wrong, which is worth recording so a third attempt does not repeat them: a constant
+    width of two produced ``[ 1]`` on a five-mod server, where the extra character is simply a
+    gap after the bracket, and deriving the width from the largest number on the page still
+    padded every single-digit row on a twenty-mod server — the reader reported it twice. The
+    column is not aligned any more, and that is the deliberate trade: one stray space across
+    nineteen rows is worse than ``[9]`` and ``[10]`` starting a character apart.
+
+    ``number`` is ``None`` only for a caller that has an entry but no place in the listing. The
+    row is then printed without a handle rather than with a made-up one, because ``[0]`` is a
+    number that looks typeable and resolves to nothing.
+
+    ``verbose`` adds the status in parentheses, for a listing that mixes statuses. A summary
+    section does not pass it: the heading above the rows already says what the group means.
     """
-    label = "[{}]".format(str(number).rjust(width) if width else str(number))
-    description = _entry_parts(entry, tr, verbose=True)[0]
-    return "{} {}".format(label, description)
+    description = _entry_parts(entry, tr, verbose=verbose)[0]
+    if number is None:
+        return description
+    return "[{}] {}".format(number, description)
 
 
 def index_selection(indexed, row_budget: int):
@@ -920,20 +1007,22 @@ def index_selection(indexed, row_budget: int):
     return shown, len(indexed) - len(shown)
 
 
-#: Lines a listing spends on something other than a row: the header, the section title, the
-#: tally, the hint, and — only when something was left out — the "not shown" line. Reserved up
-#: front so the reply fits whether or not it ends up truncated.
+#: Lines a listing spends on something other than a row, reserved before the rows are chosen:
+#: the title bar, the server context, the section title, the tally, the hint, and — only when
+#: something was left out — the "not shown" line.
 #:
 #: The arithmetic lives here, with the listing, rather than at the call site. An earlier version
 #: kept it in the chat renderer and reserved three lines instead of five; the listing then came
 #: out two lines past the budget, which is exactly the failure this whole change exists to fix.
-_INDEX_FIXED_LINES = 5
+#: It went to six when every screen gained the title bar — the constant has to be raised by
+#: whatever the screen adds above the rows, or the budget silently stops being a budget.
+_INDEX_FIXED_LINES = 6
 
 
 def render_index(
     report: Report, tr: Translator, entries=None, budget: int = CHAT_PAGE_LINES
 ):
-    """``(head, rows, tail)`` for the numbered listing, capped to a page.
+    """``(rows, tail)`` for the numbered listing, capped to a page.
 
     Split rather than joined because the two callers need different things from the same rows:
     the chat renderer attaches a click to each one, the console and the tests do not. Both need
@@ -941,26 +1030,24 @@ def render_index(
     and the row carries its own number and entry, so a click cannot end up on a different mod
     than the text it was attached to.
 
+    The line above the rows is not returned: it is the server context, and each renderer draws
+    it in its own vocabulary — the screens use the same labelled field the status screen does.
+    The rows and the tail are the part that must not be computed twice.
+
     ``entries`` narrows the listing to a subset (the status filter) while keeping the numbers
     from the full list, so a number means one mod whichever command produced the row.
     """
-    head = tr("report.header", version=report.server.describe(),
-              source=report.server.mc_version_source)
-
     indexed = report.indexed_entries()
     if entries is not None:
         wanted = {id(entry) for entry in entries}
         indexed = [(number, entry) for number, entry in indexed if id(entry) in wanted]
 
     if not indexed:
-        return head, [], [tr("report.no_mods")]
+        return [], [tr("report.no_mods")]
 
     shown, omitted = index_selection(indexed, max(1, budget - _INDEX_FIXED_LINES))
-    # As wide as the largest number actually being printed, so a short list has no padding and
-    # a long one stays aligned. The rows are in ascending order, so the last one is the widest.
-    width = len(str(shown[-1][0])) if shown else 1
     rows = [
-        (number, entry, render_index_row(number, entry, tr, width))
+        (number, entry, render_index_row(number, entry, tr))
         for number, entry in shown
     ]
 
@@ -969,59 +1056,88 @@ def render_index(
         tail.append(tr("report.index_truncated", count=omitted))
     tail.append(render_tally(report, tr))
     tail.append(tr("report.index_hint"))
-    return head, rows, tail
+    return rows, tail
 
 
-def render_index_body(report: Report, tr: Translator, entries=None,
-                      budget: int = CHAT_PAGE_LINES) -> List[str]:
-    """The listing as plain lines, for the console and for anything counting its height."""
-    head, rows, tail = render_index(report, tr, entries=entries, budget=budget)
-    return [head] + ["  " + text for _number, _entry, text in rows] + tail
+def action_row(
+    entry: UpdateEntry, number: Optional[int], prefix: str, tr: Translator
+) -> Optional[DetailRow]:
+    """The one action this mod affords right now, as a clickable row, or ``None``.
 
+    ``update_available`` offers the fetch and ``awaiting_install`` offers the install, never
+    both: the second is what the first produces, and offering a step the mod is not ready for
+    is how a command comes to answer with an error. Anything else has nothing to offer, and a
+    button that would only produce an error is worse than no button.
 
-def entry_detail_rows(entry: UpdateEntry, tr: Translator) -> List[DetailRow]:
-    """``(label, value, url)`` rows for one mod's detail view.
-
-    This is where the links live, and they can afford to: a detail view is about a single mod,
-    so two urls cost nothing, and both are offered as clickable labels rather than as text to
-    be copied — which is what makes them usable in the game's chat box at all.
+    The command is spelled out rather than the number alone, so it can be typed by hand if the
+    chat log has scrolled past the row — and so ``prefix`` is the alias the reader actually
+    used. It lives here rather than beside the command tree because the decision it encodes is
+    about the *status*, and the statuses are defined in this module.
     """
-    rows: List[DetailRow] = [( "", entry.name, "")]
+    if number is None:
+        return None
+    if entry.status == STATUS_UPDATE_AVAILABLE and entry.download_url and entry.download_sha1:
+        return DetailRow(
+            tr("detail.action_label"),
+            tr("command.detail.download"),
+            "",
+            "{} download {}".format(prefix, number),
+        )
+    if entry.status == STATUS_AWAITING_INSTALL:
+        return DetailRow(
+            tr("detail.action_label"),
+            tr("command.detail.install"),
+            "",
+            "{} install {}".format(prefix, number),
+        )
+    return None
 
-    rows.append((tr("detail.status_label"), tr(_status_key(entry.status)), ""))
-    if entry.latest_version:
-        rows.append((tr("detail.version_label"),
-                     tr("detail.version", local=entry.local_version or "?",
-                        latest=entry.latest_version), ""))
+
+def entry_detail_rows(
+    entry: UpdateEntry, tr: Translator, action: Optional[DetailRow] = None
+) -> List[DetailRow]:
+    """One mod's detail view, row by row.
+
+    The project page is the only link left. There used to be a second one — a "click to
+    download" that opened the file's url in the browser — and it sat directly above the button
+    that asks the plugin to fetch the same file. Two ways to download, one of them bypassing
+    the hash check the plugin performs, and the reader has to decide between them every time.
+    The button stayed and the raw link went, taking the mod's ``download_url`` out of the chat
+    entirely: it is still in the JSON report for anything that wants to fetch a file itself.
+
+    ``action`` — built by :func:`action_row` — is placed where that link used to be, which is
+    the spot a reader already looks at for "how do I get this".
+
+    The notes are whole sentences, so they carry no label; every other row is ``label: value``.
+    """
+    rows: List[DetailRow] = [DetailRow("", entry.name)]
+
+    rows.append(DetailRow(tr("detail.status_label"), tr(_status_key(entry.status))))
+    if entry.latest_version and entry.latest_version != entry.local_version:
+        rows.append(DetailRow(tr("detail.version_label"),
+                              tr("detail.version", local=entry.local_version or "?",
+                                 latest=entry.latest_version)))
+    elif entry.latest_version:
+        # One version, no arrow. An arrow needs two different ends, and "1.0.0 -> 1.0.0" reads
+        # like a change that did not happen — on the mods that are already current, which is
+        # most of them. The value goes in as it is rather than through the catalogue for the
+        # same reason the heading row prints the mod's name: it is data, not prose.
+        rows.append(DetailRow(tr("detail.version_label"), entry.latest_version))
     elif entry.local_version:
-        rows.append((tr("detail.version_label"),
-                     tr("detail.local_version", local=entry.local_version), ""))
+        rows.append(DetailRow(tr("detail.version_label"),
+                              tr("detail.local_version", local=entry.local_version)))
 
     if entry.project_url:
-        rows.append((tr("detail.project_label"), tr("detail.open_page"), entry.project_url))
-    if entry.download_url:
-        rows.append((tr("detail.download_label"), tr("detail.open_download"),
-                     entry.download_url))
+        rows.append(DetailRow(tr("detail.project_label"), tr("detail.open_page"),
+                              entry.project_url))
+    if action is not None:
+        rows.append(action)
 
     for key, args in entry.notes:
-        # Notes are already whole sentences, so they carry their own label rather than being
-        # forced into a ``label: value`` shape they do not have.
-        rows.append(("", tr(key, **args), ""))
+        rows.append(DetailRow("", tr(key, **args)))
     if entry.error:
-        rows.append(("", tr("report.error_detail", error=entry.error), ""))
+        rows.append(DetailRow("", tr("report.error_detail", error=entry.error)))
     return rows
-
-
-def render_detail(entry: UpdateEntry, tr: Translator) -> List[str]:
-    """The detail view as plain lines, for the console and the report file.
-
-    The labels carry their own separator (``状态: ``), the same way the status screen's do, so
-    the punctuation stays translatable and the two renderers cannot disagree about it.
-    """
-    return [
-        (label + value) if label else value
-        for label, value, _url in entry_detail_rows(entry, tr)
-    ]
 
 
 def entry_from_scan(mod: Any) -> UpdateEntry:
