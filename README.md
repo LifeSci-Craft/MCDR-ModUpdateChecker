@@ -82,15 +82,15 @@ Fabric 服务端**没有任何原生手段**能发现 Mod 过期。加载器只�
 加一个 `help` 就是帮助页——**每一行都可以直接点击**：
 
 ```
-===============  Mod Update Checker v1.3.0  ===============
+===============  Mod Update Checker v1.4.0  ===============
 用法：!!muc <子命令>（!!modupdate 亦可）
 以上命令均需 MCDR 权限等级 3（与游戏内是否为 OP 无关）
 !!muc              -- 查看上次检查的汇总
 !!muc check        -- 立即检查一次
 !!muc list         -- 列出所有 Mod（可在后面加一个状态来筛选）
 !!muc info         -- 查看某个 Mod 的详情
-!!muc download     -- 下载某个 Mod 的新版本
-!!muc install      -- 安排关服时安装某个已下载的 Mod
+!!muc download     -- 下载某个 Mod 的新版本（或全部：!!muc download all）
+!!muc install      -- 安排关服时安装某个已下载的 Mod（或全部：!!muc install all）
 !!muc confirm      -- 确认上一条 download / install
 !!muc status       -- 显示识别到的服务端版本、加载器与下载设置
 !!muc reload       -- 重新读取配置文件
@@ -108,8 +108,8 @@ Fabric 服务端**没有任何原生手段**能发现 Mod 过期。加载器只�
 | `!!modupdate list` | 列出全部 Mod（编号 + 名称 + 状态），每行带可点的 `[详细信息]` |
 | `!!modupdate list <状态>` | 只看某个状态，例如 `!!modupdate list update_available` |
 | `!!modupdate info <编号 / Mod 名>` | 某个 Mod 的详情：版本变更、项目页，以及这一步该做什么的可点按钮 |
-| `!!modupdate download <编号 / Mod 名>` | 从 Modrinth 下载这一个 Mod 的新版本（见下） |
-| `!!modupdate install <编号 / Mod 名>` | 安排下次关服时把它装进 `mods/`（见下） |
+| `!!modupdate download <编号 / Mod 名 / all>` | 从 Modrinth 下载这一个 Mod 的新版本，`all` 表示所有待下载的（见下） |
+| `!!modupdate install <编号 / Mod 名 / all>` | 安排下次关服时把它装进 `mods/`，`all` 表示所有已下载的（见下） |
 | `!!modupdate confirm` | 确认上一条 `download` / `install` |
 | `!!modupdate status` | 显示识别到的服务端版本、加载器、配置文件路径、上游开关、本地映射表、上次检查时间、已排除的 Mod |
 | `!!modupdate reload` | 重载配置文件 |
@@ -155,6 +155,25 @@ Sodium  1.0.0 -> 1.1.0
 [Mod Update Checker] 已授权：下次关服时把 Sodium 1.1.0 装进 mods/，旧 jar 保留为 .old。用 !!modupdate status 查看。
 ```
 
+要一次处理一批，就把位置换成保留字 `all`：
+
+```
+> !!modupdate download all
+即将从 Modrinth 下载 2 个，合计约 2.4 MB：
+Sodium  1.0.0 -> 1.1.0
+Lithium  0.5.0 -> 0.6.0
+（另有 1 个更新没有可下载的文件，会跳过）
+请在 120 秒内输入 !!modupdate confirm 确认；重新输入本命令可替换这次待确认的操作。
+
+> !!modupdate confirm
+[Mod Update Checker] 已开始下载 2 个 Mod 的新版本，完成后告诉你结果。
+[Mod Update Checker] 批量下载结束：2 个已下载，0 个早已存在，0 个失败，0 个跳过。
+[Mod Update Checker] 要装进 mods/ 请输入 !!modupdate install all。
+```
+
+`all` 是**保留字**，永远指「全部」：即使某个 Mod 恰好叫 `all`，这个名字也仍然指整批——要指定那个
+Mod，用它的编号。`!!modupdate install all` 同理，指所有「已下载待安装」的。
+
 几条刻意定下的规则：
 
 - **`install` 要求文件已经下载好。** 没下载就提示你先用 `download`——把「抓」和「装」合成一步会让
@@ -163,9 +182,10 @@ Sodium  1.0.0 -> 1.1.0
 - **确认 120 秒内有效。** 过期作废，需要重新输入原命令；重载配置也会让待确认的操作作废
   （配置里的文件大小上限、重试次数都会影响执行结果，不能拿改动前的计划去执行）。
 - **检查跑过一次之后，旧的确认也会作废。** 编号是「当时那份报告」的映射，报告换了，同一个编号
-  可能已经是另一个 Mod——与其猜，不如让它作废。
-- **`install` 只授权你点名的那一个。** 一台服可能挂着五个已下载的版本，授权记录是逐条的，
-  不会顺手把其余四个也装进去。
+  可能已经是另一个 Mod——与其猜，不如让它作废。批量核对的是「哪些 Mod」而不只是「多少个」：
+  集合变了就整条作废，只执行对得上的那部分会让「成功」的汇报盖住没做的那一半。
+- **`install` 只动你点名的那些。** 授权记录是逐条的：点一个编号就只装那一个，`!!muc install all`
+  才全装——无论哪种，它都不会越过你的授权去动清单里其余的。
 - `!!modupdate info <编号>` 的详情页底部会出现对应的 `[下载此版本]` / `[安排安装]`，点一下
   就等于输入了上面的命令。
 
@@ -174,7 +194,7 @@ Sodium  1.0.0 -> 1.1.0
 `!!modupdate list` 只给**一行一个 Mod**，因为它要在一页聊天框内读完：
 
 ```
-===============  Mod Update Checker v1.3.0  ===============
+===============  Mod Update Checker v1.4.0  ===============
 服务端: 26.3 / Fabric（版本来源：server_info）
 [1] Sodium  1.0.0 -> 1.1.0  (可更新)  [详细信息]
 [2] Lithium  1.0.0 -> 1.1.0  (可更新)  [详细信息]
@@ -193,7 +213,7 @@ Sodium  1.0.0 -> 1.1.0
 点某一行的 `[详细信息]`（或输入 `!!modupdate info 3`）才展开那一个 Mod：
 
 ```
-===============  Mod Update Checker v1.3.0  ===============
+===============  Mod Update Checker v1.4.0  ===============
 Sodium
 状态: 可更新
 版本: 1.0.0 -> 1.1.0
@@ -392,7 +412,9 @@ Sodium
 | 想做的事 | 命令 | 依赖开关吗 |
 |---|---|---|
 | 抓某一个 Mod 的新版本 | `!!modupdate download <编号>` | 不依赖 |
+| 抓全部待下载的 | `!!modupdate download all` | 不依赖 |
 | 安排下一次关服时装某一个 | `!!modupdate install <编号>` | 不依赖 |
+| 安排下一次关服时装全部已下载的 | `!!modupdate install all` | 不依赖 |
 | 发现更新就全都抓 | `download.enabled: true` | 是 |
 | 抓到的全都装 | `download.install_on_stop: true` | 是 |
 
@@ -402,7 +424,8 @@ Sodium
 `<原名>.old` 保留下来：
 
 - `download.install_on_stop: true` —— 装**所有**已下载的；
-- `!!modupdate install <编号>` —— 只装**你点名的那个**（见[手动下载与安装](#手动下载与安装两步确认)）。
+- `!!modupdate install <编号>` —— 只装**你点名的那个**；`!!modupdate install all` 是逐条点名
+  所有已下载的（见[手动下载与安装](#手动下载与安装两步确认)）。
 
 ```
 [Mod Update Checker] 已替换 3 个 Mod，详情见下次启动日志。
@@ -495,6 +518,13 @@ Sodium
 （`!!modupdate download <编号>` 做的是同一件事，只是限定在一个 Mod 上，而且不需要开这个开关。）
 
 下载位置：`config/mod_update_checker/downloads/`，日志会给出每个文件的完整路径。
+
+**下载完成时会专门说一声。** 一次检查里真的抓到了新文件时，控制台会打一行「下载完成：N 个新版本已就绪」
+并给出下一步（`!!muc install all`，或说明已开启自动安装）；同一时刻，线上权限足够的管理员
+（≥ `report.in_game_permission`）会在游戏里收到同样的话。**这一条不受 `report.in_game` 控制**——
+那项管的是「有更新了」的广播（明天再看也不迟），而「服务器的文件刚刚变了」是另一类消息，和关服后
+「装了什么」的汇报同一性质。没真下到东西就不发：一次什么都没抓到的检查，不该用一句「下载完成」
+来打断别人。
 
 **下载本身不会装进 `mods/`。** 装进去是另一步、另一个开关，见上一节。
 

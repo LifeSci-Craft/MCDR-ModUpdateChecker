@@ -181,6 +181,18 @@ COMMANDS = [
     # Not downloaded: must point at ``download`` rather than stage anything.
     "!!muc install Tampered Mod",
     "!!muc install Blocked Mod",
+    # --- the bulk forms, staged only ----------------------------------------------------
+    #
+    # Both are superseded by the explicit single-mod command below, so the batches never get
+    # confirmed and the default run stays a statement about *staging* — the one thing a bulk
+    # plan must get right, since acting on it is just the single path in a loop.
+    #
+    # The counts are pinned to the scenario: one mod is still waiting to be fetched (Tampered,
+    # whose transfer is refused), and three have been downloaded but not installed (Outdated,
+    # Prefixed, Flaky). A bulk command that quietly covered fewer mods than the report lists
+    # would still print a plausible plan, so the numbers are asserted rather than the wording.
+    "!!muc download all",
+    "!!muc install all",
     # Staged and deliberately NOT confirmed in the default run: confirming it would authorise
     # an install, which would move the file the download assertions above are looking at.
     "!!muc install Flaky Mod",
@@ -214,7 +226,14 @@ COMMAND_EXPECTATIONS = {
     # The staged plan, and the sentence that asks for the confirmation. The timeout itself is
     # left out of the assertion: it is a constant in the plugin, and pinning the number here
     # would make changing it fail a run for no reason.
-    "download_staged": "内输入 !!muc confirm 确认",
+    #
+    # Pinned to the *file* rather than to the ask-for-confirmation line, and that is not
+    # decoration: the bulk plan ends with the same sentence, so a substring they share would
+    # still be satisfied after the single-mod path broke.
+    "download_staged": "文件名：tampered-1.1.0.jar",
+    # The bulk forms: a plan whose counts come from the scenario (see ``COMMANDS``).
+    "download_all_staged": "即将从 Modrinth 下载 1 个",
+    "install_all_staged": "即将安排安装 3 个",
     # The confirm really fetched and really gave up: the served bytes never match their hash.
     "download_refused": "失败",
     # Named, so the sentence is pinned to the mod it is about. The number it ends with is
@@ -222,7 +241,9 @@ COMMAND_EXPECTATIONS = {
     # checks it is the right one without this file having to know the ordering.
     "install_wants_download": "Tampered Mod 的新版本还没下载。请先输入 !!muc download ",
     "install_refused_status": "Blocked Mod 当前状态是「无适配构建」",
-    "install_staged": "即将安排安装",
+    # The single-mod header, whole: the bulk header carries a count between these two words,
+    # so the shorter substring would be satisfied by a batch reply with no single install in it.
+    "install_staged": "即将安排安装（下次关服时执行）",
     "install_authorised": "已授权",
 }
 
@@ -841,12 +862,14 @@ def summarise(
         "command_alias": COMMAND_EXPECTATIONS["alias"] in console,
         "command_check": COMMAND_EXPECTATIONS["check_started"] in console,
         "command_download_staged": COMMAND_EXPECTATIONS["download_staged"] in console,
+        "command_download_all_staged": COMMAND_EXPECTATIONS["download_all_staged"] in console,
         "command_download_refused": COMMAND_EXPECTATIONS["download_refused"] in console,
         "command_install_wants_download":
             COMMAND_EXPECTATIONS["install_wants_download"] in console,
         "command_install_refused":
             COMMAND_EXPECTATIONS["install_refused_status"] in console,
         "command_install_staged": COMMAND_EXPECTATIONS["install_staged"] in console,
+        "command_install_all_staged": COMMAND_EXPECTATIONS["install_all_staged"] in console,
         "command_install_authorised":
             COMMAND_EXPECTATIONS["install_authorised"] in console,
         "mode": "install" if install else "download",
@@ -881,10 +904,12 @@ CHECK_KEYS = [
     "command_alias",
     "command_check",
     "command_download_staged",
+    "command_download_all_staged",
     "command_download_refused",
     "command_install_wants_download",
     "command_install_refused",
     "command_install_staged",
+    "command_install_all_staged",
     "modrinth_used",
     "spoke_chinese",
 ]

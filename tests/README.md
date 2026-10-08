@@ -17,7 +17,7 @@ python -m pip install --target .testlibs -r tests/requirements-test.txt
 ## 跑测试
 
 ```bash
-PYTHONPATH=.testlibs python -m pytest          # 全量（616 项，约 4 分钟，含端到端）
+PYTHONPATH=.testlibs python -m pytest          # 全量（627 项，约 4 分钟，含端到端）
 PYTHONPATH=.testlibs python -m pytest -m "not e2e"   # 跳过端到端，约 1.5 分钟
 ```
 
@@ -39,7 +39,8 @@ PYTHONPATH=.testlibs python -m pytest -m "not e2e"   # 跳过端到端，约 1.5
 | `test_projectmap.py` | 管理员手写的映射表：两种键的优先级、大小写、每一种畸形 JSON 都要「报告原因 + 忽略 + 不抛异常」、以及「一个文件名，不是一条路径」的安全性 |
 | `test_checker.py` | 完整检查流程对本地假上游的判定结果、**请求预算**、缓存复用、映射表优先于名称搜索、两条新提醒的误报方向、报告序列化**与反序列化**、增量对比、中英渲染、**分节结构（一份数据两种渲染）与显示宽度对齐** |
 | `test_i18n.py` | 两份语言目录键集一致、代码里用到的键都在、没有失效键、占位符对齐、**每条消息开头的 `[方括号]` 都是元数据里的插件名**、`install.reason.*` / `download.reason.*` 与产出它们的模块双向对齐 |
-| `test_mcdr_entry.py` | MCDR 入口：生命周期与事件注册的约束、配置分组的不变式、**配置文件的新建 / 补齐 / 补不上都会上报且状态页会显示文件路径**、**六个界面共用一个标题栏**、`!!muc download` / `install` / `confirm` 的确认流程（超时、换人、报告换过后作废、只授权点名的那一个）、关服安装的授权路径、**复用前要不要先看「这份结果还算不算数」**、存档报告的读回、映射表路径的组装与拒绝 |
+| `test_mcdr_entry.py` | MCDR 入口：生命周期与事件注册的约束、配置分组的不变式、**配置文件的新建 / 补齐 / 补不上都会上报且状态页会显示文件路径**、**六个界面共用一个标题栏**、`!!muc download` / `install` / `confirm` 的确认流程（超时、换人、报告换过后作废、只授权点名的那一个）、**批量形式 `download all` / `install all`**（保留字、计划计数、集合变了整条作废、逐条授权）、**下载完成通知的两条通道与开关**、关服安装的授权路径、**复用前要不要先看「这份结果还算不算数」**、存档报告的读回、映射表路径的组装与拒绝 |
+| `test_docs.py` | 文档与代码的约定：两份 README 的受众分工（使用者的 README 里不许出现实现细节，也不许把插件说成只读的）、文档里的选项路径必须真实存在**且每个选项都必须被文档提到**（反向漏掉一项，看起来就像「功能没做」）、README 的命令表必须列全命令树里注册的每个命令、所有仓库链接指向同一个仓库、**版本号三处一致**（plugin.json / CHANGELOG 首个标题 / README 样本）、CHANGELOG 只留一版、矩阵检查项数量由 `required_keys()` 现算、**源码行末统一 LF** |
 | `test_e2e.py` | 用 `pack.py` 打出 `.mcdr`，放进**真实 MCDR**里跑：加载、自动检查、命令树、别名、报告落盘 |
 
 `tests/fake_upstream.py` 是 Modrinth 的本地假实现。它的回答形状是照着线上实测抄的
@@ -61,8 +62,10 @@ python tools/mcdr_matrix.py /path/to/mcdr-2.13/python /path/to/mcdr-2.15.7/pytho
 每个版本会检查：插件加载（或被干净拒绝）、`language: auto` 确实跟随 MCDR、自动检查发现种下的更新、
 `!!modupdate` / `help` / `status` / `list` / `list <状态>` / `info` / `reload` 与 `!!muc` 别名都有回应、
 `!!muc download <编号>` 会暂存计划且 `confirm` 之后真的去抓（抓的正是那条哈希对不上的，所以断言的是
-「真开了 socket、真被拒绝、没留残渣」）、`!!muc install` 的两条分支、`last_report.json` 内容与控制台一致、
-没有任何 traceback。加上 `--with-install` 会再跑一遍关服安装。
+「真开了 socket、真被拒绝、没留残渣」）、`!!muc install` 的两条分支、批量形式 `!!muc download all` /
+`install all` 的**计划计数**（钉在场景上：1 个待抓、3 个待装——批量少算一个模块照样会印出一份像样的
+计划，所以断言的是数字而不是措辞）、`last_report.json` 内容与控制台一致、没有任何 traceback。
+加上 `--with-install` 会再跑一遍关服安装。
 
 单版本跑同一个流程可以走 pytest：
 

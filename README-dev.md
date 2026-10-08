@@ -131,7 +131,7 @@ whatever_the_server_holds` 是量它的那把尺）。
 | 结论 | 核验方式 |
 |---|---|
 | 能在真实 MCDR 里加载、跑完检查、注册全部命令 | `tools/mcdr_matrix.py`：在指定解释器里起真实 MCDR + 假服务端 + 假上游，驱动全流程（`tests/test_e2e.py` 是它的 pytest 封装） |
-| 能跑在 2.13 / 2.14 / 2.15 / 2.16 | 同上，跨 5 个 MCDR 版本跑矩阵；四个低版本与 2.16.0 的 **38 项检查逐项一致**（`--with-install` 那次是 36 项，差的两项是下载目录专属的断言，安装会把它搬空） |
+| 能跑在 2.13 / 2.14 / 2.15 / 2.16 | 同上，跨 5 个 MCDR 版本跑矩阵；四个低版本与 2.16.0 的 **40 项检查逐项一致**（`--with-install` 那次是 38 项，差的两项是下载目录专属的断言，安装会把它搬空） |
 | Modrinth 的请求形状正确 | `tests/test_clients.py`。假上游的回答形状是**照线上实测抄的**（例如 `version_files/update` 无匹配时返回 `{}`），不是一个想当然的替身 |
 | 哈希识别在真实数据上成立 | 拿真实 Mod jar 对线上 API 跑完整流程，核对报告的版本号与下载链接 |
 | 摘要计算正确，且只算该算的 | `tests/test_digests.py`：对整块缓冲区用 `hashlib` 交叉验证，并在**读块边界**两侧取样；另有一条断言证明内存不随文件大小增长 |
@@ -156,10 +156,14 @@ whatever_the_server_holds` 是量它的那把尺）。
 | 游戏里不会有裸 URL，日志里必须有 | `test_the_chat_summary_offers_a_button_where_the_log_offers_a_url`：同一次检查，聊天形式里既没有项目页也没有 CDN 地址、并且带一个 `!!modupdate info 1` 的点击事件；日志形式里项目页仍在 |
 | 链接列按显示宽度对齐 | `test_the_link_column_is_measured_in_columns_not_characters`：两个**字符数相同、显示宽度不同**的名字（`AB` / `文本`），断言行内链接的起始显示列相同 |
 | 编号不补空格 | `test_the_listing_never_pads_the_number`：短列表与二十个 Mod 的列表都断言 `[1] ` 在、`[ 1]` 不在——这条被用户报过两次，所以钉两遍 |
+| 批量命令的集合语义 | `test_download_all_stages_one_plan_for_every_fetchable_mod`：计划点名的恰好是全部候选，没有可下载文件的那个被**数出来**而不是丢掉。`test_a_batch_confirmation_is_dropped_when_the_set_of_mods_changed` 证明集合一变整条作废——只跑对得上的那部分，会让「成功」的汇报盖住没做的那一半。`test_all_is_the_bulk_word_even_when_a_mod_answers_to_it` 钉住保留字：连 id、文件名、显示名三处都叫 `all` 的 Mod 也不能把它变成「指定那一个」 |
+| 批量安装仍是一条一条授权 | `test_install_all_authorises_every_downloaded_build`：从磁盘读回 ledger，核对恰好是那三个 key 被授权。注入验证里把循环改成 `entries[:1]`（只装第一个）时确实失败 |
+| 下载完成会通知，且不受 `report.in_game` 控制 | `test_a_finished_download_is_announced_to_the_console_and_to_admins`（控制台一行 + 权限够的管理员收到、权限不够的收不到）、`test_a_check_that_fetched_nothing_says_nothing`（非事件不发）、`test_a_join_check_keeps_the_completion_on_the_console_only`（`broadcast=False` 时只有控制台） |
+| 源码行末统一 LF | `test_no_source_file_carries_windows_line_endings`：扫工作区（跳过二进制与缓存），任何 `\r\n` 都失败。它守的是 Git 看不见的那一侧——`.gitattributes` 只在**提交时**归一，而「读文件再写回」的脚本会在 Windows 上把整份文件翻成 CRLF，内容一个字没改，diff 却全是警告 |
 
-测试套件共 **616 项**（其中 2 项是真实 MCDR 端到端，只在 CI 上跑；当前数量用
+测试套件共 **627 项**（其中 2 项是真实 MCDR 端到端，只在 CI 上跑；当前数量用
 `pytest --collect-only -q | tail -1` 查；这一行是快照，
-所以上面那张表里的「38 项检查」才是被测试自动核对的那个数字），细节见 [`tests/README.md`](tests/README.md)。
+所以上面那张表里的「40 项检查」才是被测试自动核对的那个数字），细节见 [`tests/README.md`](tests/README.md)。
 
 ---
 
