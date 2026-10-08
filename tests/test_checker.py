@@ -46,13 +46,17 @@ from mod_update_checker.report import (
     STATUS_UPDATE_AVAILABLE,
     UPDATE_ENTRY_ORDER,
     Report,
+    SummarySection,
     UpdateEntry,
+    action_row,
+    display_width,
     entry_detail_rows,
-    render_detail,
     render_entry_lines,
     render_full,
-    render_index_body,
+    render_index,
+    render_index_row,
     render_summary,
+    summarise,
 )
 from mod_update_checker.scanner import scan_jar, scan_mods
 from mod_update_checker.serverinfo import ServerContext
@@ -1023,7 +1027,13 @@ _LINE_BUDGET = 100
 
 
 def _entry_with_links(mod_id, status, *, name=None, local="1.0.0", latest="1.1.0", by="hash"):
-    """An entry carrying both URLs, which is what a real run produces."""
+    """An entry carrying both URLs and the digest a download is verified against.
+
+    All three, because that is what a real run produces — ``checker`` fills in the digest it
+    read off the platform's version file, and a helper that left it out would make every
+    download button in the suite silently disappear, since the button needs something to
+    verify the fetched file against before it can honestly offer to fetch it.
+    """
     entry = UpdateEntry(
         mod_id=mod_id,
         name=name or mod_id.title(),
@@ -1035,6 +1045,7 @@ def _entry_with_links(mod_id, status, *, name=None, local="1.0.0", latest="1.1.0
     )
     entry.project_url = "https://modrinth.com/mod/" + mod_id
     entry.download_url = _CDN_URL
+    entry.download_sha1 = "a" * 40
     return entry
 
 
@@ -1168,6 +1179,45 @@ def test_a_listing_of_links_starts_them_in_one_column():
     assert len(set(columns)) == 1, columns
 
 
+def test_the_link_column_is_measured_in_columns_not_characters():
+    """Two names of equal length, one of them in Chinese, and the game draws those twice as
+    wide as an ``A``.
+
+    Padding by ``len`` gives both rows the same number of spaces, so the second row's link
+    starts two columns further right — and this is not an edge case: every mod name and every
+    status note this plugin prints in its shipped language is full-width, so the column came
+    out ragged across the whole listing. Asserted on the display width of the text before the
+    link, which is the column a reader sees.
+    """
+    tr = make_translator("zh_cn")
+    entries = [
+        _entry_with_links("a", STATUS_UPDATE_AVAILABLE, name="AB"),
+        _entry_with_links("b", STATUS_UPDATE_AVAILABLE, name="\u6587\u672c"),
+    ]
+    lines = render_entry_lines(entries, tr, verbose=True)
+
+    # Same character count, different display width — which is what makes this a test of the
+    # measurement rather than of the padding arithmetic.
+    assert len(entries[0].name) == len(entries[1].name)
+    assert display_width(entries[0].name) != display_width(entries[1].name)
+
+    columns = [display_width(line[: line.index("https://")]) for line in lines]
+    assert len(set(columns)) == 1, columns
+
+
+def test_a_row_with_no_number_prints_without_a_handle():
+    """``[0]`` looks typeable and resolves to nothing, so it is not printed at all."""
+    tr = make_translator("zh_cn")
+    entry = _entry_with_links("alpha", STATUS_UPDATE_AVAILABLE)
+
+    numbered = render_index_row(3, entry, tr)
+    unnumbered = render_index_row(None, entry, tr)
+
+    assert numbered.startswith("[3] ")
+    assert not unnumbered.startswith("[")
+    assert numbered.endswith(unnumbered), (numbered, unnumbered)
+
+
 def test_a_full_listing_still_says_which_status_each_row_is():
     """The link might be gone, but the rows here are of all kinds and must stay tellable apart."""
     tr = make_translator("zh_cn")
@@ -1228,6 +1278,24 @@ def _many(actionable=0, up_to_date=0):
     return entries
 
 
+def _listing(report, tr, entries=None, budget=CHAT_PAGE_LINES):
+    """Every line the listing puts on screen, as plain text.
+
+    ``render_index`` returns the rows and the tail; the title bar and the server context above
+    them belong to the screen and are counted here, because they are lines the reader scrolls
+    past — a budget measured without them is not the budget the reader gets.
+
+    The rows carry their number and no indentation any more: the colour says which of them need
+    attention, so a leading pair of spaces would only spend width.
+    """
+    rows, tail = render_index(report, tr, entries=entries, budget=budget)
+    return (
+        ["(title bar)", "(server context)"]
+        + [text for _number, _entry, text in rows]
+        + tail
+    )
+
+
 def test_the_listing_fits_a_page_whatever_the_server_holds():
     """The property the whole change exists for.
 
@@ -1238,7 +1306,7 @@ def test_the_listing_fits_a_page_whatever_the_server_holds():
     tr = make_translator("zh_cn")
     for actionable, up_to_date in ((3, 4), (40, 160), (0, 200), (40, 0), (0, 0)):
         report = _index_report(_many(actionable, up_to_date))
-        lines = render_index_body(report, tr)
+        lines = _listing(report, tr)
         assert len(lines) <= CHAT_PAGE_LINES, (actionable, up_to_date, len(lines))
 
 
@@ -1250,11 +1318,11 @@ def test_the_actionable_mods_are_never_the_ones_left_out():
     """
     tr = make_translator("zh_cn")
     report = _index_report(_many(actionable=40, up_to_date=160))
-    body = "\n".join(render_index_body(report, tr))
+    body = "\n".join(_listing(report, tr))
 
     assert "Action Mod 000" in body
-    # 13 rows fit at this budget; every one of them is an actionable mod.
-    assert "Action Mod 012" in body
+    # 12 rows fit at this budget; every one of them is an actionable mod.
+    assert "Action Mod 011" in body
     assert "Fresh Mod" not in body
 
 
@@ -1269,17 +1337,17 @@ def test_a_truncated_listing_says_how_many_it_held_back():
     """
     tr = make_translator("zh_cn")
     report = _index_report(_many(actionable=40, up_to_date=160))
-    body = "\n".join(render_index_body(report, tr))
+    body = "\n".join(_listing(report, tr))
 
     assert "另有" in body and "未显示" in body
     match = re.search(r"另有\s+(\d+)\s+个未显示", body)
     assert match is not None, body
     omitted = int(match.group(1))
     # Every mod is either printed as a row or counted in that number, never both and never
-    # neither — which is the arithmetic the line is claiming. The row shape is matched rather
-    # than "starts with a bracket": the header opens with the ``[Mod Update Checker]`` badge,
-    # so a looser test counted it as a row.
-    printed = [line for line in body.splitlines() if re.match(r"^  \[\s*\d+\] ", line)]
+    # neither — which is the arithmetic the line is claiming. The row shape is matched exactly
+    # rather than loosely: the header used to open with the ``[Mod Update Checker]`` badge, and
+    # a loose "starts with a bracket" pattern counted it as a row.
+    printed = [line for line in body.splitlines() if re.match(r"^\[\d+\] ", line)]
     assert omitted > 0
     assert len(printed) + omitted == len(report.entries)
 
@@ -1301,31 +1369,32 @@ def test_a_filtered_listing_keeps_the_numbers_the_full_one_used():
     filtered = report.by_status(STATUS_UP_TO_DATE)
 
     tr = make_translator("zh_cn")
-    body = "\n".join(render_index_body(report, tr, entries=filtered))
+    body = "\n".join(_listing(report, tr, entries=filtered))
 
     for number, entry in report.indexed_entries():
         if entry in filtered:
-            # Five mods, so the column is one digit wide and carries no padding at all.
             assert "[{}] {}".format(number, entry.name) in body
 
 
-def test_the_number_column_is_as_wide_as_the_numbers_it_prints():
-    """One digit for a handful of mods, two once there is a tenth.
+def test_the_listing_never_pads_the_number():
+    """``[1]``, not ``[ 1]`` — reported twice, so it is pinned twice.
 
-    Asked of the rows rather than fixed, because neither constant is right: a width of two put
-    a visible gap after the bracket on a five-mod server, and a width of one leaves ``[1]`` and
-    ``[10]`` out of line the moment a tenth row exists.
+    Two answers were tried before this one: a constant width of two, which put a visible gap
+    after the bracket on a small server, and a width derived from the largest number on the
+    page, which still padded every single-digit row on a server with twenty mods. The column is
+    simply not aligned now: ``[9]`` and ``[10]`` start a character apart, and that is the trade
+    the reader asked for.
     """
     tr = make_translator("zh_cn")
 
-    short = "\n".join(render_index_body(_index_report(_many(actionable=2, up_to_date=3)), tr))
+    short = "\n".join(_listing(_index_report(_many(actionable=2, up_to_date=3)), tr))
     assert "[1] " in short
     assert "[ 1]" not in short
 
-    long_list = "\n".join(
-        render_index_body(_index_report(_many(up_to_date=12)), tr, budget=40)
-    )
-    assert "[ 1] " in long_list
+    # The case the second attempt got wrong: a listing long enough to reach double digits.
+    long_list = "\n".join(_listing(_index_report(_many(up_to_date=12)), tr, budget=40))
+    assert "[1] " in long_list
+    assert "[ 1]" not in long_list
     assert "[10] " in long_list
 
 
@@ -1457,28 +1526,150 @@ def test_an_entry_can_be_looked_up_by_number_or_by_name():
     assert report.entry_by_handle("no such mod") is None
 
 
-def test_the_detail_view_is_where_the_links_live():
-    """The listing cannot afford a url; one mod's detail can afford two."""
-    entry = _entry_with_links("sodium", STATUS_UPDATE_AVAILABLE)
-    rows = entry_detail_rows(entry, make_translator("zh_cn"))
+def test_the_detail_view_shows_one_way_to_download():
+    """The link and the command both downloaded, and the reader had to choose between them.
 
-    urls = [url for _label, _value, url in rows if url]
-    assert entry.project_url in urls
-    assert entry.download_url in urls
+    The raw link went: it bypassed the hash check the command performs, it wrapped in the chat
+    box, and the button that performs the check is right where the link used to be.
+    """
+    tr = make_translator("zh_cn")
+    entry = _entry_with_links("sodium", STATUS_UPDATE_AVAILABLE)
+    rows = entry_detail_rows(entry, tr, action=action_row(entry, 3, "!!muc", tr))
+
+    assert entry.project_url in [row.url for row in rows]
+    assert entry.download_url not in [row.url for row in rows], "the raw cdn link is back"
+    assert entry.download_url not in [row.value for row in rows]
+
+    # The action sits where that link sat: after the project page, before the notes.
+    action_row_index = [index for index, row in enumerate(rows) if row.command]
+    project_row_index = [index for index, row in enumerate(rows) if row.url]
+    assert len(action_row_index) == 1 and len(project_row_index) == 1
+    assert action_row_index[0] == project_row_index[0] + 1
+    button = rows[action_row_index[0]]
+    assert button.value == tr("command.detail.download")
+    assert button.command == "!!muc download 3"
+
     # And the version change the reader came for, with both versions named.
-    body = "\n".join(render_detail(entry, make_translator("zh_cn")))
+    body = "\n".join(row.label + row.value for row in rows)
     assert "1.0.0" in body and "1.1.0" in body
+
+
+def test_the_action_offered_matches_what_the_mod_is_ready_for():
+    """Never both, and never a step the mod cannot take.
+
+    A button that can only answer with its own error message is worse than no button, so an
+    entry with nothing to offer gets no row at all.
+    """
+    tr = make_translator("zh_cn")
+
+    fresh = _entry_with_links("alpha", STATUS_UPDATE_AVAILABLE)
+    assert action_row(fresh, 1, "!!muc", tr).command == "!!muc download 1"
+    # The alias the reader typed is the one the button carries, like every other command it
+    # prints — the two roots are interchangeable, but a reply that mixes them reads as a bug.
+    assert action_row(fresh, 1, "!!modupdate", tr).command == "!!modupdate download 1"
+
+    fetched = _entry_with_links("beta", STATUS_AWAITING_INSTALL)
+    assert action_row(fetched, 2, "!!muc", tr).command == "!!muc install 2"
+
+    current = UpdateEntry(mod_id="c", name="C", file_name="c.jar", status=STATUS_UP_TO_DATE)
+    assert action_row(current, 3, "!!muc", tr) is None
+    # No number means no command can be spelled, so there is no honest button to offer.
+    assert action_row(fresh, None, "!!muc", tr) is None
 
 
 def test_the_detail_view_stays_short():
     """One mod's detail must still fit, notes and all."""
+    tr = make_translator("zh_cn")
     entry = _entry_with_links("sodium", STATUS_UPDATE_AVAILABLE)
     entry.add_note("note.declared_mc", range=">=26.1 <27")
     entry.add_note("note.bundled_jars", count=16)
     entry.add_note("note.client_only")
 
-    body = render_detail(entry, make_translator("zh_cn"))
-    assert len(body) <= 10, body
+    rows = entry_detail_rows(entry, tr, action=action_row(entry, 1, "!!muc", tr))
+    # Plus the title bar the screen draws above the rows.
+    assert len(rows) + 1 <= 10, rows
+
+
+def test_the_summary_and_the_screen_agree_about_the_sections():
+    """The log gets flat text and the screen gets buttons; the sections come from one place.
+
+    ``summarise`` is what both walk, so this asserts they really are reading one structure: the
+    flat form opens with the same context line, prints the same headings, and every actionable
+    mod appears in exactly one section.
+    """
+    tr = make_translator("zh_cn")
+    entry = _entry_with_links("alpha", STATUS_UPDATE_AVAILABLE)
+    blocked = _entry_with_links("blocked", STATUS_NO_COMPATIBLE_BUILD)
+    report = Report(
+        generated_at="2026-01-01T00:00:00+00:00",
+        server=SERVER,
+        mods_directory="server/mods",
+        entries=[entry, blocked],
+    )
+
+    context, blocks, closing = summarise(report, tr)
+    flat = render_summary(report, tr)
+    sections = [block for block in blocks if isinstance(block, SummarySection)]
+
+    assert flat[0] == context
+    assert [section.heading for section in sections] == [block.heading for block in sections]
+    for section in sections:
+        assert section.heading in flat
+    assert closing and closing[-1] in flat
+
+    listed = [item for section in sections for item in section.entries]
+    assert len(listed) == len({id(item) for item in listed}), "a mod appears in two sections"
+    assert {id(item) for item in listed} == {
+        id(item) for item in report.entries if item.actionable
+    }
+
+
+def test_a_summary_section_is_ordered_like_the_listing():
+    """The sections are cut out of the same set of entries the numbers come from.
+
+    Left in scan order, a section printed ``[2]`` above ``[1]`` — and a reader who noticed had
+    no way to tell that from a bug in the numbering itself. This is the assertion that keeps
+    the two orders the same, because the numbers are only trustworthy while they are.
+    """
+    tr = make_translator("zh_cn")
+    zulu = _entry_with_links("zulu", STATUS_UPDATE_AVAILABLE, name="Zulu")
+    alpha = _entry_with_links("alpha", STATUS_UPDATE_AVAILABLE, name="Alpha")
+    report = Report(
+        generated_at="2026-01-01T00:00:00+00:00",
+        server=SERVER,
+        mods_directory="server/mods",
+        entries=[zulu, alpha],
+    )
+
+    _context, blocks, _closing = summarise(report, tr)
+    section = [block for block in blocks if isinstance(block, SummarySection)][0]
+
+    assert section.entries == [alpha, zulu]
+    numbers = {id(entry): number for number, entry in report.indexed_entries()}
+    assert [numbers[id(item)] for item in section.entries] == [1, 2]
+
+
+def test_a_section_that_was_truncated_says_so_in_both_forms():
+    """The "and N more" line is arithmetic, so it lives in the shared structure, not per
+    renderer: one of them would eventually be the one that forgot to count."""
+    tr = make_translator("zh_cn")
+    entries = [
+        _entry_with_links("mod{:02d}".format(index), STATUS_UPDATE_AVAILABLE)
+        for index in range(20)
+    ]
+    report = Report(
+        generated_at="2026-01-01T00:00:00+00:00",
+        server=SERVER,
+        mods_directory="server/mods",
+        entries=entries,
+    )
+
+    _context, blocks, _closing = summarise(report, tr, max_updates=3)
+    section = [block for block in blocks if isinstance(block, SummarySection)][0]
+
+    assert len(section.entries) == 3
+    assert any("还有 17 个" in line for line in section.trailing), section.trailing
+    assert "还有 17 个" in "\n".join(render_summary(report, tr, max_updates=3))
 
 
 def test_summary_says_so_when_there_is_nothing_to_do(tmp_path, upstream):

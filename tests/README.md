@@ -17,7 +17,7 @@ python -m pip install --target .testlibs -r tests/requirements-test.txt
 ## 跑测试
 
 ```bash
-PYTHONPATH=.testlibs python -m pytest          # 全量（607 项，约 4 分钟，含端到端）
+PYTHONPATH=.testlibs python -m pytest          # 全量（615 项，约 4 分钟，含端到端）
 PYTHONPATH=.testlibs python -m pytest -m "not e2e"   # 跳过端到端，约 1.5 分钟
 ```
 
@@ -37,9 +37,9 @@ PYTHONPATH=.testlibs python -m pytest -m "not e2e"   # 跳过端到端，约 1.5
 | `test_serverinfo.py` | MC 版本与加载器的推断顺序：配置覆盖 → MCDR ServerInformation → 日志 → Mod 元数据投票 |
 | `test_clients.py` | Modrinth 客户端的协议形状：批量哈希、**空过滤数组不发送**、chunk 分段、429/5xx 重试、401/403 与 404 处理 |
 | `test_projectmap.py` | 管理员手写的映射表：两种键的优先级、大小写、每一种畸形 JSON 都要「报告原因 + 忽略 + 不抛异常」、以及「一个文件名，不是一条路径」的安全性 |
-| `test_checker.py` | 完整检查流程对本地假上游的判定结果、**请求预算**、缓存复用、映射表优先于名称搜索、两条新提醒的误报方向、报告序列化**与反序列化**、增量对比、中英渲染 |
+| `test_checker.py` | 完整检查流程对本地假上游的判定结果、**请求预算**、缓存复用、映射表优先于名称搜索、两条新提醒的误报方向、报告序列化**与反序列化**、增量对比、中英渲染、**分节结构（一份数据两种渲染）与显示宽度对齐** |
 | `test_i18n.py` | 两份语言目录键集一致、代码里用到的键都在、没有失效键、占位符对齐、**每条消息开头的 `[方括号]` 都是元数据里的插件名**、`install.reason.*` / `download.reason.*` 与产出它们的模块双向对齐 |
-| `test_mcdr_entry.py` | MCDR 入口：生命周期与事件注册的约束、配置分组的不变式、**配置文件的新建 / 补齐 / 补不上都会上报且状态页会显示文件路径**、`!!muc download` / `install` / `confirm` 的确认流程（超时、换人、报告换过后作废、只授权点名的那一个）、关服安装的授权路径、**复用前要不要先看「这份结果还算不算数」**、存档报告的读回、映射表路径的组装与拒绝 |
+| `test_mcdr_entry.py` | MCDR 入口：生命周期与事件注册的约束、配置分组的不变式、**配置文件的新建 / 补齐 / 补不上都会上报且状态页会显示文件路径**、**六个界面共用一个标题栏**、`!!muc download` / `install` / `confirm` 的确认流程（超时、换人、报告换过后作废、只授权点名的那一个）、关服安装的授权路径、**复用前要不要先看「这份结果还算不算数」**、存档报告的读回、映射表路径的组装与拒绝 |
 | `test_e2e.py` | 用 `pack.py` 打出 `.mcdr`，放进**真实 MCDR**里跑：加载、自动检查、命令树、别名、报告落盘 |
 
 `tests/fake_upstream.py` 是 Modrinth 的本地假实现。它的回答形状是照着线上实测抄的

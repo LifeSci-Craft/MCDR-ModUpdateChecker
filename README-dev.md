@@ -97,6 +97,35 @@ MC 的 Mod 版本号是一团乱麻：`1.2.3`、`v1.2.3`、`0.162.0+26.3`、`1.1
 
 ---
 
+## 界面：一份数据，两种渲染
+
+同一个检查结果有两个读者，需求正好相反，所以有两套渲染——但**分节、顺序、标题、截断的算术只有
+一份**（`summarise()` 返回 `(context, blocks, closing)`）：
+
+| | 谁看 | 行怎么排 | URL |
+|---|---|---|---|
+| `render_summary` / `render_full` | 控制台、`last_report.txt` | 对齐成一列（按**显示宽度**，见下） | 保留 |
+| `_reply_summary` / `_reply_index` / `_reply_detail` | 游戏内聊天 | `[编号] 描述` + `[详细信息]` 按钮 | 不出现 |
+
+日志行点不了，URL 是那里唯一能到达项目页的方式，而且还能复制；游戏里 URL 点不了又折行，所以换成
+按钮。两边读同一个结构，因此**不会对「有几节、哪一节在前、截掉了几行」产生分歧**。
+
+**颜色由「这一行代表什么」决定，不由它包含什么决定。** 规则就五条：金色=标题栏；aqua=可操作的
+东西（按钮、命令、字段名）；白色=内容；黄色=需要有人处理的行；灰色=其余。上一版是按文本猜的
+（`"->" in line` 就是黄色），于是同一个 Mod 在 `list` 里和在汇总里是两种颜色，一个名叫 `a->b`
+的 Mod 还会把自己涂成黄色。
+
+**列宽按显示宽度算，不按字符数。** `len()` 数字符，而游戏字库把汉字画成两个 `A` 宽——每一行都以
+中文状态注释结尾，所以按字符数补出来的空格把链接列推得参差不齐，在中文界面上**每一行**都错。
+`display_width()` 用 `unicodedata.east_asian_width` 数 W/F 为 2、其余为 1。
+
+**页数预算是算出来的，不是估的。** `_INDEX_FIXED_LINES` 是「行以外还会打印几行」：标题栏、服务端
+上下文、小节标题、统计行、提示行，以及被截断时那一行。加一个界面元素就要把它调大——它上次是 5，
+这次因为每个界面都多了标题栏而变成 6，否则预算会悄悄不再是预算（`test_the_listing_fits_a_page_
+whatever_the_server_holds` 是量它的那把尺）。
+
+---
+
 ## 这些结论是怎么核验的
 
 | 结论 | 核验方式 |
@@ -123,8 +152,12 @@ MC 的 Mod 版本号是一团乱麻：`1.2.3`、`v1.2.3`、`0.162.0+26.3`、`1.1
 | 配置文件是完整的，而且补齐之后插件会说出来 | 静态那一半：`Config` 的字段集与 `Config.get_default().serialize()` 的叶子集**必须相等**；每个选项都必须在 README 或本文件里出现过。运行时那一半：一份缺了选项的旧配置文件会被 MCDR 补齐并重写（`test_an_incomplete_config_file_is_healed_and_the_added_options_are_named` 等三条），**插件必须把补了什么、文件在哪报出来**——这段被矩阵在五个版本上端到端核对：`config_healed`（文件真的多了那两个选项）与 `config_reported`（控制台真的报了） |
 | 列表编号扛得住状态变化 | `test_downloading_a_mod_does_not_move_it_in_the_listing`：`update_available` 与 `awaiting_install` 共用一个排序名次，所以 `download 1` 之后 `install 1` 指的还是同一个 Mod |
 | 手柄查找的四种写法与三种失败 | `test_a_mod_can_be_looked_up_by_the_name_the_listing_shows` 等一组。**示例 Mod 的 id、文件名、显示名必须互不相同**，否则测试会经 mod id 命中而看起来通过 |
+| 六个界面看上去属于同一个插件 | `test_every_screen_opens_with_the_same_title_bar`：五个界面各渲染一次，比对**发送给客户端的 segment**——标题栏那段金色文字必须逐字相同。另有一条 AST 断言防止某个界面把 RText 交给日志（颜色和按钮会一起丢掉） |
+| 游戏里不会有裸 URL，日志里必须有 | `test_the_chat_summary_offers_a_button_where_the_log_offers_a_url`：同一次检查，聊天形式里既没有项目页也没有 CDN 地址、并且带一个 `!!modupdate info 1` 的点击事件；日志形式里项目页仍在 |
+| 链接列按显示宽度对齐 | `test_the_link_column_is_measured_in_columns_not_characters`：两个**字符数相同、显示宽度不同**的名字（`AB` / `文本`），断言行内链接的起始显示列相同 |
+| 编号不补空格 | `test_the_listing_never_pads_the_number`：短列表与二十个 Mod 的列表都断言 `[1] ` 在、`[ 1]` 不在——这条被用户报过两次，所以钉两遍 |
 
-测试套件共 **607 项**（其中 2 项是真实 MCDR 端到端，只在 CI 上跑；当前数量用
+测试套件共 **615 项**（其中 2 项是真实 MCDR 端到端，只在 CI 上跑；当前数量用
 `pytest --collect-only -q | tail -1` 查；这一行是快照，
 所以上面那张表里的「38 项检查」才是被测试自动核对的那个数字），细节见 [`tests/README.md`](tests/README.md)。
 
