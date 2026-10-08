@@ -17,7 +17,7 @@ __all__ = [
     "fabric_metadata",
     "write_jar",
     "write_plain_file",
-    "digests_of",
+    "sha1_of",
     "make_mods_directory",
     "flatten_options",
     "option_paths",
@@ -82,18 +82,6 @@ def write_plain_file(path: Path, payload: bytes = b"not a zip at all\n") -> Path
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(payload)
     return path
-
-
-def digests_of(path: Path) -> Tuple[str, str, int]:
-    """``(sha1, sha512, size)`` for a file on disk."""
-    # Imported here rather than at module level: importing any ``mod_update_checker`` submodule
-    # runs the package ``__init__``, which imports MCDR. That would make this module — and the
-    # plain dict helpers in it — unusable from ``tools/mcdr_matrix.py``, which runs on an
-    # interpreter with no MCDR installed.
-    from mod_update_checker.digests import digests_of_file
-
-    with open(path, "rb") as handle:
-        return digests_of_file(handle)
 
 
 def sha1_of(path: Path) -> str:

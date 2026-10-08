@@ -1,12 +1,17 @@
-"""The digests Modrinth identifies a jar by.
+"""The digest Modrinth identifies a jar by.
 
-A jar is looked up by the **SHA-1 of its exact bytes**, and verified against the **SHA-512** the
-API publishes alongside it. The size falls out of the same pass.
+A jar is looked up by the **SHA-1 of its exact bytes**. That is the only digest computed here,
+and the narrowness is deliberate: an earlier version also produced a SHA-512 "to verify with",
+and nothing ever read it. The download path verifies against the SHA-512 the *API* publishes
+for the file it just fetched — a different number, computed at a different time, for a
+different file — so the local one was pure work on every scan of every folder.
 
-All of them are computed in **one pass** over the file. A modpack's ``mods/`` folder runs to
-hundreds of megabytes, and re-reading it once per digest would be a self-inflicted stall on
-every check — 240 MiB with 120 jars measures at roughly 0.6 s on a warm page cache, of which
-the second digest is a little under half.
+It was not free. Hashing 240 MiB (120 jars of 2 MiB, warm page cache) takes 0.54–0.62 s with
+both digests and 0.30–0.40 s with one, over three runs of ``bench/scan_bench.py``: 45–48% of
+the scan was being spent on a number nobody looked at. That script now adds the second digest
+back on the same files, so the difference can be re-measured rather than taken on trust.
+
+The size falls out of the same pass, so the file is never read twice.
 
 The check that calls this runs on its own thread, scheduled (by default) sixty seconds after
 the server finishes starting — deliberately not on the plugin-loading thread, which is where
@@ -26,14 +31,16 @@ __all__ = ["digests_of_file", "READ_CHUNK"]
 READ_CHUNK = 1 << 20
 
 
-def digests_of_file(handle: IO[bytes]) -> Tuple[str, str, int]:
-    """Return ``(sha1_hex, sha512_hex, size)`` for an open binary file.
+def digests_of_file(handle: IO[bytes]) -> Tuple[str, int]:
+    """Return ``(sha1_hex, size)`` for an open binary file.
 
     Reads from the current position to the end and leaves the handle there. Memory use is
     bounded by :data:`READ_CHUNK` however large the file is.
+
+    ``hashlib`` releases the GIL for a buffer this size, which is why a scan is one of the few
+    CPU-bound jobs here that threads can genuinely speed up.
     """
-    sha1 = hashlib.sha1()
-    sha512 = hashlib.sha512()
+    digest = hashlib.sha1()
     size = 0
 
     while True:
@@ -41,7 +48,6 @@ def digests_of_file(handle: IO[bytes]) -> Tuple[str, str, int]:
         if not block:
             break
         size += len(block)
-        sha1.update(block)
-        sha512.update(block)
+        digest.update(block)
 
-    return sha1.hexdigest(), sha512.hexdigest(), size
+    return digest.hexdigest(), size

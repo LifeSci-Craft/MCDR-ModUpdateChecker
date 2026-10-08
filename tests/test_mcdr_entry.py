@@ -1249,7 +1249,7 @@ def test_the_status_screen_uses_the_same_title_bar_as_the_help():
     try:
         plugin._config = config
         plugin._apply_language(None, config)
-        plugin._scan_current = lambda *_a: (
+        plugin._scan_current = lambda *_a, **_k: (
             _Scan(),
             __import__(
                 "mod_update_checker.serverinfo", fromlist=["ServerContext"]
@@ -1684,7 +1684,7 @@ def _run_with_stub(plugin, server, tmp_path, monkeypatch, report, **config):
     monkeypatch.setattr(
         plugin,
         "_scan_current",
-        lambda *_a: (
+        lambda *_a, **_k: (
             _scan_of(tmp_path),
             ServerContext(mc_version="26.3", mc_version_source="config", loader="fabric"),
         ),
@@ -1927,7 +1927,7 @@ def _status_with_map(tmp_path, monkeypatch, map_payload=None, setting=None):
     try:
         plugin._config = config
         plugin._apply_language(server, config)
-        plugin._scan_current = lambda *_a: (
+        plugin._scan_current = lambda *_a, **_k: (
             _Scan(),
             __import__(
                 "mod_update_checker.serverinfo", fromlist=["ServerContext"]
@@ -1971,3 +1971,77 @@ def test_the_status_page_says_when_the_map_name_is_not_a_file_name(tmp_path, mon
     rendered = _status_with_map(tmp_path, monkeypatch, setting="sub/dir.json")
 
     assert "已忽略" in rendered and "sub/dir.json" in rendered
+
+
+def test_the_status_screen_does_not_hash_the_mods_folder(tmp_path, monkeypatch):
+    """``!!muc status`` shows a count, a directory and a version — none of which is a SHA-1.
+
+    And it runs on MCDR's command thread, so hashing every jar means the server waits. On a
+    modpack of a few hundred megabytes that is about a second of stall for a screen that only
+    needed the file names.
+
+    Asserted by counting calls to the digest function rather than by timing anything, and
+    rather than by making it raise: ``scan_mods`` deliberately swallows a per-jar exception and
+    records that jar as unreadable, so a poisoning function would leave the jar count intact
+    and this test passing for the wrong reason.
+    """
+    import mod_update_checker as plugin
+    import mod_update_checker.scanner as scanner
+
+    from support import fabric_metadata, write_jar
+
+    mods = Path(tmp_path) / "mods"
+    mods.mkdir(parents=True, exist_ok=True)
+    write_jar(mods / "example.jar", fabric=fabric_metadata(id="example", version="1.0.0"))
+
+    read_calls = []
+
+    def spy(handle):
+        read_calls.append(handle)
+        return "", 0
+
+    monkeypatch.setattr(scanner, "digests_of_file", spy, raising=False)
+
+    server = _FakeServer(tmp_path)
+    previous = (plugin._config, plugin._server)
+    try:
+        plugin._config = _config_with({"language": "zh_cn"})
+        plugin._apply_language(server, plugin._config)
+        plugin._server = server
+        source = _ReplyRecorder()
+        plugin._show_status(source)
+    finally:
+        plugin._config, plugin._server = previous
+
+    rendered = "\n".join(str(item) for item in source.replies)
+    assert read_calls == [], "!!muc status read jar bytes"
+    assert "1 个 jar" in rendered, rendered
+
+
+def test_the_status_screen_still_reads_the_metadata(tmp_path, monkeypatch):
+    """The other half: skipping the hashing must not turn into skipping the folder.
+
+    Without this, "does not hash" could be satisfied by a status page that reports zero jars.
+    """
+    import mod_update_checker as plugin
+
+    from support import fabric_metadata, write_jar
+
+    mods = Path(tmp_path) / "mods"
+    mods.mkdir(parents=True, exist_ok=True)
+    for index in range(3):
+        write_jar(mods / "mod{}.jar".format(index),
+                  fabric=fabric_metadata(id="mod{}".format(index)))
+
+    server = _FakeServer(tmp_path)
+    previous = (plugin._config, plugin._server)
+    try:
+        plugin._config = _config_with({"language": "zh_cn"})
+        plugin._apply_language(server, plugin._config)
+        plugin._server = server
+        source = _ReplyRecorder()
+        plugin._show_status(source)
+    finally:
+        plugin._config, plugin._server = previous
+
+    assert "3 个 jar" in "\n".join(str(item) for item in source.replies)

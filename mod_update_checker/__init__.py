@@ -529,11 +529,18 @@ def _check_options(config: Config, mc_version: Optional[str], loader: str) -> Ch
     )
 
 
-def _scan_current(server: PluginServerInterface, config: Config) -> Tuple[ScanResult, Any]:
-    """Scan the mods folder and resolve the server context. Reads only."""
+def _scan_current(
+    server: PluginServerInterface, config: Config, hashes: bool = True
+) -> Tuple[ScanResult, Any]:
+    """Scan the mods folder and resolve the server context. Reads only.
+
+    :param hashes: ``False`` skips reading jar bytes entirely. Every caller that runs a *check*
+    wants them; the ones describing the folder do not, and this is the switch that keeps
+    ``!!muc status`` from hashing a whole modpack to print a count.
+    """
     working_directory = _working_directory(server)
     directory = resolve_mods_directory(working_directory, config.server.mods_directory)
-    scan = scan_mods(directory, logger=server.logger)
+    scan = scan_mods(directory, logger=server.logger, hashes=hashes)
 
     information_version = None
     try:
@@ -1996,11 +2003,17 @@ def _show_status(source: CommandSource) -> None:
     building them as one ``RTextList`` is what lets colours and the title bar survive. (A
     ``server.logger`` call cannot do this — MCDR's log formatter stringifies its argument and
     ``RTextBase.__str__`` drops the colour, which is why the console paths log plain strings.)
+
+    Scanned **without hashing**, deliberately. This page shows a jar count, a directory and the
+    detected version; it has no use for a SHA-1, and computing one per jar would mean this
+    command reads a whole modpack off the disk — on MCDR's command thread, so the server waits
+    for it. A modpack of a few hundred megabytes measures at about a second, which is a second
+    of stall for a screen that only needed the file names.
     """
     server = _server
     if server is None:
         return
-    scan, context = _scan_current(server, _config)
+    scan, context = _scan_current(server, _config, hashes=False)
 
     modrinth_state = (
         tr("command.status.enabled") if _config.sources.modrinth.enabled else tr("command.status.disabled")

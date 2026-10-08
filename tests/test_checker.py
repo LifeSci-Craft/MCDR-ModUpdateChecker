@@ -1993,3 +1993,97 @@ def test_a_stored_report_keeps_the_download_folder_so_the_hint_still_works():
     )
 
     assert Report.from_json(report.to_json()).download_folder == report.download_folder
+
+
+def test_the_two_batched_lookups_share_one_round_trip(tmp_path, upstream, monkeypatch):
+    """1b (newest build per hash) and 1c (project titles) need only the identities from 1a.
+
+    Neither needs the other, so asking them one after the other is two round trips where one
+    will do. On a server whose whole folder resolves by hash — the normal case — those two are
+    the last two requests of the check, so this is the difference between a check that ends in
+    one round trip and one that ends in two.
+
+    Watched by counting simultaneous calls rather than by timing the run: that is the property
+    actually wanted, and it does not depend on how loaded the machine is.
+    """
+    from mod_update_checker.modrinth import ModrinthClient
+
+    scenario = Scenario(tmp_path, upstream)
+    mod = scenario.add_jar("alpha.jar", id="alpha", version="1.0.0", name="Alpha")
+    upstream.add_project(
+        FakeProject(
+            id="proj-alpha",
+            slug="alpha",
+            title="Alpha Mod",
+            versions=[_version("proj-alpha", "a-100", "1.0.0", mod.sha1)],
+        )
+    )
+
+    state = {"in_flight": 0, "peak": 0}
+    lock = threading.Lock()
+
+    def watching(attribute):
+        real = getattr(ModrinthClient, attribute)
+
+        def wrapper(self, *args, **kwargs):
+            with lock:
+                state["in_flight"] += 1
+                state["peak"] = max(state["peak"], state["in_flight"])
+            try:
+                # Stands in for the round trip. Without it both calls would be over before the
+                # other started and there would be nothing to observe, whatever the threading did.
+                time.sleep(0.05)
+                return real(self, *args, **kwargs)
+            finally:
+                with lock:
+                    state["in_flight"] -= 1
+
+        return wrapper
+
+    monkeypatch.setattr(ModrinthClient, "latest_from_hashes", watching("latest_from_hashes"))
+    monkeypatch.setattr(ModrinthClient, "projects", watching("projects"))
+
+    report = run_check(upstream, scenario, tmp_path)
+
+    assert state["peak"] > 1, "the two batched lookups were made one after the other"
+    # And the verdicts are unaffected by the overlap.
+    assert entry_for(report, "alpha").status == STATUS_UP_TO_DATE
+
+
+def test_overlapping_the_batched_lookups_still_reports_both_kinds_of_failure(
+    tmp_path, upstream, monkeypatch
+):
+    """A failure in 1b means "we could not judge this mod", and one in 1c is only a missing title.
+
+    They are collected from the workers as values rather than appended to the report from
+    inside them, so this asserts the two are still told apart after the restructure: 1b failing
+    must not lose the mod, and 1c failing must not turn a verdict into an error.
+    """
+    from mod_update_checker.modrinth import ModrinthClient
+    from mod_update_checker.upstream import UpstreamError
+
+    scenario = Scenario(tmp_path, upstream)
+    mod = scenario.add_jar("alpha.jar", id="alpha", version="1.0.0", name="Alpha")
+    upstream.add_project(
+        FakeProject(
+            id="proj-alpha",
+            slug="alpha",
+            title="Alpha Mod",
+            versions=[
+                _version("proj-alpha", "a-100", "1.0.0", mod.sha1),
+                _version("proj-alpha", "a-110", "1.1.0", "9" * 40,
+                         date="2026-02-01T00:00:00Z"),
+            ],
+        )
+    )
+
+    def refuse_titles(self, *_args, **_kwargs):
+        raise UpstreamError("titles unavailable")
+
+    monkeypatch.setattr(ModrinthClient, "projects", refuse_titles)
+
+    report = run_check(upstream, scenario, tmp_path)
+
+    entry = entry_for(report, "alpha")
+    assert entry.status == STATUS_UPDATE_AVAILABLE, "a missing title must not change the verdict"
+    assert "note.modrinth_unavailable" in dict(report.upstream_notes)

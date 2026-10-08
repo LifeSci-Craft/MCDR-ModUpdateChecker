@@ -140,8 +140,9 @@ class ScannedMod:
     path: str
     size: int = 0
     mtime: float = 0.0
+    #: SHA-1 of the file's exact bytes, which is how Modrinth identifies it. Empty when the
+    #: caller asked for a metadata-only scan — see :func:`scan_mods`.
     sha1: str = ""
-    sha512: str = ""
     metadata: Optional[ModMetadata] = None
     error: Optional[str] = None
 
@@ -612,16 +613,30 @@ def read_metadata(archive: zipfile.ZipFile) -> Optional[ModMetadata]:
     return None
 
 
-def scan_jar(path: Path) -> ScannedMod:
-    """Hash one jar and read its metadata. Never raises."""
+def scan_jar(path: Path, hashes: bool = True) -> ScannedMod:
+    """Hash one jar and read its metadata. Never raises.
+
+    :param hashes: when ``False``, the file's bytes are never read — the size comes from
+        ``stat`` and ``sha1`` is left empty. Callers that only want to describe a folder
+        (counting jars, showing a status page) have no use for a digest, and on a real
+        modpack hashing every jar is seconds of reading that nothing asked for.
+    """
     mod = ScannedMod(file_name=path.name, path=str(path))
     try:
-        mod.mtime = path.stat().st_mtime
-        with open(path, "rb") as handle:
-            mod.sha1, mod.sha512, mod.size = digests_of_file(handle)
+        information = path.stat()
+        mod.mtime = information.st_mtime
+        mod.size = information.st_size
     except OSError as error:
         mod.error = "{}: {}".format(type(error).__name__, error)
         return mod
+
+    if hashes:
+        try:
+            with open(path, "rb") as handle:
+                mod.sha1, mod.size = digests_of_file(handle)
+        except OSError as error:
+            mod.error = "{}: {}".format(type(error).__name__, error)
+            return mod
 
     try:
         with zipfile.ZipFile(mod.path) as archive:
@@ -636,8 +651,15 @@ def scan_jar(path: Path) -> ScannedMod:
     return mod
 
 
-def scan_mods(directory: Path, logger: Optional[Any] = None) -> ScanResult:
-    """Scan a ``mods/`` folder. Missing directory yields an empty, well-formed result."""
+def scan_mods(
+    directory: Path, logger: Optional[Any] = None, hashes: bool = True
+) -> ScanResult:
+    """Scan a ``mods/`` folder. Missing directory yields an empty, well-formed result.
+
+    :param hashes: passed through to :func:`scan_jar`. ``False`` gives the same list of jars
+        with the same metadata and no bytes read, for the callers that are describing the
+        folder rather than identifying its contents.
+    """
     log = logger or _LOGGER
     result = ScanResult(directory=str(directory))
     jars, disabled = iter_mod_jars(directory)
@@ -645,7 +667,7 @@ def scan_mods(directory: Path, logger: Optional[Any] = None) -> ScanResult:
 
     for jar in jars:
         try:
-            result.mods.append(scan_jar(jar))
+            result.mods.append(scan_jar(jar, hashes=hashes))
         except Exception as error:  # noqa: BLE001 - one bad jar must not stop the scan
             log.warning("failed to inspect %s: %s", jar.name, error)
             result.mods.append(

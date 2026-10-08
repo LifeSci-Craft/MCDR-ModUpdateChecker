@@ -105,7 +105,7 @@ MC 的 Mod 版本号是一团乱麻：`1.2.3`、`v1.2.3`、`0.162.0+26.3`、`1.1
 | 能跑在 2.13 / 2.14 / 2.15 / 2.16 | 同上，跨 5 个 MCDR 版本跑矩阵；四个低版本与 2.16.0 的 **36 项检查逐项一致**（`--with-install` 那次是 34 项，差的两项是下载目录专属的断言，安装会把它搬空） |
 | Modrinth 的请求形状正确 | `tests/test_clients.py`。假上游的回答形状是**照线上实测抄的**（例如 `version_files/update` 无匹配时返回 `{}`），不是一个想当然的替身 |
 | 哈希识别在真实数据上成立 | 拿真实 Mod jar 对线上 API 跑完整流程，核对报告的版本号与下载链接 |
-| 单次遍历的摘要计算正确 | `tests/test_digests.py`：对整块缓冲区用 `hashlib` 交叉验证，并在**读块边界**两侧取样；另有一条断言证明内存不随文件大小增长 |
+| 摘要计算正确，且只算该算的 | `tests/test_digests.py`：对整块缓冲区用 `hashlib` 交叉验证，并在**读块边界**两侧取样；另有一条断言证明内存不随文件大小增长 |
 | 版本比对不会判反 | `tests/test_versioning.py`，含 `1.21.10 > 1.21.4` 这类反字典序用例 |
 | 下载的拒绝与重试两条路径都会被走到 | 假 CDN 提供三种坏情况：校验必定失败的字节、前两次损坏随后正常的抖动、不带 `Content-Length` 的流式响应；真实 MCDR 运行证明「抖动的文件最终落盘且哈希通过」「被篡改的文件 4 次尝试后放弃且不留残留」 |
 | 手动 `!!muc download` / `install` / `confirm` 真的能走通 | 上面那个矩阵运行里**真敲了** `!!muc download 1` → `!!muc confirm`：1 号的文件字节与哈希故意对不上，所以这条断言证明的是「真的开了 socket、真的被拒绝、下载目录里没留下残渣」；`!!muc install` 的两条分支（未下载要先 download、已下载要 `confirm`）也各有一条断言 |
@@ -117,8 +117,11 @@ MC 的 Mod 版本号是一团乱麻：`1.2.3`、`v1.2.3`、`0.162.0+26.3`、`1.1
 | 复用窗口不会被跨重启的报告骗到 | `test_a_report_for_a_different_mods_folder_is_not_reused` 等三条，加上 `test_a_report_that_still_applies_is_reused` 防止门禁「靠全部拒绝来通过」 |
 | 存档报告能被读回来、坏的那份被拒 | `tests/test_checker.py` 的 round-trip 一组：`format` 不认识就整个拒绝、一条坏记录只丢它自己、认不出的 `status` 降级成 `unresolved` |
 | 新依赖提醒不会对正常服务端开火 | `test_a_satisfied_dependency_is_not_reported`、`test_a_provided_id_satisfies_a_requirement`、`test_fabric_requires_ignores_recommends_and_suggests`，以及 `optional` / `unknown` 的 `server_side` 参数化用例 |
+| `!!muc status` 不会读 jar 的字节 | `test_the_status_screen_does_not_hash_the_mods_folder`：**数**摘要函数的调用次数，而不是让它抛异常。`scan_mods` 会吞掉单个 jar 的异常并把它记成「读不了」，所以抛异常那个写法会让这个测试在错误的原因下通过；配套的 `test_the_status_screen_still_reads_the_metadata` 防止「不哈希」退化成「不读文件夹」 |
+| 两个批量查询只花一个往返 | `test_the_two_batched_lookups_share_one_round_trip`：数同时在飞的调用数，并配一条断言证明 1c 失败只是少了标题、不会改变判定 |
+| 版本号三处写法一致 | `tests/test_docs.py`：README 里那张样例状态屏的版本、CHANGELOG 的**第一个** `## ` 标题（`tools/release.py` 就是拿它当发布正文的）都必须等于 `mcdreforged.plugin.json` 的版本，且 CHANGELOG 只允许有一个版本段 |
 
-测试套件共 **582 项**（其中 2 项是真实 MCDR 端到端，只在 CI 上跑；当前数量用
+测试套件共 **590 项**（其中 2 项是真实 MCDR 端到端，只在 CI 上跑；当前数量用
 `pytest --collect-only -q | tail -1` 查；这一行是快照，
 所以上面那张表里的「36 项检查」才是被测试自动核对的那个数字），细节见 [`tests/README.md`](tests/README.md)。
 
@@ -189,7 +192,7 @@ mod_update_checker/
 ├── projectmap.py    sources.manual_map：读管理员手写的「jar → 项目」清单（只读，从不写）
 ├── upstream.py      HTTP 层：重试、限速、限流、可配置 base url
 ├── versioning.py    版本比较与 MC 版本范围匹配
-├── digests.py       单次遍历算出 SHA-1 / SHA-512 / 大小
+├── digests.py       算出 SHA-1 与大小（只算真的会被用到的那一个）
 ├── downloads.py     下载新版本、哈希校验、清单与旧版本清理；单一文件名安全校验
 ├── installer.py     关服后把下载好的版本装进 mods/（唯一会改动 mods/ 的模块）
 ├── report.py        报告模型、序列化与反序列化、渲染

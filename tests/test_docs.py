@@ -291,3 +291,53 @@ def test_every_repository_url_names_the_same_repository():
     # the repo lives under the org.
     authors = {entry["name"] for entry in metadata["authors"]}
     assert authors, "no author is declared"
+
+
+# --------------------------------------------------------------------------------------
+# The version, which is written down in three places by hand
+# --------------------------------------------------------------------------------------
+#
+# `mcdreforged.plugin.json` is what MCDR reads, `CHANGELOG.md`'s top section is what the release
+# notes are built from, and the sample status screen in the user README shows a title bar with
+# the version in it. All three are edited during a release, none of them imports the others, and
+# getting one wrong produces documentation that describes a plugin nobody can install.
+
+#: ``===============  Mod Update Checker v1.1.0  ===============``
+_TITLE_BAR_VERSION = re.compile(r"Mod Update Checker v([0-9][\w.\-]*)")
+
+
+def _shipped_version() -> str:
+    return json.loads((REPO / "mcdreforged.plugin.json").read_text(encoding="utf-8"))["version"]
+
+
+def test_the_readme_sample_shows_the_shipped_version():
+    """The sample is a screenshot in text form; a wrong number there is a broken screenshot."""
+    found = set(_TITLE_BAR_VERSION.findall(_doc(USER_DOC)))
+
+    assert found == {_shipped_version()}, (
+        "the README shows {} but the plugin is {}".format(sorted(found), _shipped_version())
+    )
+
+
+def test_the_changelog_leads_with_the_shipped_version():
+    """``tools/release.py`` builds the release body from the top ``## `` section.
+
+    So a changelog whose first heading is a version that was never shipped publishes release
+    notes for a version that does not exist — and the release itself is still cut from the tag,
+    which means nothing else would notice.
+    """
+    headings = [line for line in _doc("CHANGELOG.md").splitlines() if line.startswith("## ")]
+
+    assert headings, "the changelog has no version sections"
+    assert headings[0] == "## v{}".format(_shipped_version()), headings[0]
+
+
+def test_the_changelog_keeps_only_the_latest_release():
+    """The project's rule, stated at the top of the file and enforced here.
+
+    Older entries live on the Releases page because the file ships inside the plugin, and a
+    ``.mcdr`` carrying five versions of history is a file every user downloads and nobody reads.
+    """
+    headings = [line for line in _doc("CHANGELOG.md").splitlines() if line.startswith("## ")]
+
+    assert len(headings) == 1, headings
