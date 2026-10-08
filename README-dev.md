@@ -120,9 +120,18 @@ MC 的 Mod 版本号是一团乱麻：`1.2.3`、`v1.2.3`、`0.162.0+26.3`、`1.1
 `display_width()` 用 `unicodedata.east_asian_width` 数 W/F 为 2、其余为 1。
 
 **页数预算是算出来的，不是估的。** `_INDEX_FIXED_LINES` 是「行以外还会打印几行」：标题栏、服务端
-上下文、小节标题、统计行、提示行，以及被截断时那一行。加一个界面元素就要把它调大——它上次是 5，
-这次因为每个界面都多了标题栏而变成 6，否则预算会悄悄不再是预算（`test_the_listing_fits_a_page_
-whatever_the_server_holds` 是量它的那把尺）。
+上下文、小节标题、统计行、提示行，以及翻页那一行。加一个界面元素就要把它调大——它从 5 涨到 6
+（每个界面多了标题栏），v1.5.0 又涨到 7（多了翻页行），否则预算会悄悄不再是预算
+（`test_the_listing_fits_a_page_whatever_the_server_holds` 是量它的那把尺）。
+
+**翻页和取行是两件事。** `index_page()` 只回答「这一页是哪些行」，`render_index()` 才决定这些行
+怎么画；聊天与控制台两个渲染器共用前者。合成一件事的话，「控制台看到的第二页」和「点第二页按钮
+得到的」会很容易变成两批不同的 Mod——而这两条路径平时根本不会同时被人跑到。
+
+**上色是三段而不是两段。** 角色（`Notice.role`）在句子被造出来的地方决定，颜色在
+`_tell_player` 里按角色查表——**没有一处按文本猜颜色**。v1.3.0 删掉的那个「关键字命中就上色」的
+函数就是反例：它看起来更省事，但只要文案改一个字，颜色就静默地错。词汇表只有四个角色：
+`heading` / `action` / `done` / `hint`。
 
 ---
 
@@ -131,7 +140,7 @@ whatever_the_server_holds` 是量它的那把尺）。
 | 结论 | 核验方式 |
 |---|---|
 | 能在真实 MCDR 里加载、跑完检查、注册全部命令 | `tools/mcdr_matrix.py`：在指定解释器里起真实 MCDR + 假服务端 + 假上游，驱动全流程（`tests/test_e2e.py` 是它的 pytest 封装） |
-| 能跑在 2.13 / 2.14 / 2.15 / 2.16 | 同上，跨 5 个 MCDR 版本跑矩阵；四个低版本与 2.16.0 的 **40 项检查逐项一致**（`--with-install` 那次是 38 项，差的两项是下载目录专属的断言，安装会把它搬空） |
+| 能跑在 2.13 / 2.14 / 2.15 / 2.16 | 同上，跨 5 个 MCDR 版本跑矩阵；四个低版本与 2.16.0 的 **43 项检查逐项一致**（`--with-install` 那次是 41 项，差的两项是下载目录专属的断言，安装会把它搬空） |
 | Modrinth 的请求形状正确 | `tests/test_clients.py`。假上游的回答形状是**照线上实测抄的**（例如 `version_files/update` 无匹配时返回 `{}`），不是一个想当然的替身 |
 | 哈希识别在真实数据上成立 | 拿真实 Mod jar 对线上 API 跑完整流程，核对报告的版本号与下载链接 |
 | 摘要计算正确，且只算该算的 | `tests/test_digests.py`：对整块缓冲区用 `hashlib` 交叉验证，并在**读块边界**两侧取样；另有一条断言证明内存不随文件大小增长 |
@@ -160,10 +169,16 @@ whatever_the_server_holds` 是量它的那把尺）。
 | 批量安装仍是一条一条授权 | `test_install_all_authorises_every_downloaded_build`：从磁盘读回 ledger，核对恰好是那三个 key 被授权。注入验证里把循环改成 `entries[:1]`（只装第一个）时确实失败 |
 | 下载完成会通知，且不受 `report.in_game` 控制 | `test_a_finished_download_is_announced_to_the_console_and_to_admins`（控制台一行 + 权限够的管理员收到、权限不够的收不到）、`test_a_check_that_fetched_nothing_says_nothing`（非事件不发）、`test_a_join_check_keeps_the_completion_on_the_console_only`（`broadcast=False` 时只有控制台） |
 | 源码行末统一 LF | `test_no_source_file_carries_windows_line_endings`：扫工作区（跳过二进制与缓存），任何 `\r\n` 都失败。它守的是 Git 看不见的那一侧——`.gitattributes` 只在**提交时**归一，而「读文件再写回」的脚本会在 Windows 上把整份文件翻成 CRLF，内容一个字没改，diff 却全是警告 |
+| 前缀能匹配、且绝不比精确更宽 | `test_a_unique_prefix_of_a_name_is_enough`（唯一前缀命中）、`test_a_prefix_that_matches_two_mods_is_refused_and_lists_them`（多个就列出候选并拒绝）、`test_an_exact_match_is_never_widened_into_a_prefix_search`（有一个 Mod 就叫 `sod` 时，它就是 `sod`）、`test_a_prefix_is_matched_through_the_same_normalisation_as_everything_else`（前缀走与精确同一套归一化）。矩阵里另有一条：控制台的补全接口真的列出候选（`tree._entry_generate_suggestions`） |
+| 游戏内没有 Tab 补全可用 | 不是「没做」，是**做不到**：原版的补全只对 `/` 开头的命令生效，`!!` 命令是一条聊天消息。所以游戏内给的是 `suggest_command` 点击事件（点一下把命令填进输入框），矩阵断言候选那一行确实带那个事件 |
+| 列表一页装得下、翻页不丢行 | `test_every_mod_is_on_exactly_one_page`（所有页拼起来恰好等于全集，不多不少）、`test_a_page_past_the_end_lands_on_the_last_one`（越界落在最后一页）、`test_the_pager_line_names_the_commands_a_console_can_type`（控制台拿到的是能敲的命令，不是按不动的方框）、`test_the_first_page_is_the_mods_that_need_attention`（排序保证第一页就是要动手的那批）。矩阵里那一条**数**列表出现了几次，因为「有列表出现过」在页码参数被拒时照样成立 |
+| 只可能在客户端用的依赖不算缺依赖 | `test_a_missing_dependency_that_cannot_run_on_a_server_is_not_reported`、`test_only_the_client_only_dependencies_are_taken_out_of_the_list`（排除的恰好是那一个，其余照报）、`test_a_dependency_on_a_server_capable_project_is_still_reported`（`optional` 与没标记的不排除）。三条合起来钉住「只有 `unsupported` 才排除」 |
+| 提醒按角色上色 | `test_an_install_notice_is_coloured_by_role_not_painted_one_colour`、`test_the_update_notice_gives_each_kind_of_line_its_role`；矩阵里读**发出去的 payload**核对标题段确实白、待办行确实黄——这是唯一能证明「游戏真的收到了这个颜色」的地方 |
+| README 里的样例屏就是插件画的那一屏 | `test_the_readme_sample_screens_start_with_the_bar_the_plugin_draws`：拿 `_title_line()` 的真输出跟 README 里每一条标题栏逐字比对。标题栏的 `=` 是按常量算出来的，而三条样例曾长期停在一个早已改掉的宽度上——只查版本号的话永远发现不了 |
 
-测试套件共 **627 项**（其中 2 项是真实 MCDR 端到端，只在 CI 上跑；当前数量用
+测试套件共 **648 项**（其中 2 项是真实 MCDR 端到端，只在 CI 上跑；当前数量用
 `pytest --collect-only -q | tail -1` 查；这一行是快照，
-所以上面那张表里的「40 项检查」才是被测试自动核对的那个数字），细节见 [`tests/README.md`](tests/README.md)。
+所以上面那张表里的「43 项检查」才是被测试自动核对的那个数字），细节见 [`tests/README.md`](tests/README.md)。
 
 ---
 

@@ -153,11 +153,18 @@ write_server_output_to_log_file: false
 #: waiting) and ``5`` is Blocked Mod (nothing published for this loader). A change to the
 #: scenario that moves them fails these assertions loudly, which is the point.
 COMMANDS = [
+    # 裸命令 = 帮助页（v1.5.0 起，项目约定），汇总搬到了自己的词上。
     "!!modupdate",
+    "!!modupdate summary",
     "!!modupdate help",
     "!!modupdate status",
     "!!modupdate list",
     "!!modupdate list update_available",
+    # A trailing page number, on a status that the scenario guarantees is non-empty (the
+    # download stage always leaves something waiting to be installed). Before v1.5.0 this was a
+    # parse error — and "some listing appeared" would not have noticed, which is why the check
+    # on it counts listings instead of looking for one.
+    "!!modupdate list awaiting_install 2",
     # The listing is a numbered index now; this is the click target on one of its rows. A
     # number is deliberate here — it is the one place the number path is exercised for real.
     "!!modupdate info 1",
@@ -209,6 +216,8 @@ MANUAL_INSTALL_COMMAND = "!!muc confirm"
 #: because the MCDR instance is pinned to zh_cn and the plugin follows it.
 COMMAND_EXPECTATIONS = {
     "summary": plugin_badge(),
+    # 裸命令显示帮助页 —— 从帮助页的用法行里认，而不是从「有没有打印东西」认。
+    "bare_help": "不带子命令就是本页",
     "help": "!!modupdate list",
     # ASCII colon: the separator is part of the translated label, not hardcoded.
     "status_mc": "服务端: 26.3",
@@ -429,6 +438,10 @@ def plugin_config(upstream, install: bool = False) -> dict:
     return config
 
 
+#: The part of the listing's tail that every listing prints, whatever it holds. Counted, not
+#: searched for: "how many listings came out" is the question the paged command turns on.
+LISTING_MARKER = "点 [详细信息] 看版本变更与链接"
+
 #: The install summary line, as the plugin writes it. Checked verbatim so a run cannot pass
 #: on an install that never announced itself.
 #: The marker both install messages carry, so the check does not depend on which of the two
@@ -608,6 +621,39 @@ def _sha1_of(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _walk_fragments(payload, colour=None):
+    """Every ``(colour, text)`` run in a chat component, depth first.
+
+    MCDR serialises an ``RTextList`` as an object whose ``text`` is a list on some versions and
+    as a bare list on others, so both shapes are walked rather than assumed. Assuming an object
+    is what made this tool die on 2.13.0 with ``'list' object has no attribute 'get'`` — the
+    payload was fine, the reader was not.
+
+    A nested fragment inherits the colour of its parent unless it sets its own, which is how
+    Minecraft resolves it too.
+    """
+    if isinstance(payload, str):
+        yield colour, payload
+        return
+    if isinstance(payload, list):
+        for item in payload:
+            for pair in _walk_fragments(item, colour):
+                yield pair
+        return
+    if not isinstance(payload, dict):
+        return
+    own = payload.get("color", colour)
+    text = payload.get("text")
+    if isinstance(text, str):
+        if text:
+            yield own, text
+    else:
+        for pair in _walk_fragments(text, own):
+            yield pair
+    for pair in _walk_fragments(payload.get("extra"), own):
+        yield pair
+
+
 def _collect_tellraw(console: str) -> tuple:
     """Every ``tellraw`` the plugin sent to the test player, as parsed payloads.
 
@@ -621,12 +667,16 @@ def _collect_tellraw(console: str) -> tuple:
     Minecraft 1.13+, so the tellraw is located by searching for it rather than assumed to be
     at the start; which form was used is reported too, since it is version-dependent.
 
-    Returns ``(payloads, wrapped, errors)`` so a malformed command fails the run instead of
-    being silently skipped.
+    Returns ``(texts, fragments, wrapped, errors)``: one string per payload, then every
+    ``(colour, text)`` run across all of them flattened. The colours are here because the
+    notice is meant to say *what needs doing* by colour, and "which colour did the game
+    actually receive" is only answerable from the payload. A malformed command fails the run
+    instead of being silently skipped.
     """
     marker = "(tellraw) "
     needle = "tellraw {} ".format(TEST_PLAYER)
-    payloads = []
+    texts = []
+    fragments = []
     errors = []
     wrapped = None
     for line in console.splitlines():
@@ -645,12 +695,13 @@ def _collect_tellraw(console: str) -> tuple:
         except ValueError:
             errors.append("not valid JSON: {}".format(raw[:120]))
             continue
-        text = payload.get("text")
-        if not isinstance(text, str) or not text.strip():
+        runs = list(_walk_fragments(payload))
+        if not any(text.strip() for _, text in runs):
             errors.append("no text in the payload: {}".format(raw[:120]))
             continue
-        payloads.append(text)
-    return payloads, wrapped, errors
+        fragments.extend(runs)
+        texts.append("".join(text for _, text in runs))
+    return texts, fragments, wrapped, errors
 
 
 def summarise(
@@ -714,8 +765,20 @@ def summarise(
         entry["file_name"]: entry["status"] for entry in report.get("entries", [])
     }
 
-    tellraws, tellraw_wrapper, tellraw_errors = _collect_tellraw(console)
+    tellraws, fragments, tellraw_wrapper, tellraw_errors = _collect_tellraw(console)
     joined = "\n".join(tellraws)
+
+    # The notices say *what needs doing* by colour, not by wording — a heading is white, a row
+    # somebody has to act on is yellow, a row that is already done is gray. Read off the payload
+    # because that is the only place the colours exist: the builders decide roles, and the game
+    # receives the finished thing. Before v1.5.0 every run was yellow, which is what the two
+    # assertions below are watching for.
+    headings = {colour for colour, text in fragments if "尚未下载" in text}
+    rows = {colour for colour, text in fragments if "->" in text}
+    # The listing is counted rather than merely found. Three commands in ``COMMANDS`` end in a
+    # listing, and the third one is the point: a trailing page number has to be *accepted by the
+    # command tree*, so a run where the argument is refused prints two listings instead of three.
+    listings = console.count(LISTING_MARKER)
 
     # What the auto-download stage actually put on disk, compared against what the CDN
     # published. Every file that is downloadable must be there byte for byte, and the ones that
@@ -795,6 +858,11 @@ def summarise(
         "notify_payloads": tellraws,
         "notify_wrapper": tellraw_wrapper,
         "notify_errors": tellraw_errors,
+        "notify_colours": sorted({colour for colour, _ in fragments if colour}),
+        # Two colours, two jobs: the heading says what the block is, the rows are the work. A
+        # single-colour notice fails both halves, which is deliberate — the point of the change
+        # was that a finished install must not look as urgent as a pending one.
+        "notify_coloured_by_role": headings == {"white"} and rows == {"yellow"},
         "downloads_written": downloaded,
         "downloads_verified": verified,
         "downloads_leftovers": leftovers,
@@ -853,10 +921,12 @@ def summarise(
         ),
         "statuses": statuses,
         "command_summary": COMMAND_EXPECTATIONS["summary"] in console,
+        "command_bare_help": COMMAND_EXPECTATIONS["bare_help"] in console,
         "command_help": COMMAND_EXPECTATIONS["help"] in console,
         "command_status": COMMAND_EXPECTATIONS["status_mc"] in console,
         "command_list_all": COMMAND_EXPECTATIONS["list_all"] in console,
         "command_list_filtered": COMMAND_EXPECTATIONS["list_filtered"] in console,
+        "command_list_page_number": listings >= 3,
         "command_info": COMMAND_EXPECTATIONS["info_detail"] in console,
         "command_reload": COMMAND_EXPECTATIONS["reload"] in console,
         "command_alias": COMMAND_EXPECTATIONS["alias"] in console,
@@ -893,12 +963,15 @@ CHECK_KEYS = [
     "notify_in_game_sent",
     "admin_join_notified",
     "notify_payloads_valid",
+    "notify_coloured_by_role",
     "notify_lists_both_groups",
     "command_summary",
+    "command_bare_help",
     "command_help",
     "command_status",
     "command_list_all",
     "command_list_filtered",
+    "command_list_page_number",
     "command_info",
     "command_reload",
     "command_alias",

@@ -302,8 +302,11 @@ def test_every_repository_url_names_the_same_repository():
 # the version in it. All three are edited during a release, none of them imports the others, and
 # getting one wrong produces documentation that describes a plugin nobody can install.
 
-#: ``===============  Mod Update Checker v1.1.0  ===============``
+#: ``===============  Mod Update Checker v1.5.0  ===============``
 _TITLE_BAR_VERSION = re.compile(r"Mod Update Checker v([0-9][\w.\-]*)")
+
+#: The whole line, both sides of ``=`` included — so the sample can be compared to the real one.
+_TITLE_BAR_LINE = re.compile(r"^=+  Mod Update Checker v\S+  =+$", re.MULTILINE)
 
 
 def _shipped_version() -> str:
@@ -316,6 +319,42 @@ def test_the_readme_sample_shows_the_shipped_version():
 
     assert found == {_shipped_version()}, (
         "the README shows {} but the plugin is {}".format(sorted(found), _shipped_version())
+    )
+
+
+class _SampleMetadata:
+    """A plugin metadata object with the shipped version, for the title bar to read."""
+
+    name = "Mod Update Checker"
+
+    def __init__(self, version: str):
+        self.version = version
+
+
+class _SampleServer:
+    def get_self_metadata(self):
+        return _SampleMetadata(_shipped_version())
+
+
+def test_the_readme_sample_screens_start_with_the_bar_the_plugin_draws():
+    """The samples are screenshots in text form, and the bar around the version is *drawn*.
+
+    ``_title_line`` sizes the ``=`` from ``_TITLE_WIDTH`` and the length of the name and version,
+    so a sample with a hand-counted run of ``=`` is a picture of a screen this plugin does not
+    produce. Three of them were exactly that: the width constant grew and the samples kept the
+    old bar, which nothing noticed because they were only ever checked for the version number.
+
+    Built from the plugin rather than from the constant, so there is no second copy of the
+    arithmetic to fall out of step with the first.
+    """
+    import mod_update_checker as plugin
+
+    expected = str(plugin._title_line(_SampleServer()))
+    found = _TITLE_BAR_LINE.findall(_doc(USER_DOC))
+
+    assert found, "the README has no sample screen left"
+    assert set(found) == {expected}, "samples show {}, the plugin draws {}".format(
+        sorted(set(found)), expected
     )
 
 
