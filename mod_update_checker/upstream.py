@@ -20,7 +20,7 @@ injects the logger it wants to use.
 import threading
 import time
 from collections import deque
-from typing import Any, Callable, Dict, Iterable, Optional, Sequence
+from typing import Any, Callable, Dict, Optional
 
 import requests
 

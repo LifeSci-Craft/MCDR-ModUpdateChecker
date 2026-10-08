@@ -14,7 +14,6 @@ from mod_update_checker.modrinth import ModrinthClient
 from mod_update_checker.upstream import (
     HttpClient,
     RateLimiter,
-    Unauthorised,
     UpstreamError,
 )
 

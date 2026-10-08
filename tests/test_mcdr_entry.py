@@ -1222,7 +1222,6 @@ def test_the_status_screen_uses_the_same_title_bar_as_the_help():
     plugin name, and it opens both screens.
     """
     import mod_update_checker as plugin
-    from mcdreforged.api.rtext import RColor
 
     class _Scan:
         directory = "server/mods"
@@ -1353,7 +1352,6 @@ def test_download_stages_a_plan_and_fetches_nothing(tmp_path, monkeypatch):
 
 def test_confirm_is_what_runs_the_download(tmp_path, monkeypatch):
     """And the outcome is reported back with the next command to type."""
-    import mod_update_checker as plugin
     from mod_update_checker.downloads import STATUS_DOWNLOADED
 
     plugin_mod, server, source, entry, _ledger = _manual_env(tmp_path, monkeypatch)
@@ -1381,7 +1379,6 @@ def test_confirm_is_what_runs_the_download(tmp_path, monkeypatch):
 
 def test_a_failed_download_says_why_and_stays_an_update(tmp_path, monkeypatch):
     """A failure is reported in words, not as the internal code it travels as."""
-    import mod_update_checker as plugin
     from mod_update_checker.downloads import STATUS_FAILED
 
     plugin_mod, _server, source, entry, _ledger = _manual_env(tmp_path, monkeypatch)
@@ -1446,7 +1443,6 @@ def test_install_refuses_a_mod_that_has_not_been_downloaded(tmp_path, monkeypatc
 
 def test_install_stages_the_swap_and_confirm_authorises_only_that_mod(tmp_path, monkeypatch):
     """The whole point of the per-record flag: five downloads, one named, one installed."""
-    import mod_update_checker as plugin
     from mod_update_checker.downloads import DownloadLedger
 
     plugin_mod, server, source, _entry, ledger = _manual_env(
@@ -1474,7 +1470,6 @@ def test_install_stages_the_swap_and_confirm_authorises_only_that_mod(tmp_path, 
 
 
 def test_confirm_with_nothing_staged_says_so(tmp_path, monkeypatch):
-    import mod_update_checker as plugin
 
     plugin_mod, _server, source, _entry, _ledger = _manual_env(tmp_path, monkeypatch)
     plugin_mod._clear_pending()
@@ -1514,7 +1509,6 @@ def test_a_confirmation_is_dropped_when_the_report_moved_underneath_it(tmp_path,
     Re-resolving ``1`` against a report that has been replaced is how the wrong mod gets
     installed — the numbers still exist, they just mean something else now.
     """
-    import mod_update_checker as plugin
     from mod_update_checker.report import UpdateEntry
 
     plugin_mod, server, source, _entry, _ledger = _manual_env(
@@ -1537,7 +1531,6 @@ def test_a_confirmation_is_dropped_when_the_report_moved_underneath_it(tmp_path,
 
 def test_the_console_counts_as_its_own_requester(tmp_path, monkeypatch):
     """A player cannot confirm a plan the console staged, and vice versa."""
-    import mod_update_checker as plugin
 
     plugin_mod, server, _source, _entry, _ledger = _manual_env(tmp_path, monkeypatch)
     console = _ReplyRecorder()
@@ -1564,9 +1557,7 @@ def test_install_on_stop_installs_only_what_was_authorised(tmp_path, monkeypatch
     This is the invariant the per-record flag exists for. Installing the whole ledger here
     would turn "install this one" into "install everything that happens to be downloaded".
     """
-    import mod_update_checker as plugin
     from mod_update_checker.downloads import DownloadLedger
-    from mod_update_checker.installer import STATUS_INSTALLED
 
     plugin_mod, server, _source, entry, ledger = _manual_env(
         tmp_path, monkeypatch, status="awaiting_install"
@@ -1606,8 +1597,6 @@ def test_install_on_stop_installs_only_what_was_authorised(tmp_path, monkeypatch
 
 def test_install_on_stop_does_nothing_at_all_without_an_approval(tmp_path, monkeypatch):
     """A server that never used the command must not grow an install report."""
-    import mod_update_checker as plugin
-    from mod_update_checker.downloads import DownloadLedger
 
     plugin_mod, server, _source, _entry, _ledger = _manual_env(tmp_path, monkeypatch)
     monkeypatch.setattr(plugin_mod, "_config", _config_with(), raising=False)
@@ -1624,7 +1613,6 @@ def test_install_on_stop_does_nothing_at_all_without_an_approval(tmp_path, monke
 
 def test_the_automatic_setting_installs_the_whole_ledger(tmp_path, monkeypatch):
     """Switching install-on-stop on is itself the instruction, so the flag is not consulted."""
-    import mod_update_checker as plugin
     from mod_update_checker.installer import pending_records
 
     plugin_mod, _server, _source, _entry, ledger = _manual_env(tmp_path, monkeypatch)

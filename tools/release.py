@@ -200,7 +200,9 @@ def upload_asset(token: str, upload_url: str, path: Path) -> dict:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as error:
         body = error.read().decode("utf-8", errors="replace")
-        raise Failure("could not upload {} (HTTP {}): {}".format(path.name, error.code, body[:300]))
+        raise Failure(
+            "could not upload {} (HTTP {}): {}".format(path.name, error.code, body[:300])
+        ) from error
 
 
 def download_asset(url: str, destination: Path) -> None:

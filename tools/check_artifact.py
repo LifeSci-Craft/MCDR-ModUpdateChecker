@@ -56,6 +56,7 @@ FORBIDDEN_ROOTS = (
     "pack.py",
     "conftest.py",
     "pytest.ini",
+    "ruff.toml",
     "tests/",
     "tools/",
     "docs/",

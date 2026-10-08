@@ -58,6 +58,9 @@ MC 的 Mod 版本号是一团乱麻：`1.2.3`、`v1.2.3`、`0.162.0+26.3`、`1.1
 ## 开发
 
 ```bash
+# 代码风格（规则见根目录 ruff.toml；target-version 是 3.8，因为插件要支持 MCDR 2.13.0）
+ruff check .
+
 # 测试
 python -m pip install --target .testlibs -r tests/requirements-test.txt
 PYTHONPATH=.testlibs python -m pytest -m "not e2e"     # 快
