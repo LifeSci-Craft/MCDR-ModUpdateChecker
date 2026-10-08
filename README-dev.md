@@ -12,13 +12,76 @@
 
 ## 它是怎么判断的
 
-一次检查分三级，从最便宜最可靠开始，每一级只处理上一级答不出来的：
+一次检查分四级，从最便宜最可靠开始，每一级只处理上一级答不出来的：
 
 1. **Modrinth 按 SHA-1 批量识别。** 通常一两次请求就能识别整个 mods 目录，并拿到「适配当前加载器 +
    游戏版本的最新构建」。这一步能解决绝大多数 Fabric 服务端，而且不需要任何凭据。
-2. **按名称兜底。** 有些 jar 是自己编译的、被重新签名或重新打包过的，字节与发布版本不同，哈希自然对不上。
-   这时用 mod id 去匹配项目 slug，**只接受完全一致**的结果，并在报告里标注 `matched_by: name`。
-3. **附加提醒。** 重复 mod id、仅客户端 Mod、声明的 MC 范围与当前服务端不符。
+2. **管理员自己写的映射表**（`sources.manual_map`，默认 `project-map.json`）。自己编译、改签名、
+   fork 过的 jar 字节与发布版本不同，哈希对不上，mod id 也可能对不上任何 slug——但**管理员知道它是什么**。
+   这一步排在第 3 步**之前**：它是一句陈述，而名称匹配是一次猜测，让猜测先跑就等于允许一个 slug 巧合
+   静默推翻管理员的明确说法。命中后报告标 `matched_by: manual`。
+3. **按名称兜底。** 用 mod id 去匹配项目 slug，**只接受完全一致**的结果，并标注 `matched_by: name`。
+4. **附加提醒。** 重复 mod id、仅客户端 Mod、Modrinth 标记为不支持服务端、**缺少依赖**、声明的 MC
+   范围与当前服务端不符。
+
+### 两处刻意的「宁可多报」
+
+「缺少依赖」和「不支持服务端」这两条都会误报，而且**都往多报的方向偏**——理由一样：漏报会让你找不到
+崩溃原因，多报只是多看一眼。具体是：
+
+- **缺少依赖**只认**必装**依赖（Fabric/Quilt 的 `depends`、Forge/NeoForge 里 `mandatory` 不为 false 的），
+  平台本身（`minecraft` / `fabricloader` / `forge` / `neoforge` / `java` …，见 `scanner.PLATFORM_MOD_IDS`）
+  已经剔除。会误报的两种情况都**看不见**：依赖被打包在别的 jar 内部（jar-in-jar 只数不打开），或者被
+  放进了 `.disabled` / `.old`。`provides` 会被认作满足，因为那是加载器实际会用的替换声明。
+- **不支持服务端**用的是 Modrinth 的 `server_side == "unsupported"`，不是 jar 自己的 `environment`。
+  两者互补：jar 只声明 `environment: *` 而平台标了 `unsupported` 的 Mod，只有这一条能抓到。
+  `optional` 和 `unknown` **都不报**——把「平台没分类」当成「这玩意不能跑」是纯粹的噪音。
+
+### 两个状态文件，以及它们各自被读回来的原因
+
+数据文件夹里有两份 JSON 会影响下一次检查的判断，两者的立场完全相反：
+
+| 文件 | 什么时候读 | 为什么值得读回来 |
+|---|---|---|
+| `resolve-cache.json` | 每次检查 | **只存否定答案**：「这个哈希识别不了」，且只由第 3 步（名称搜索）写入——那一步为了证明一个 jar 不在平台上要花一次搜索加一次版本查询，是最贵的答案，而明天答案不会变 |
+| `last_report.json` | 插件加载时 | 让 `report.reuse_report_minutes` 那个复用窗口**跨重启有效**。否则每次重启后第一个管理员上线都必然触发一次全量检查 |
+
+`resolve-cache.json` **不存正向识别**，也不存任何关于更新的结论。前者是没必要的：正向识别来自
+对整个目录的**一次**批量请求，记住它省不下什么，而一份过期的正向结论是在断言一批可能已经被换掉的字节。
+后者是设计底线：有没有新版本正是检查的意义，必须每次现问。
+
+`last_report.json` 的读回比看上去更需要小心，因为它**跨版本存活**：
+
+- 写出的 JSON 带一个 `format` 标记（`report.py` 里的 `REPORT_FORMAT`），读的时候**不匹配就整个拒绝**。
+  拒绝的代价只是多跑一次检查，所以严格是划算的——升级后第一次上线多查一次，好过按老形状乐观解读；
+- 每一行都靠 `report.py` 里那几个 `_text` / `_integer` / `_notes` 强制转型，**一条坏记录只丢它自己**；
+- 认不出的 `status` 一律降级成 `unresolved`。没有别的办法如实陈述一个这个版本不知道的状态，而让它回退成
+  `status.something_new` 原样打进日志更糟；
+- 只在 `report.write_file` 打开时才读——那个选项的字面意思就是「把结果留在盘上」。
+
+### 「这份结果还算数吗」不只是「它有多旧」
+
+`report.reuse_report_minutes` 原先只看时间。这在报告只存在内存里时够用，现在报告跨重启存活，
+「多久以前生成的」和「还描不描述这台服务端」就成了两个问题。所以复用前还要过一遍
+`_report_still_applies()`：
+
+- `server.mods_directory` 必须和当前解析出来的目录一致（管理员可能换了目录）；
+- `server.loader` 必须一致；
+- `server.mc_version` **写死时**必须一致。
+
+**已知漏洞**：`mc_version: auto` 时没有便宜的对照物（推断要读日志、读不到就要扫每个 jar），所以自动推断
+出来的版本变化仍可能被漏掉。README 本来就建议升级大版本后写死版本号，这里是那条建议多出来的一个理由。
+
+### 「自上次检查以来新出现了什么」
+
+`update_available` 是一个**状态**而不是**事件**：一个等了一周的更新和一个一小时前刚发布的更新，报告里
+长得一模一样。`Report.record_new_since(previous)` 用上一份报告做差集，`new_since_last` 只收
+**新变成** `update_available` 的文件名。三个边界是刻意的：
+
+- 只比 `update_available`。刚被下载下来的那些变成了 `awaiting_install`，那是管理员自己干的，不是新闻；
+- 用**文件名**做身份，因为这是两份报告不需要重新解析任何东西就能对上的东西；
+- 没有上一份报告时是空集，渲染时**什么都不写**——「没有新东西」和「没得比」会写出同一句话，
+  而只有一句值得读。
 
 ### 版本比对的取舍
 
@@ -49,8 +112,14 @@ MC 的 Mod 版本号是一团乱麻：`1.2.3`、`v1.2.3`、`0.162.0+26.3`、`1.1
 | 授权安装只装点名的那一个 | `test_install_on_stop_installs_only_what_was_authorised`：清单里放两条、只授权一条，断言另一条的 jar 连 `.old` 都没出现过 |
 | MCDR 生命周期语义（重复注册、reload 不触发 `on_unload`） | 逐条对照安装的 MCDR 源码核实，并用 AST 级测试钉住「模块级按名注册、不得再显式注册」这条约束 |
 | 上游行为与代码假设一致 | `tools/probe_upstream.py`——上线后上游若有变化，重跑它就能看出差别 |
+| 自己写的映射表确实赢了名称搜索 | `test_the_map_beats_the_name_search`：那个 jar 的 mod id **正好**等于另一个项目的 slug，所以名称搜索会兴高采烈地把它解析成**错的项目**；断言拿到的是映射表那个 |
+| 映射表填错会说出来而不是猜 | `test_a_map_entry_pointing_nowhere_is_reported_rather_than_guessed`，以及 `tests/test_projectmap.py` 里每一种畸形 JSON 都走一遍 |
+| 复用窗口不会被跨重启的报告骗到 | `test_a_report_for_a_different_mods_folder_is_not_reused` 等三条，加上 `test_a_report_that_still_applies_is_reused` 防止门禁「靠全部拒绝来通过」 |
+| 存档报告能被读回来、坏的那份被拒 | `tests/test_checker.py` 的 round-trip 一组：`format` 不认识就整个拒绝、一条坏记录只丢它自己、认不出的 `status` 降级成 `unresolved` |
+| 新依赖提醒不会对正常服务端开火 | `test_a_satisfied_dependency_is_not_reported`、`test_a_provided_id_satisfies_a_requirement`、`test_fabric_requires_ignores_recommends_and_suggests`，以及 `optional` / `unknown` 的 `server_side` 参数化用例 |
 
-测试套件共 **504 项**（当前数量用 `pytest --collect-only -q | tail -1` 查；这一行是快照，
+测试套件共 **582 项**（其中 2 项是真实 MCDR 端到端，只在 CI 上跑；当前数量用
+`pytest --collect-only -q | tail -1` 查；这一行是快照，
 所以上面那张表里的「36 项检查」才是被测试自动核对的那个数字），细节见 [`tests/README.md`](tests/README.md)。
 
 ---
@@ -114,18 +183,23 @@ CHANGELOG 的 Releases 链接必须指向真实存在的仓库。四处是否**�
 ```
 mod_update_checker/
 ├── __init__.py      MCDR 入口：配置、命令树、事件、调度、通知
-├── checker.py       编排：三级识别与状态判定
-├── scanner.py       mods 目录扫描与元数据解析（四种格式）
+├── checker.py       编排：四级识别与状态判定
+├── scanner.py       mods 目录扫描与元数据解析（四种格式）、依赖收集与缺失判定
 ├── modrinth.py      Modrinth 客户端
+├── projectmap.py    sources.manual_map：读管理员手写的「jar → 项目」清单（只读，从不写）
 ├── upstream.py      HTTP 层：重试、限速、限流、可配置 base url
 ├── versioning.py    版本比较与 MC 版本范围匹配
 ├── digests.py       单次遍历算出 SHA-1 / SHA-512 / 大小
-├── downloads.py     下载新版本、哈希校验、清单与旧版本清理
+├── downloads.py     下载新版本、哈希校验、清单与旧版本清理；单一文件名安全校验
 ├── installer.py     关服后把下载好的版本装进 mods/（唯一会改动 mods/ 的模块）
-├── report.py        报告模型与渲染
+├── report.py        报告模型、序列化与反序列化、渲染
 ├── serverinfo.py    MC 版本 / 加载器推断
 ├── i18n.py          多语言查表
 └── lang/            en_us.json / zh_cn.json
 ```
 
 除了 `__init__.py`，其余模块**都不 import MCDR**——这是它们能被直接单元测试的原因。
+
+⚠️ **两条自相矛盾的注释已经在 v1.1.0 修掉，别改回去**：`digests.py` 曾声称扫描会阻塞开服
+（实际跑在开服 60 秒后的守护线程上），`checker.py` 的 `ResolveCache` 曾声称缓存「哈希属于哪个项目」
+（实际只存否定答案）。两处都是「文档比代码更乐观」，而它们都朝着**让人误判性能或行为**的方向。

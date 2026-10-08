@@ -15,6 +15,7 @@ from mod_update_checker.scanner import (
     _toml_string_list,
     _toml_value,
     iter_mod_jars,
+    missing_dependencies,
     read_metadata,
     resolve_mods_directory,
     scan_jar,
@@ -368,3 +369,162 @@ def test_name_falls_back_to_the_file_name_when_metadata_is_absent(tmp_path):
     mod = scan_jar(path)
     assert mod.name == "unknown.jar"
     assert mod.version == ""
+
+
+# --------------------------------------------------------------------------------------
+# Declared dependencies
+#
+# ``requires`` exists so a missing library can be reported, which is a different kind of
+# finding from "this jar is out of date" — it explains a crash rather than a stale file. What
+# is tested here is what gets *left out*, because that is where the false positives live: a
+# warning that fires on a working server teaches an admin to ignore the warning line.
+# --------------------------------------------------------------------------------------
+
+
+def test_fabric_requires_lists_the_other_mods_not_the_platform(tmp_path):
+    path = write_jar(
+        tmp_path / "a.jar",
+        fabric=fabric_metadata(
+            id="a",
+            depends={
+                "minecraft": ">=26.3",
+                "fabricloader": ">=0.16.0",
+                "java": ">=17",
+                "fabric-api": "*",
+                "cloth-config": ">=12",
+            },
+        ),
+    )
+
+    assert scan_jar(path).metadata.requires == ("cloth-config", "fabric-api")
+
+
+def test_fabric_requires_ignores_recommends_and_suggests(tmp_path):
+    """A mod that merely *prefers* another one is not a broken server."""
+    path = write_jar(
+        tmp_path / "b.jar",
+        fabric=fabric_metadata(
+            id="b",
+            depends={"minecraft": ">=26.3"},
+            recommends={"modmenu": "*"},
+            suggests={"sodium": "*"},
+        ),
+    )
+
+    assert scan_jar(path).metadata.requires == ()
+
+
+def test_quilt_requires_reads_the_list_form(tmp_path):
+    quilt = dict(QUILT_JSON)
+    quilt["quilt_loader"] = dict(QUILT_JSON["quilt_loader"])
+    quilt["quilt_loader"]["depends"] = [
+        {"minecraft": ">=26.3"},
+        {"quilt_loader": ">=0.20"},
+        {"id": "cloth-config", "versions": ">=12"},
+    ]
+    path = write_jar(tmp_path / "q.jar", quilt=quilt)
+
+    assert scan_jar(path).metadata.requires == ("cloth-config",)
+
+
+def test_forge_requires_includes_the_mods_but_not_forge_or_minecraft(tmp_path):
+    mods_toml = MODS_TOML + """
+[[dependencies.jei]]
+    modId="cloth_config"
+    mandatory=true
+    versionRange="[12,)"
+
+[[dependencies.jei]]
+    modId="jei_plugin_api"
+    mandatory=false
+"""
+    path = write_jar(tmp_path / "f.jar", mods_toml=mods_toml)
+
+    # ``mandatory=false`` is a preference, so the last one is dropped.
+    assert scan_jar(path).metadata.requires == ("cloth_config",)
+
+
+def test_the_regex_reader_agrees_with_the_parser_about_requires():
+    """The two readers have to answer the same question, or 3.10 sees a different report.
+
+    ``tomllib`` is absent on 3.10 and older, which is precisely the interpreter nobody
+    develops on — so the fallback is asserted against the same input rather than trusted.
+    """
+    mods_toml = MODS_TOML + """
+[[dependencies.jei]]
+    modId="cloth_config"
+    mandatory=true
+    versionRange="[12,)"
+
+[[dependencies.jei]]
+    modId="optional_thing"
+    mandatory=false
+"""
+    metadata = _metadata_from_toml_regex(mods_toml, "META-INF/mods.toml", "forge")
+
+    assert metadata.requires == ("cloth_config",)
+    assert metadata.mc_range == "[1.20.1,1.21)"
+
+
+def test_a_required_mod_that_is_present_is_not_missing(tmp_path):
+    directory = tmp_path / "mods"
+    write_jar(
+        directory / "needs.jar",
+        fabric=fabric_metadata(id="needs", depends={"fabric-api": "*", "minecraft": ">=26.3"}),
+    )
+    write_jar(directory / "fabric-api.jar", fabric=fabric_metadata(id="fabric-api"))
+
+    assert missing_dependencies(scan_mods(directory)) == {}
+
+
+def test_a_provided_id_satisfies_a_requirement(tmp_path):
+    """``provides`` is how a mod says "I am a drop-in replacement for X".
+
+    Ignoring it would warn about a server that is working, which is the failure mode worth
+    spending a test on.
+    """
+    directory = tmp_path / "mods"
+    write_jar(
+        directory / "needs.jar",
+        fabric=fabric_metadata(id="needs", depends={"old-api": "*", "minecraft": ">=26.3"}),
+    )
+    write_jar(
+        directory / "replacement.jar",
+        fabric=fabric_metadata(id="replacement", provides=["old-api"]),
+    )
+
+    assert missing_dependencies(scan_mods(directory)) == {}
+
+
+def test_a_missing_dependency_names_the_jars_that_want_it(tmp_path):
+    directory = tmp_path / "mods"
+    for name in ("one", "two"):
+        write_jar(
+            directory / "{}.jar".format(name),
+            fabric=fabric_metadata(
+                id=name, depends={"cloth-config": "*", "minecraft": ">=26.3"}
+            ),
+        )
+
+    assert missing_dependencies(scan_mods(directory)) == {
+        "cloth-config": ["one.jar", "two.jar"]
+    }
+
+
+def test_a_mod_that_depends_on_itself_is_not_reported(tmp_path):
+    """Nonsense metadata, but nonsense that must not produce a warning about nothing."""
+    directory = tmp_path / "mods"
+    write_jar(
+        directory / "self.jar",
+        fabric=fabric_metadata(id="self", depends={"self": "*"}),
+    )
+
+    assert missing_dependencies(scan_mods(directory)) == {}
+
+
+def test_a_jar_with_no_metadata_contributes_nothing(tmp_path):
+    directory = tmp_path / "mods"
+    write_jar(directory / "needs.jar", fabric=fabric_metadata(id="needs", depends={"gone": "*"}))
+    write_plain_file(directory / "library.jar")
+
+    assert missing_dependencies(scan_mods(directory)) == {"gone": ["needs.jar"]}

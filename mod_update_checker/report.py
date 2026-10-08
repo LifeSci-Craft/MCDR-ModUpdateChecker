@@ -44,6 +44,11 @@ __all__ = [
     "ACTIONABLE_STATUSES",
     "LINKED_STATUSES",
     "UPDATE_ENTRY_ORDER",
+    "REPORT_FORMAT",
+    "MATCHED_BY_HASH",
+    "MATCHED_BY_NAME",
+    "MATCHED_BY_MANUAL",
+    "MATCHED_BY_NOTEWORTHY",
     "UpdateEntry",
     "Report",
     "render_summary",
@@ -113,9 +118,27 @@ LINKED_STATUSES: Tuple[str, ...] = (
     STATUS_NO_COMPATIBLE_BUILD,
 )
 
-#: How an entry was tied to a project: by the bytes of the file, or by its name. Only the
-#: second is a guess, and a line that said "matched by hash" on every row would bury it.
+#: Version of the JSON written to ``last_report.json``.
+#:
+#: Bumped when a change would make an older file mean something different rather than merely
+#: be missing a field, because that file is read back after a restart and a mismatch has to
+#: mean "run the check again" instead of "interpret it optimistically".
+REPORT_FORMAT = 1
+
+#: How an entry was tied to a project: by the bytes of the file, by its name, or by the
+#: admin's own mapping file. Only the middle one is a guess, and a line that said "matched by
+#: hash" on every row would bury it.
+MATCHED_BY_HASH = "hash"
 MATCHED_BY_NAME = "name"
+#: Tied to a project by ``project-map.json`` — the admin wrote down which project this jar is,
+#: so nothing was guessed. Worth showing anyway: it is how the admin confirms their own file
+#: was read, and a mapping that quietly stopped applying would otherwise look like a project
+#: that had vanished from Modrinth.
+MATCHED_BY_MANUAL = "manual"
+
+#: The ``matched_by`` values a reader needs to be told about. ``hash`` is the default and the
+#: honest one, so it stays silent.
+MATCHED_BY_NOTEWORTHY = (MATCHED_BY_NAME, MATCHED_BY_MANUAL)
 
 #: Blank columns inserted between the description and the project link.
 _LINK_GAP = "  "
@@ -135,6 +158,53 @@ CHAT_PAGE_LINES = 18
 DetailRow = Tuple[str, str, str]
 
 Translator = Callable[..., str]
+
+
+# --------------------------------------------------------------------------------------
+# Reading a stored report back
+#
+# ``last_report.json`` is written every check and read again after a restart, so the "reuse
+# yesterday's answer instead of asking again" window is not thrown away by a server restart.
+# These coercions are the whole reason that is safe: the file is on disk across versions of
+# the plugin, and a field this version does not understand has to degrade to something
+# usable rather than raise on plugin load.
+# --------------------------------------------------------------------------------------
+
+
+def _text(value: Any) -> str:
+    return value if isinstance(value, str) else ""
+
+
+def _integer(value: Any) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _number(value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.0
+    return float(value)
+
+
+def _keyed_args(value: Any) -> List[Tuple[str, Dict[str, Any]]]:
+    """``[{"key": ..., "args": {...}}]`` back into the tuple form the renderers want.
+
+    Used for an entry's notes and for the report's advisories and upstream notes, which are
+    all the same shape: a translation key plus the arguments its placeholders take. One reader
+    for all three, because a shape that is written in one place and read in three is exactly
+    where a divergence would go unnoticed.
+    """
+    if not isinstance(value, list):
+        return []
+    out: List[Tuple[str, Dict[str, Any]]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        key = _text(item.get("key"))
+        if not key:
+            continue
+        args = item.get("args")
+        out.append((key, args if isinstance(args, dict) else {}))
+    return out
 
 
 @dataclass
@@ -202,6 +272,49 @@ class UpdateEntry:
         ]
         return data
 
+    @classmethod
+    def from_dict(cls, data: Any) -> Optional["UpdateEntry"]:
+        """Rebuild one entry from a stored report, or ``None`` if it is unusable.
+
+        Only used to read back this plugin's own ``last_report.json`` after a restart. It has
+        to be forgiving because that file survives upgrades: it was written by an older
+        version, or by a newer one that has since been rolled back, and a shape this version
+        does not recognise must mean "skip this entry" rather than an exception on load.
+
+        A file name is the one field required, because it is the entry's identity — everything
+        else has a sensible default. An unrecognised ``status`` becomes ``unresolved`` rather
+        than being printed raw: there is no way to state a status this version does not know,
+        and "we cannot say" is the honest one.
+        """
+        if not isinstance(data, dict):
+            return None
+        file_name = _text(data.get("file_name"))
+        if not file_name:
+            return None
+
+        status = _text(data.get("status"))
+        entry = cls(
+            mod_id=_text(data.get("mod_id")),
+            name=_text(data.get("name")) or file_name,
+            file_name=file_name,
+            local_version=_text(data.get("local_version")),
+            latest_version=_text(data.get("latest_version")),
+            status=status if status in ALL_STATUSES else STATUS_UNRESOLVED,
+            platform=_text(data.get("platform")),
+            matched_by=_text(data.get("matched_by")),
+            project_url=_text(data.get("project_url")),
+            download_url=_text(data.get("download_url")),
+            download_filename=_text(data.get("download_filename")),
+            download_sha1=_text(data.get("download_sha1")),
+            download_sha512=_text(data.get("download_sha512")),
+            download_size=_integer(data.get("download_size")),
+            released_at=_text(data.get("released_at")),
+            release_channel=_text(data.get("release_channel")),
+            error=_text(data.get("error")),
+            notes=_keyed_args(data.get("notes")),
+        )
+        return entry
+
 
 @dataclass
 class Report:
@@ -222,6 +335,17 @@ class Report:
     advisories: List[Tuple[str, Dict[str, Any]]] = field(default_factory=list)
     upstream_notes: List[Tuple[str, Dict[str, Any]]] = field(default_factory=list)
     duration_seconds: float = 0.0
+    #: File names of the entries that became ``update_available`` since the previous report.
+    #:
+    #: Empty when there was no previous report to compare against, which is why nothing is
+    #: said when it is empty: "nothing new" and "nothing to compare with" would produce the
+    #: same sentence, and only one of them is worth reading.
+    #:
+    #: It exists because a server checks on every start, so an admin sees the same twelve
+    #: updates announced again and again until they act on them. Without this field the
+    #: notification cannot tell "still there" from "just appeared", and the second is the one
+    #: that is news.
+    new_since_last: List[str] = field(default_factory=list)
 
     # -- queries -----------------------------------------------------------------------
 
@@ -328,11 +452,44 @@ class Report:
 
     # -- serialisation -----------------------------------------------------------------
 
+    def record_new_since(self, previous: Optional["Report"]) -> None:
+        """Note which updates were not already there in ``previous``.
+
+        "Update available" is a state, not an event, so a mod that has needed updating for a
+        week is reported identically to one published an hour ago. Comparing the two reports
+        is the only way to tell them apart, and the comparison is deliberately one-directional
+        and name-based:
+
+        * only ``update_available`` entries count. A build that has just been *downloaded*
+          changed to ``awaiting_install``, which is the admin's own doing and not news;
+        * the identity is the file name, because that is what the two reports can agree on
+          without either one re-resolving anything.
+
+        A mod that leaves and comes back — downloaded, then removed from the download folder —
+        counts as new again. That is the useful reading: the update is available once more.
+        """
+        self.new_since_last = []
+        if previous is None:
+            return
+        before = {
+            entry.file_name for entry in previous.by_status(STATUS_UPDATE_AVAILABLE)
+        }
+        self.new_since_last = sorted(
+            entry.file_name
+            for entry in self.by_status(STATUS_UPDATE_AVAILABLE)
+            if entry.file_name not in before
+        )
+
     def to_dict(self) -> Dict[str, Any]:
         return {
+            "format": REPORT_FORMAT,
             "generated_at": self.generated_at,
             "duration_seconds": round(self.duration_seconds, 3),
             "mods_directory": self.mods_directory,
+            # Written even though it is only a path: an entry that is "waiting to be
+            # installed" names a folder, and a stored report that omitted it produced a
+            # notification telling the admin the files were somewhere it could not say.
+            "download_folder": self.download_folder,
             "server": asdict(self.server),
             "total_jars": self.total_jars,
             "counts": self.counts(),
@@ -351,10 +508,83 @@ class Report:
             "upstream_notes": [
                 {"key": key, "args": args} for key, args in self.upstream_notes
             ],
+            "new_since_last": list(self.new_since_last),
         }
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), ensure_ascii=False, indent=2)
+
+    @classmethod
+    def from_dict(cls, data: Any) -> Optional["Report"]:
+        """Rebuild a report from a stored one, or ``None`` when it cannot be trusted.
+
+        ``None`` is always a safe answer: the caller's response is to run the check, which is
+        what it would have done anyway. So anything ambiguous — no format marker, a format
+        from another version, no timestamp to measure the age against — is rejected rather
+        than guessed at, and the whole report is rejected rather than partially loaded,
+        because half a report rendered to an admin reads exactly like a full one.
+        """
+        if not isinstance(data, dict):
+            return None
+        if data.get("format") != REPORT_FORMAT:
+            return None
+        generated_at = _text(data.get("generated_at"))
+        if not generated_at:
+            return None
+
+        report = cls(
+            generated_at=generated_at,
+            server=ServerContext.from_dict(data.get("server")),
+            mods_directory=_text(data.get("mods_directory")),
+            download_folder=_text(data.get("download_folder")),
+            total_jars=_integer(data.get("total_jars")),
+            duration_seconds=_number(data.get("duration_seconds")),
+        )
+
+        entries = data.get("entries")
+        if isinstance(entries, list):
+            for item in entries:
+                entry = UpdateEntry.from_dict(item)
+                if entry is not None:
+                    report.entries.append(entry)
+
+        unidentified = data.get("unidentified")
+        if isinstance(unidentified, list):
+            for item in unidentified:
+                if isinstance(item, dict):
+                    report.unidentified.append(
+                        (_text(item.get("file_name")), _text(item.get("reason")))
+                    )
+
+        disabled = data.get("disabled_jars")
+        if isinstance(disabled, list):
+            report.disabled_jars = [item for item in disabled if isinstance(item, str)]
+
+        duplicates = data.get("duplicate_ids")
+        if isinstance(duplicates, dict):
+            report.duplicate_ids = {
+                str(key): [item for item in value if isinstance(item, str)]
+                for key, value in duplicates.items()
+                if isinstance(value, list)
+            }
+
+        report.advisories = _keyed_args(data.get("advisories"))
+        report.upstream_notes = _keyed_args(data.get("upstream_notes"))
+
+        new_since = data.get("new_since_last")
+        if isinstance(new_since, list):
+            report.new_since_last = [item for item in new_since if isinstance(item, str)]
+
+        return report
+
+    @classmethod
+    def from_json(cls, text: str) -> Optional["Report"]:
+        """Parse a stored report. Malformed JSON is not an error, it is "no report"."""
+        try:
+            data = json.loads(text)
+        except (TypeError, ValueError):
+            return None
+        return cls.from_dict(data)
 
 
 # --------------------------------------------------------------------------------------
@@ -408,10 +638,10 @@ def _entry_parts(entry: UpdateEntry, tr: Translator, verbose: bool) -> Tuple[str
     notes: List[str] = []
     if verbose:
         notes.append(tr(_status_key(entry.status)))
-        # Only the guess is worth printing. Saying "matched by hash" on every row would bury
-        # the one row where the plugin was not sure, which is the row that needs reading.
-        if entry.matched_by == MATCHED_BY_NAME:
-            notes.append(tr("matched_by." + MATCHED_BY_NAME))
+        # Only what the reader has to know. Saying "matched by hash" on every row would bury
+        # the rows where the plugin was not certain, which are the rows that need reading.
+        if entry.matched_by in MATCHED_BY_NOTEWORTHY:
+            notes.append(tr("matched_by." + entry.matched_by))
 
     description = core if not notes else "{}  ({})".format(core, ", ".join(notes))
     link = entry.project_url if entry.status in LINKED_STATUSES else ""
@@ -489,7 +719,20 @@ def render_summary(report: Report, tr: Translator, max_updates: int = 12) -> Lis
     updates = report.updates
     pending = report.awaiting_install
 
-    section(updates, "report.updates_found")
+    # Appended to the update section rather than placed above it, so "there are five" is read
+    # before "two of them are new" — the other order makes the second sentence look like a
+    # correction of the first.
+    section(
+        updates,
+        "report.updates_found",
+        tr(
+            "report.new_since_last",
+            count=len(report.new_since_last),
+            names=", ".join(report.new_since_last[:6]),
+        )
+        if report.new_since_last
+        else None,
+    )
     section(
         pending,
         "report.awaiting_install_found",

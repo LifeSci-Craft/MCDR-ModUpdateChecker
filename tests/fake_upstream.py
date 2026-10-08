@@ -92,6 +92,11 @@ class FakeProject:
     title: str = ""
     project_type: str = "mod"
     description: str = "a test project"
+    #: Modrinth's own side flags. ``server_side`` is what the "this mod does not work on a
+    #: server" advisory reads, and it is deliberately settable: the whole point of that
+    #: advisory is projects whose *jar* declares no environment at all.
+    client_side: str = "required"
+    server_side: str = "required"
     versions: List[FakeVersion] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -105,8 +110,8 @@ class FakeProject:
             "source_url": "",
             "game_versions": sorted({v for item in self.versions for v in item.game_versions}),
             "loaders": sorted({loader for item in self.versions for loader in item.loaders}),
-            "client_side": "required",
-            "server_side": "required",
+            "client_side": self.client_side,
+            "server_side": self.server_side,
             "downloads": 1234,
         }
 
