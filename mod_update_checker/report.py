@@ -1113,10 +1113,16 @@ def entry_detail_rows(
     rows: List[DetailRow] = [DetailRow("", entry.name)]
 
     rows.append(DetailRow(tr("detail.status_label"), tr(_status_key(entry.status))))
-    if entry.latest_version:
+    if entry.latest_version and entry.latest_version != entry.local_version:
         rows.append(DetailRow(tr("detail.version_label"),
                               tr("detail.version", local=entry.local_version or "?",
                                  latest=entry.latest_version)))
+    elif entry.latest_version:
+        # One version, no arrow. An arrow needs two different ends, and "1.0.0 -> 1.0.0" reads
+        # like a change that did not happen — on the mods that are already current, which is
+        # most of them. The value goes in as it is rather than through the catalogue for the
+        # same reason the heading row prints the mod's name: it is data, not prose.
+        rows.append(DetailRow(tr("detail.version_label"), entry.latest_version))
     elif entry.local_version:
         rows.append(DetailRow(tr("detail.version_label"),
                               tr("detail.local_version", local=entry.local_version)))

@@ -157,7 +157,7 @@ whatever_the_server_holds` 是量它的那把尺）。
 | 链接列按显示宽度对齐 | `test_the_link_column_is_measured_in_columns_not_characters`：两个**字符数相同、显示宽度不同**的名字（`AB` / `文本`），断言行内链接的起始显示列相同 |
 | 编号不补空格 | `test_the_listing_never_pads_the_number`：短列表与二十个 Mod 的列表都断言 `[1] ` 在、`[ 1]` 不在——这条被用户报过两次，所以钉两遍 |
 
-测试套件共 **615 项**（其中 2 项是真实 MCDR 端到端，只在 CI 上跑；当前数量用
+测试套件共 **616 项**（其中 2 项是真实 MCDR 端到端，只在 CI 上跑；当前数量用
 `pytest --collect-only -q | tail -1` 查；这一行是快照，
 所以上面那张表里的「38 项检查」才是被测试自动核对的那个数字），细节见 [`tests/README.md`](tests/README.md)。
 

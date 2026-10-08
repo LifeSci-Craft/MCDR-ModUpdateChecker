@@ -1577,6 +1577,27 @@ def test_the_action_offered_matches_what_the_mod_is_ready_for():
     assert action_row(fresh, None, "!!muc", tr) is None
 
 
+def test_the_detail_view_does_not_draw_an_arrow_between_equal_versions():
+    """``1.0.0 -> 1.0.0`` reads like a change that did not happen.
+
+    Seen by rendering the screen rather than by reading the code: the arrow branch keyed off
+    "is there a latest version", which is true for a mod that is already current — and most
+    mods on a healthy server are.
+    """
+    tr = make_translator("zh_cn")
+
+    current = _entry_with_links("alpha", STATUS_UP_TO_DATE, local="1.0.0", latest="1.0.0")
+    body = "\n".join(row.label + row.value
+                     for row in entry_detail_rows(current, tr))
+    assert "1.0.0 -> 1.0.0" not in body, body
+    assert "版本: 1.0.0" in body, body
+
+    # And the two ends are still both named when they really are different.
+    pending = _entry_with_links("beta", STATUS_UPDATE_AVAILABLE, local="1.0.0", latest="1.1.0")
+    body = "\n".join(row.label + row.value for row in entry_detail_rows(pending, tr))
+    assert "1.0.0 -> 1.1.0" in body, body
+
+
 def test_the_detail_view_stays_short():
     """One mod's detail must still fit, notes and all."""
     tr = make_translator("zh_cn")
