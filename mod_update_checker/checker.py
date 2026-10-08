@@ -6,14 +6,18 @@ deals with what the previous ones could not answer:
 1. **Modrinth by SHA-1.** One or two batched requests identify every jar whose bytes exist
    on Modrinth and return the newest build for the configured loader and game version. This
    alone resolves the large majority of a Fabric server, and it needs no credentials.
-2. **Name search.** Some jars are built from source, re-signed, or simply old, so their bytes
+2. **The admin's own map.** Jars the hashes did not resolve are looked up in
+   ``project-map.json`` — a file the admin writes to say which project their own build
+   belongs to. It runs before the name search because it is a statement rather than a guess,
+   and it exists because a jar built from source or re-signed is otherwise unresolvable.
+3. **Name search.** Some jars are built from source, re-signed, or simply old, so their bytes
    are not published anywhere. Matching the mod id against the project slug is a guess, so it
    is only accepted on an exact (normalised) slug or title match, and every entry resolved
    this way is labelled ``matched_by=name`` in the report. A wrong guess that leads an admin to
    overwrite a good jar is worse than an honest "unresolved".
-3. **Advisories.** Duplicate mod ids, client-only mods sitting in a server folder, and mods
-   whose declared Minecraft range excludes the running version. None of these is an update,
-   but all three explain far more breakage than a stale jar does.
+4. **Advisories.** Duplicate mod ids, client-only mods sitting in a server folder, missing
+   dependencies, and mods whose declared Minecraft range excludes the running version. None
+   of these is an update, but all of them explain far more breakage than a stale jar does.
 
 Jars that cannot be identified at all are still reported, as ``unresolved`` — which is a
 useful answer in itself, since it means Modrinth has never seen those exact bytes.
@@ -22,10 +26,12 @@ A jar is identified in the report by its **file name**, not its mod id, because 
 the same mod in one folder is a real and common situation that would otherwise be
 impossible to report.
 
-One design note on freshness: the resolve cache stores only *identifications* (which project
-a hash belongs to), never the "is there a newer version" answer. Identification is stable
-for the life of a file; the update answer is the whole point of the check and must be fresh
-every run.
+One design note on freshness: the resolve cache stores only the *negative* answer — "this
+hash could not be identified" — and never the "is there a newer version" answer. Both halves
+of that are deliberate. The update answer is the whole point of the check and must be fresh
+every run. And the positive identification is not worth caching: it comes from one batched
+request for the entire folder, so remembering it would save a request that costs nothing,
+while a stale positive would be a claim about bytes that may have been replaced since.
 """
 
 import json
@@ -41,7 +47,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 from .modrinth import ModrinthClient, ModrinthProject, ModrinthVersion
+from .projectmap import ProjectMap
 from .report import (
+    MATCHED_BY_HASH,
+    MATCHED_BY_MANUAL,
+    MATCHED_BY_NAME,
     STATUS_ERROR,
     STATUS_IGNORED,
     STATUS_LOCAL_AHEAD,
@@ -55,7 +65,7 @@ from .report import (
     entry_from_scan,
     mc_mismatch_note,
 )
-from .scanner import ScanResult, ScannedMod
+from .scanner import ScanResult, ScannedMod, missing_dependencies
 from .serverinfo import ServerContext
 from .upstream import HttpClient, RateLimiter, UpstreamError
 from .versioning import compare
@@ -119,12 +129,20 @@ class CheckOptions:
 
 
 class ResolveCache:
-    """``sha1 -> identification`` on disk, so a restart does not re-resolve everything.
+    """``sha1 -> "this could not be identified"`` on disk, so a restart does not re-ask.
 
-    Only the *identity* of a file is cached, never whether an update exists — see the
-    module docstring. Negative results are cached too, and that is the important part: a jar
-    that is not on any platform costs the most requests to prove (a per-project fallback
-    plus two searches), and it will still not be on any platform tomorrow.
+    What is cached is narrow, and the narrowness is the design rather than an oversight: only
+    a **negative** identification is stored, and only by :meth:`Checker._identify_by_name` —
+    the stage that had to spend a search plus a version lookup to prove a jar is not on the
+    platform. That is the expensive answer, and it is the one that will still be the same
+    answer tomorrow.
+
+    Nothing about *updates* is cached anywhere, ever. "Is there a newer build" is the entire
+    point of a check and has to be asked fresh every time; a remembered answer would turn the
+    plugin into a machine for reporting yesterday's news. A positive identification is not
+    cached either, for the cheaper reason that it arrives in one batched request for the whole
+    folder — there is no cost to save, and a stale positive would be a claim about bytes that
+    might since have been replaced.
     """
 
     VERSION = 1
@@ -160,7 +178,7 @@ class ResolveCache:
         """A cached record, or ``None`` when absent or stale.
 
         A TTL of zero means "never expires" rather than "always stale": switching the cache
-        off is what ``use_resolve_cache`` is for, and having two settings that both disable
+        off is what ``network.cache.enabled`` is for, and having two settings that both disable
         it would only make the config harder to reason about.
         """
         if not self.enabled or not sha1:
@@ -212,10 +230,19 @@ class Checker:
         self._http: Optional[HttpClient] = None
         self._modrinth: Optional[ModrinthClient] = None
         self._cache = ResolveCache(None, options.cache_ttl_hours, enabled=False)
+        self._map = ProjectMap(None)
+        #: File names whose Modrinth project declares itself server-incompatible. Collected
+        #: while stage 1 has the project data in hand and turned into one advisory at the end,
+        #: so every advisory in a report is assembled in one place.
+        self._server_unsupported: List[str] = []
 
     # -- lifecycle ---------------------------------------------------------------------
 
-    def _setup(self, cache_path: Union[str, Path, None]) -> None:
+    def _setup(
+        self,
+        cache_path: Union[str, Path, None],
+        map_path: Union[str, Path, None] = None,
+    ) -> None:
         from .modrinth import DEFAULT_BASE_URL as MR_BASE
 
         limiter = RateLimiter(self.options.requests_per_minute)
@@ -232,6 +259,21 @@ class Checker:
         self._cache = ResolveCache(
             cache_path, self.options.cache_ttl_hours, enabled=self.options.use_cache
         )
+        self._map = ProjectMap(map_path, logger=self.logger)
+        self._server_unsupported = []
+        # Said out loud rather than swallowed: an unreadable map is a silent loss of the
+        # admin's own instructions, and "I wrote that file and nothing changed" is exactly
+        # the report a bare ``debug`` line would produce.
+        if self._map.path is not None and self._map.error:
+            self.logger.warning(
+                "ignoring %s: %s", self._map.path, self._map.error
+            )
+        elif self._map.rejected:
+            self.logger.warning(
+                "%s: %d entr(ies) were unusable and ignored",
+                self._map.path,
+                self._map.rejected,
+            )
 
     def close(self) -> None:
         if self._http is not None:
@@ -245,9 +287,10 @@ class Checker:
         scan: ScanResult,
         server: ServerContext,
         cache_path: Union[str, Path, None] = None,
+        map_path: Union[str, Path, None] = None,
     ) -> Report:
         started = time.monotonic()
-        self._setup(cache_path)
+        self._setup(cache_path, map_path)
 
         report = Report(
             generated_at=_now_iso(),
@@ -269,6 +312,10 @@ class Checker:
 
         try:
             remaining = self._stage_modrinth(active, entries, report, server)
+            if remaining:
+                # Before the name search, not after: this stage is the admin telling us the
+                # answer, and a guess must not be allowed to pre-empt it.
+                remaining = self._stage_manual_map(remaining, entries, server)
             if remaining:
                 self._stage_name_search(remaining, entries, report, server)
         finally:
@@ -474,10 +521,17 @@ class Checker:
         server: ServerContext,
     ) -> None:
         entry.platform = "modrinth"
-        entry.matched_by = "hash"
+        entry.matched_by = MATCHED_BY_HASH
         entry.project_url = project.page_url if project else ""
         if project is not None:
             _prefer_name(entry, project.title)
+            # Modrinth's own "this does not work on a server" flag. Collected here because
+            # this is the only place the project record is in hand, and it costs nothing
+            # extra: the batch that fetched every title fetched this in the same response.
+            # It catches mods whose own jar declares no ``environment`` at all, which is the
+            # half the scanner-side check cannot see.
+            if project.server_side == "unsupported":
+                self._server_unsupported.append(entry.file_name)
 
         # Keyed by the hash we sent, which is the local file's SHA-1.
         latest = latest_by_hash.get(mod.sha1)
@@ -579,7 +633,93 @@ class Checker:
             targets=", ".join(newest.game_versions[-6:]) or "?",
         )
 
-    # -- stage 2: name search ----------------------------------------------------------
+    # -- stage 2: the admin's own map ---------------------------------------------------
+
+    def _stage_manual_map(
+        self,
+        mods: Sequence[ScannedMod],
+        entries: Dict[str, UpdateEntry],
+        server: ServerContext,
+    ) -> List[ScannedMod]:
+        """Identify what the admin has already identified. Returns the leftovers.
+
+        This is the answer to the plugin's own documented limitation: a jar built from source,
+        forked, or re-signed has bytes Modrinth has never seen and a mod id that may match no
+        slug, so neither the hash lookup nor the name search can place it. The admin knows
+        what it is. ``project-map.json`` is where they say so.
+
+        It sits between the two automatic stages rather than after both, because it is a
+        statement while the name search is a guess: letting the guess run first would mean an
+        admin's explicit mapping could be silently overridden by an exact-slug coincidence.
+
+        A mod with no metadata is skipped, exactly as the name search skips it — there would
+        be no local version to compare against, so the entry could only ever say "this is
+        project X" without saying whether X is current, which is not worth a request.
+        """
+        if not self._map.loaded:
+            return list(mods)
+        assert self._modrinth is not None
+
+        leftover: List[ScannedMod] = []
+        for mod in mods:
+            entry = entries[mod.file_name]
+            if entry.status in (STATUS_IGNORED, STATUS_ERROR) or not mod.identified:
+                leftover.append(mod)
+                continue
+            target = self._map.lookup(sha1=mod.sha1, mod_id=mod.mod_id)
+            if not target:
+                leftover.append(mod)
+                continue
+            # ``False`` means the question could not be asked. Hand it back to the name
+            # search rather than reporting a conclusion — a failure is not an answer, and a
+            # different endpoint might still work.
+            if not self._apply_manual(entry, target, server):
+                leftover.append(mod)
+        return leftover
+
+    def _apply_manual(
+        self, entry: UpdateEntry, target: str, server: ServerContext
+    ) -> bool:
+        """Resolve one entry against the project the admin named. ``False`` = could not ask.
+
+        A reference that does not exist upstream is reported rather than quietly skipped. The
+        admin wrote it, so either it is a typo or the project is gone, and both are things
+        they need told — falling through to the name search would hide a broken mapping behind
+        a guess that happened to work.
+        """
+        assert self._modrinth is not None
+        try:
+            project = self._modrinth.project(target)
+        except UpstreamError as error:
+            self.logger.debug("project map lookup of %s failed: %s", target, error)
+            return False
+
+        if project is None:
+            entry.status = STATUS_UNRESOLVED
+            entry.add_note("note.manual_map_unknown_project", project=target)
+            return True
+
+        try:
+            versions = self._modrinth.project_versions(
+                project.id, loaders=[self.options.loader]
+            )
+        except UpstreamError as error:
+            self.logger.debug("project map versions for %s failed: %s", target, error)
+            return False
+
+        self._settle_by_versions(
+            entry,
+            versions,
+            server,
+            project_url=project.page_url,
+            title=project.title,
+            matched_by=MATCHED_BY_MANUAL,
+            note_key="note.matched_by_manual",
+            note_args={"project": target},
+        )
+        return True
+
+    # -- stage 3: name search ----------------------------------------------------------
 
     def _stage_name_search(
         self,
@@ -696,15 +836,47 @@ class Checker:
             self.logger.debug("modrinth versions for %s failed: %s", hit.slug, error)
             return None
 
+        self._settle_by_versions(
+            entry,
+            versions,
+            server,
+            project_url=hit.page_url,
+            title=hit.title,
+            matched_by=MATCHED_BY_NAME,
+            note_key="note.matched_by_name",
+            note_args={"slug": hit.slug},
+        )
+        return True
+
+    def _settle_by_versions(
+        self,
+        entry: UpdateEntry,
+        versions: Sequence[ModrinthVersion],
+        server: ServerContext,
+        project_url: str,
+        title: str,
+        matched_by: str,
+        note_key: str,
+        note_args: Dict[str, Any],
+    ) -> None:
+        """Fill in one entry from a project's version list, whoever produced that list.
+
+        Shared by the name search and the admin's map because from here on the two are the
+        same job: pick the newest build this server can run, compare the two version strings,
+        and say plainly when there is no build to compare against. Two copies of that would
+        eventually disagree about which of "no build for this loader" and "no build for this
+        game version" applies — the pair of answers this stage exists to keep apart.
+        """
         entry.platform = "modrinth"
-        entry.matched_by = "name"
-        entry.project_url = hit.page_url
-        _prefer_name(entry, hit.title)
-        entry.add_note("note.matched_by_name", slug=hit.slug)
+        entry.matched_by = matched_by
+        entry.project_url = project_url
+        _prefer_name(entry, title)
+        entry.add_note(note_key, **note_args)
+
         if not versions:
             entry.status = STATUS_NO_COMPATIBLE_BUILD
             entry.add_note("note.no_build_for_loader", loader=self.options.loader)
-            return True
+            return
 
         compatible = [
             version
@@ -725,10 +897,9 @@ class Checker:
                 newest=entry.latest_version,
                 targets=", ".join((versions[0].game_versions or [])[-6:]) or "?",
             )
-            return True
+            return
 
         self._decide_by_string(entry)
-        return True
 
     @staticmethod
     def _decide_by_string(entry: UpdateEntry) -> None:
@@ -769,6 +940,21 @@ class Checker:
         if client_only:
             report.advisories.append(
                 ("advisory.client_only", {"count": len(client_only), "files": ", ".join(client_only[:8])})
+            )
+        # Modrinth's flag rather than the jar's, so the two lists overlap only where both
+        # sources agree. Kept separate on purpose: an admin reading two lists can tell which
+        # of them came from the mod author's own metadata.
+        if self._server_unsupported:
+            names = sorted(set(self._server_unsupported))
+            report.advisories.append(
+                ("advisory.server_side_unsupported",
+                 {"count": len(names), "files": ", ".join(names[:8])})
+            )
+        missing = missing_dependencies(scan)
+        if missing:
+            report.advisories.append(
+                ("advisory.missing_dependencies",
+                 {"count": len(missing), "files": ", ".join(list(missing)[:8])})
             )
         if report.duplicate_ids:
             report.advisories.append(

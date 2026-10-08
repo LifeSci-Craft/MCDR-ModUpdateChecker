@@ -235,11 +235,13 @@ def make_options(upstream, **overrides):
     return CheckOptions(**values)
 
 
-def run_check(upstream, scenario, tmp_path, **overrides):
+def run_check(upstream, scenario, tmp_path, map_path=None, **overrides):
     options = make_options(upstream, **overrides)
     checker = Checker(options)
     try:
-        return checker.run(scenario.scan(), SERVER, cache_path=None)
+        return checker.run(
+            scenario.scan(), SERVER, cache_path=None, map_path=map_path
+        )
     finally:
         checker.close()
 
@@ -1509,3 +1511,485 @@ def test_report_entries_are_always_one_per_jar(tmp_path, upstream):
 
     assert len(report.entries) == 2
     assert len(report.unidentified) == 2
+
+
+# --------------------------------------------------------------------------------------
+# The admin's own map
+#
+# The documented limitation this exists for: a jar built from source, forked or re-signed has
+# bytes Modrinth has never seen and a mod id that may match no slug, so neither automatic
+# stage can place it. Everything asserted here is about the *order* — the admin's statement
+# has to beat the plugin's guess — and about a bad entry being reported rather than obeyed.
+# --------------------------------------------------------------------------------------
+
+
+def write_map(tmp_path, by_sha1=None, by_mod_id=None):
+    path = tmp_path / "project-map.json"
+    payload = {
+        "version": 1,
+        "by_sha1": by_sha1 or {},
+        "by_mod_id": by_mod_id or {},
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def test_a_jar_the_admin_mapped_is_resolved_by_the_map(tmp_path, upstream):
+    """The unnamed jar is unresolvable by both automatic stages; one line of JSON fixes it."""
+    scenario = Scenario(tmp_path, upstream)
+    mod = scenario.add_jar("mystery.jar", id="mystery", version="1.0.0", name="Mystery")
+    upstream.add_project(
+        FakeProject(
+            id="proj-custom",
+            slug="custom-thing",
+            title="Custom Thing",
+            versions=[
+                _version("proj-custom", "c-100", "1.0.0", "1" * 40),
+                _version("proj-custom", "c-200", "2.0.0", "2" * 40,
+                         date="2026-02-01T00:00:00Z"),
+            ],
+        )
+    )
+    path = write_map(tmp_path, by_sha1={mod.sha1: "custom-thing"})
+
+    report = run_check(upstream, scenario, tmp_path, map_path=path)
+
+    entry = entry_for(report, "mystery")
+    assert entry.matched_by == "manual"
+    assert entry.status == STATUS_UPDATE_AVAILABLE
+    assert (entry.local_version, entry.latest_version) == ("1.0.0", "2.0.0")
+    assert entry.project_url.endswith("/custom-thing")
+    assert dict(entry.notes)["note.matched_by_manual"]["project"] == "custom-thing"
+
+
+def test_the_map_beats_the_name_search(tmp_path, upstream):
+    """Otherwise an exact-slug coincidence could silently overrule the admin's own answer.
+
+    The jar's mod id *does* match a project slug here, so the name search would happily
+    resolve it — to the wrong project. The map has to be consulted first for the admin's
+    explicit statement to mean anything.
+    """
+    scenario = Scenario(tmp_path, upstream)
+    scenario.add_jar("fork.jar", id="shared", version="1.0.0", name="Shared")
+    upstream.add_project(
+        FakeProject(
+            id="proj-upstream",
+            slug="shared",
+            title="Upstream",
+            versions=[_version("proj-upstream", "u-1", "9.9.9", "3" * 40)],
+        )
+    )
+    upstream.add_project(
+        FakeProject(
+            id="proj-fork",
+            slug="the-fork",
+            title="The Fork",
+            versions=[_version("proj-fork", "f-1", "1.5.0", "4" * 40)],
+        )
+    )
+    path = write_map(tmp_path, by_mod_id={"shared": "the-fork"})
+
+    report = run_check(upstream, scenario, tmp_path, map_path=path)
+
+    entry = entry_for(report, "shared")
+    assert entry.matched_by == "manual"
+    assert entry.latest_version == "1.5.0", "the name search's project was used instead"
+
+
+def test_the_map_can_be_keyed_by_mod_id_when_the_bytes_change(tmp_path, upstream):
+    """Recompiling changes the hash but not the id, which is the case this key exists for."""
+    scenario = Scenario(tmp_path, upstream)
+    scenario.add_jar("rebuilt.jar", id="rebuilt", version="3.0.0", name="Rebuilt")
+    upstream.add_project(
+        FakeProject(
+            id="proj-rebuilt",
+            slug="rebuilt-upstream",
+            versions=[_version("proj-rebuilt", "r-1", "3.1.0", "5" * 40)],
+        )
+    )
+    path = write_map(tmp_path, by_mod_id={"rebuilt": "rebuilt-upstream"})
+
+    entry = entry_for(
+        run_check(upstream, scenario, tmp_path, map_path=path), "rebuilt"
+    )
+
+    assert entry.matched_by == "manual"
+    assert entry.status == STATUS_UPDATE_AVAILABLE
+
+
+def test_a_map_entry_pointing_nowhere_is_reported_rather_than_guessed(tmp_path, upstream):
+    """A typo has to surface. Falling through to the name search would hide a broken mapping
+    behind a guess that happened to work, and the admin would never learn to fix it."""
+    scenario = Scenario(tmp_path, upstream)
+    scenario.add_jar("typo.jar", id="typo", version="1.0.0", name="Typo")
+    upstream.add_project(
+        FakeProject(
+            id="proj-typo",
+            slug="typo",
+            versions=[_version("proj-typo", "t-1", "2.0.0", "6" * 40)],
+        )
+    )
+    path = write_map(tmp_path, by_mod_id={"typo": "wrong-spelling"})
+
+    entry = entry_for(run_check(upstream, scenario, tmp_path, map_path=path), "typo")
+
+    assert entry.status == STATUS_UNRESOLVED
+    assert entry.matched_by == ""
+    assert dict(entry.notes)["note.manual_map_unknown_project"]["project"] == "wrong-spelling"
+
+
+def test_a_jar_with_no_metadata_is_not_looked_up_in_the_map(tmp_path, upstream):
+    """Nothing to compare a version against, so the entry could only ever be a bare link."""
+    scenario = Scenario(tmp_path, upstream)
+    mod = scenario.add_plain_jar("library.jar")
+    upstream.add_project(
+        FakeProject(
+            id="proj-lib",
+            slug="lib",
+            versions=[_version("proj-lib", "l-1", "1.0.0", "7" * 40)],
+        )
+    )
+    path = write_map(tmp_path, by_sha1={mod.sha1: "lib"})
+
+    entry = entry_for_file(
+        run_check(upstream, scenario, tmp_path, map_path=path), "library.jar"
+    )
+
+    assert entry.status == STATUS_NOT_A_MOD
+
+
+def test_an_ignored_mod_is_not_rescued_by_the_map(tmp_path, upstream):
+    """``ignored_mods`` means "no lookups at all", and a map entry is still a lookup."""
+    scenario = Scenario(tmp_path, upstream)
+    mod = scenario.add_jar("quiet.jar", id="quiet", version="1.0.0", name="Quiet")
+    upstream.add_project(
+        FakeProject(
+            id="proj-quiet",
+            slug="quiet",
+            versions=[_version("proj-quiet", "q-1", "2.0.0", "8" * 40)],
+        )
+    )
+    path = write_map(tmp_path, by_sha1={mod.sha1: "quiet"})
+
+    report = run_check(
+        upstream, scenario, tmp_path, map_path=path, ignored_mods=["quiet"]
+    )
+
+    assert entry_for(report, "quiet").status == STATUS_IGNORED
+
+
+def test_no_map_file_means_the_old_behaviour(tmp_path, upstream):
+    """The feature is opt-in: absent, nothing about the run changes."""
+    scenario = Scenario(tmp_path, upstream)
+    scenario.add_jar("plain.jar", id="plain", version="1.0.0", name="Plain")
+
+    entry = entry_for(
+        run_check(upstream, scenario, tmp_path, map_path=tmp_path / "absent.json"),
+        "plain",
+    )
+
+    assert entry.status == STATUS_UNRESOLVED
+    assert entry.matched_by == ""
+
+
+# --------------------------------------------------------------------------------------
+# Advisories added for breakage that is not an update
+# --------------------------------------------------------------------------------------
+
+
+def project_with_side(project_id, slug, sha1, **flags):
+    return FakeProject(
+        id=project_id,
+        slug=slug,
+        versions=[_version(project_id, project_id + "-1", "1.0.0", sha1)],
+        **flags,
+    )
+
+
+def test_a_project_modrinth_marks_server_unsupported_is_reported(tmp_path, upstream):
+    """Modrinth's flag, not the jar's: this is the half the scanner cannot see.
+
+    A mod whose ``fabric.mod.json`` says ``environment: *`` can still be flagged
+    ``server_side: unsupported`` on the platform, and that is the one that will break a server.
+    """
+    scenario = Scenario(tmp_path, upstream)
+    mod = scenario.add_jar("hudonly.jar", id="hudonly", version="1.0.0", name="Hud Only")
+    upstream.add_project(
+        project_with_side("proj-hudonly", "hudonly", mod.sha1, server_side="unsupported")
+    )
+
+    report = run_check(upstream, scenario, tmp_path)
+
+    keys = dict(report.advisories)
+    assert "advisory.server_side_unsupported" in keys
+    assert keys["advisory.server_side_unsupported"]["files"] == "hudonly.jar"
+
+
+@pytest.mark.parametrize("side", ["required", "optional", "unknown"])
+def test_a_server_compatible_project_is_not_reported(tmp_path, upstream, side):
+    """``optional`` means it works on a server. Warning about it would be noise.
+
+    ``unknown`` too: it is what Modrinth reports for a project it has not classified, and
+    turning "we do not know" into "this is broken" is the failure this test exists to prevent.
+    """
+    scenario = Scenario(tmp_path, upstream)
+    mod = scenario.add_jar("fine.jar", id="fine", version="1.0.0", name="Fine")
+    upstream.add_project(project_with_side("proj-fine", "fine", mod.sha1, server_side=side))
+
+    report = run_check(upstream, scenario, tmp_path)
+
+    assert "advisory.server_side_unsupported" not in dict(report.advisories)
+
+
+def test_a_missing_dependency_is_reported(tmp_path, upstream):
+    """A missing library explains a crash; a stale jar explains almost nothing."""
+    scenario = Scenario(tmp_path, upstream)
+    scenario.add_jar(
+        "needs.jar",
+        id="needs",
+        version="1.0.0",
+        name="Needs",
+        depends={"minecraft": ">=26.3", "cloth-config": "*"},
+    )
+
+    report = run_check(upstream, scenario, tmp_path)
+
+    keys = dict(report.advisories)
+    assert "advisory.missing_dependencies" in keys
+    assert keys["advisory.missing_dependencies"]["files"] == "cloth-config"
+
+
+def test_a_satisfied_dependency_is_not_reported(tmp_path, upstream):
+    """The false-positive direction, which is what would make the line ignorable."""
+    scenario = Scenario(tmp_path, upstream)
+    scenario.add_jar(
+        "needs.jar",
+        id="needs",
+        version="1.0.0",
+        name="Needs",
+        depends={"minecraft": ">=26.3", "cloth-config": "*"},
+    )
+    scenario.add_jar("cloth.jar", id="cloth-config", version="1.0.0", name="Cloth Config")
+
+    report = run_check(upstream, scenario, tmp_path)
+
+    assert "advisory.missing_dependencies" not in dict(report.advisories)
+
+
+# --------------------------------------------------------------------------------------
+# Reading a stored report back
+#
+# ``last_report.json`` is read after a restart so the reuse window survives one, and compared
+# against the previous run so "new update" can be told from "still waiting". Both of those
+# depend on the file surviving a round trip, so the round trip is asserted rather than assumed.
+# --------------------------------------------------------------------------------------
+
+
+def test_a_report_survives_a_json_round_trip(report):
+    restored = Report.from_json(report.to_json())
+
+    assert restored is not None
+    assert restored.generated_at == report.generated_at
+    assert restored.mods_directory == report.mods_directory
+    assert restored.download_folder == report.download_folder
+    assert restored.server.describe() == report.server.describe()
+    assert restored.server.mc_version_source == report.server.mc_version_source
+    assert [entry.file_name for entry in restored.entries] == [
+        entry.file_name for entry in report.sorted_entries()
+    ]
+    assert restored.counts() == report.counts()
+    assert restored.actionable_count == report.actionable_count
+    assert restored.advisories == report.advisories
+    assert restored.upstream_notes == report.upstream_notes
+    assert restored.duplicate_ids == report.duplicate_ids
+    assert restored.disabled_jars == report.disabled_jars
+    assert restored.unidentified == report.unidentified
+
+
+def test_every_entry_field_survives_including_its_notes(report):
+    original = entry_for(report, "alpha")
+    restored = [entry for entry in Report.from_json(report.to_json()).entries
+                if entry.file_name == original.file_name][0]
+
+    assert restored.status == original.status
+    assert restored.matched_by == original.matched_by
+    assert restored.download_sha512 == original.download_sha512
+    assert restored.download_url == original.download_url
+    assert restored.notes == original.notes
+    assert restored.release_channel == original.release_channel
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "not json at all",
+        "[]",
+        "{}",
+        '{"generated_at": "2026-01-01T00:00:00+00:00"}',
+        # A format this version does not know: refuse rather than interpret optimistically.
+        '{"format": 99, "generated_at": "2026-01-01T00:00:00+00:00"}',
+        # No timestamp, so there is no way to judge the age — which is the only thing a
+        # stored report is ever used for.
+        '{"format": 1, "generated_at": ""}',
+    ],
+)
+def test_an_unusable_stored_report_is_refused(payload):
+    assert Report.from_json(payload) is None
+
+
+def test_one_unreadable_entry_does_not_lose_the_rest():
+    """A whole report is not thrown away over one bad row — the others are still true."""
+    stored = Report(generated_at="2026-01-01T00:00:00+00:00", server=SERVER, mods_directory="m")
+    good = UpdateEntry(mod_id="a", name="A", file_name="a.jar", status=STATUS_UP_TO_DATE)
+    payload = stored.to_dict()
+    payload["entries"] = [good.to_dict(), {"no_file_name": True}, "nonsense"]
+
+    restored = Report.from_dict(payload)
+
+    assert [entry.file_name for entry in restored.entries] == ["a.jar"]
+
+
+def test_an_unknown_status_becomes_unresolved_rather_than_being_printed_raw():
+    """A file written by a newer version must not put ``status.something_new`` in the log."""
+    payload = {
+        "format": 1,
+        "generated_at": "2026-01-01T00:00:00+00:00",
+        "entries": [
+            {"file_name": "a.jar", "mod_id": "a", "name": "A", "status": "quantum_superposition"}
+        ],
+    }
+
+    restored = Report.from_dict(payload)
+
+    assert restored.entries[0].status == STATUS_UNRESOLVED
+
+
+def test_the_extra_sections_of_the_payload_are_ignored():
+    """``counts`` and ``actionable_count`` are written for scripts and recomputed here."""
+    report = Report(
+        generated_at="2026-01-01T00:00:00+00:00",
+        server=SERVER,
+        mods_directory="m",
+        entries=[
+            UpdateEntry(mod_id="a", name="A", file_name="a.jar", status=STATUS_UPDATE_AVAILABLE)
+        ],
+    )
+    payload = report.to_dict()
+    payload["counts"] = {"update_available": 999}
+    payload["actionable_count"] = 999
+
+    restored = Report.from_dict(payload)
+
+    assert restored.actionable_count == 1
+
+
+def test_new_since_last_names_only_the_updates_that_appeared():
+    """The whole point: a mod that has needed updating for a week is not news.
+
+    Without this, every server start re-announces the same list identically, and the admin has
+    no way to tell "still waiting" from "just published".
+    """
+    previous = Report(
+        generated_at="2026-01-01T00:00:00+00:00",
+        server=SERVER,
+        mods_directory="m",
+        entries=[
+            UpdateEntry(mod_id="old", name="Old", file_name="old.jar",
+                        status=STATUS_UPDATE_AVAILABLE),
+            UpdateEntry(mod_id="settled", name="Settled", file_name="settled.jar",
+                        status=STATUS_UP_TO_DATE),
+        ],
+    )
+    current = Report(
+        generated_at="2026-01-02T00:00:00+00:00",
+        server=SERVER,
+        mods_directory="m",
+        entries=[
+            UpdateEntry(mod_id="old", name="Old", file_name="old.jar",
+                        status=STATUS_UPDATE_AVAILABLE),
+            UpdateEntry(mod_id="settled", name="Settled", file_name="settled.jar",
+                        status=STATUS_UPDATE_AVAILABLE),
+            UpdateEntry(mod_id="brand", name="Brand", file_name="brand.jar",
+                        status=STATUS_UPDATE_AVAILABLE),
+        ],
+    )
+
+    current.record_new_since(previous)
+
+    assert current.new_since_last == ["brand.jar", "settled.jar"]
+
+
+def test_nothing_is_called_new_without_a_previous_report():
+    """Empty is the only honest answer on a first run, and the renderer says nothing then."""
+    report = Report(
+        generated_at="2026-01-01T00:00:00+00:00",
+        server=SERVER,
+        mods_directory="m",
+        entries=[
+            UpdateEntry(mod_id="a", name="A", file_name="a.jar", status=STATUS_UPDATE_AVAILABLE)
+        ],
+    )
+
+    report.record_new_since(None)
+
+    assert report.new_since_last == []
+
+
+def test_a_build_that_has_since_been_downloaded_is_not_new():
+    """Moving to "waiting to be installed" is the admin's own doing, not news."""
+    previous = Report(
+        generated_at="2026-01-01T00:00:00+00:00",
+        server=SERVER,
+        mods_directory="m",
+        entries=[
+            UpdateEntry(mod_id="a", name="A", file_name="a.jar",
+                        status=STATUS_UPDATE_AVAILABLE)
+        ],
+    )
+    current = Report(
+        generated_at="2026-01-02T00:00:00+00:00",
+        server=SERVER,
+        mods_directory="m",
+        entries=[
+            UpdateEntry(mod_id="a", name="A", file_name="a.jar",
+                        status=STATUS_AWAITING_INSTALL)
+        ],
+    )
+
+    current.record_new_since(previous)
+
+    assert current.new_since_last == []
+
+
+def test_the_new_since_line_is_rendered_and_absent_when_empty():
+    """Rendered inside the update section, so "there are five" is read before "two are new"."""
+    report = Report(
+        generated_at="2026-01-01T00:00:00+00:00",
+        server=SERVER,
+        mods_directory="m",
+        entries=[
+            UpdateEntry(mod_id="a", name="A", file_name="a.jar", local_version="1.0",
+                        latest_version="2.0", status=STATUS_UPDATE_AVAILABLE)
+        ],
+    )
+    tr = make_translator("zh_cn")
+
+    assert "新出现" not in "\n".join(render_summary(report, tr))
+
+    report.new_since_last = ["a.jar"]
+    rendered = "\n".join(render_summary(report, tr))
+
+    assert "新出现" in rendered and "a.jar" in rendered
+    assert rendered.index("存在更新") < rendered.index("新出现")
+
+
+def test_a_stored_report_keeps_the_download_folder_so_the_hint_still_works():
+    """The JSON used to omit it, and the notification then named a folder it could not say."""
+    report = Report(
+        generated_at="2026-01-01T00:00:00+00:00",
+        server=SERVER,
+        mods_directory="m",
+        download_folder="/plugins/mod_update_checker/downloads",
+    )
+
+    assert Report.from_json(report.to_json()).download_folder == report.download_folder

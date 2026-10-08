@@ -40,7 +40,7 @@ REASON_SOURCES = {
 
 #: Values the dynamic families are built from.
 #: How an entry was tied to a project. ``fingerprint`` went with CurseForge.
-MATCHED_BY_VALUES = ("hash", "name")
+MATCHED_BY_VALUES = ("hash", "name", "manual")
 
 #: A message key used literally in the source, e.g. ``"note.declared_mc"`` or
 #: ``"command.help.list"``. Keys are matched by their leading family so that unrelated dotted

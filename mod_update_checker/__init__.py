@@ -71,6 +71,7 @@ from .report import (
     render_summary,
 )
 from .upstream import HttpClient
+from .projectmap import MAP_FILE_NAME, ProjectMap, resolve_map_file
 from .scanner import (
     ScanResult,
     iter_mod_jars,
@@ -230,6 +231,17 @@ class SourcesConfig(_Grouped):
     _NESTED: ClassVar[Dict[str, Type[Serializable]]] = {"modrinth": ModrinthConfig}
 
     modrinth: ModrinthConfig = ModrinthConfig()
+
+    manual_map: str = MAP_FILE_NAME
+    """自己写的「哪个 jar 对应哪个项目」清单的文件名，放在插件数据文件夹里。
+
+    用来解决「自己编译、重新打包或改签名的 Mod 查不到」这个已知限制：哈希对不上、名称也猜不中，
+    这类 jar 本来只能报 ``unresolved``。在这里写下它们的归属，就不需要再猜。
+
+    填**文件名，不是路径**（如 ``project-map.json``）——与 ``download.folder_name`` 同样的理由，
+    这样它无论如何配置都只会在插件数据文件夹里，不会读到别处去。填 ``""`` 即关闭。
+
+    这个文件**只读不写**，格式见 README。改完直接 ``!!modupdate reload`` 或等下次检查即可生效。"""
 
 
 class DownloadConfig(_Grouped):
@@ -572,6 +584,9 @@ def _run_check(
 
     try:
         config = _config
+        # Captured before this run replaces it: the difference between the two is the only
+        # thing that can tell "this update is new" from "this update is still waiting".
+        previous = _last_report
         scan, context = _scan_current(server, config)
         if not os.path.isdir(scan.directory):
             message = tr("console.no_mods_directory", directory=scan.directory)
@@ -593,7 +608,9 @@ def _run_check(
             if config.network.cache.enabled
             else None
         )
-        report = checker.run(scan, context, cache_path=cache_path)
+        report = checker.run(
+            scan, context, cache_path=cache_path, map_path=_manual_map_path(server, config)
+        )
         _last_report = report
 
         # Before the notification, not after it. What the admin reads has to describe the state
@@ -602,6 +619,10 @@ def _run_check(
         # report wrong the instant it is printed. The cost is waiting for the transfers, so a
         # line saying how many are starting goes out first.
         _reconcile_downloads(server, report, config)
+
+        # After the download reconciliation, so the comparison describes the report as it will
+        # be read: a build that was fetched just now is no longer "an update available".
+        report.record_new_since(previous)
 
         _notify(server, report, source=source, announce_clean=announce_clean,
                 broadcast=broadcast)
@@ -619,6 +640,88 @@ def _run_check(
         return None
     finally:
         _check_lock.release()
+
+
+def _manual_map_path(
+    server: PluginServerInterface, config: Config
+) -> Optional[Path]:
+    """The admin's mapping file, or ``None`` when it is switched off or unusable.
+
+    A rejected value warns and then disables the feature rather than failing the check: the
+    cost of ignoring it is that a few jars stay ``unresolved``, which is what they would have
+    been anyway, while the cost of refusing to check would be the whole plugin.
+    """
+    path, reason = resolve_map_file(
+        Path(server.get_data_folder()), config.sources.manual_map
+    )
+    if path is None:
+        if reason != "disabled":
+            server.logger.warning(
+                tr("console.manual_map_rejected", value=config.sources.manual_map)
+            )
+        return None
+    return path
+
+
+def _load_previous_report(
+    server: PluginServerInterface, config: Config
+) -> Optional[Report]:
+    """Read back the report the last run wrote, so a restart does not discard the window.
+
+    Gated on ``report.write_file``, which is the setting whose entire meaning is "keep the
+    last result on disk". With it off, a report file left over from when it was on is not
+    something to start reading — the admin asked for results not to be persisted.
+
+    Anything unusable gives ``None``, and the caller's response to ``None`` is to run the
+    check, which is what it would have done anyway. That is what makes it safe to be strict
+    about the format marker: the worst case is one extra check after an upgrade.
+    """
+    if not config.report.write_file:
+        return None
+    path = os.path.join(server.get_data_folder(), REPORT_FILE_NAME)
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return Report.from_json(handle.read())
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _report_still_applies(
+    report: Report, config: Config, server: PluginServerInterface
+) -> bool:
+    """Whether a stored report still describes the server in front of us.
+
+    The age window alone used to be enough, because the report only ever lived in memory. Now
+    that it survives a restart, "produced within the last day" is no longer the same as "still
+    true": the admin could have swapped the mods folder, changed loader, or upgraded Minecraft
+    in between, and reusing the old answer would then describe a server that no longer exists.
+
+    Two of those are checkable for free, and they are the two that matter:
+
+    * the mods directory the report was produced from has to be the one configured now;
+    * ``server.mc_version`` has to match when it is *pinned*. With the default ``auto`` there
+      is nothing cheap to compare against — detection reads the log and, failing that, every
+      jar — so an auto-detected version change can still be missed. The README already tells
+      an admin upgrading a major version to pin the version explicitly, and this is one more
+      reason that advice pays off.
+    """
+    expected = str(
+        resolve_mods_directory(
+            _working_directory(server), config.server.mods_directory
+        )
+    )
+    if report.mods_directory != expected:
+        return False
+
+    configured_loader = (config.server.loader or "").strip().lower()
+    if configured_loader and report.server.loader != configured_loader:
+        return False
+
+    pinned = (config.server.mc_version or "").strip()
+    if pinned and pinned.lower() != i18n.AUTO:
+        if report.server.mc_version != pinned:
+            return False
+    return True
 
 
 def _write_report_files(server: PluginServerInterface, report: Report) -> None:
@@ -1180,6 +1283,11 @@ def _notification_lines(report: Report) -> List[str]:
                             latest=entry.latest_version or "?"))
         if len(updates) > NOTIFY_MAX_UPDATES:
             lines.append(tr("report.and_more", count=len(updates) - NOTIFY_MAX_UPDATES))
+        # The list is the same every start until the admin acts on it, so the one thing worth
+        # adding is which part of it just appeared.
+        if report.new_since_last:
+            lines.append(tr("report.new_since_last", count=len(report.new_since_last),
+                            names=", ".join(report.new_since_last[:6])))
 
     pending = report.awaiting_install
     if pending:
@@ -1280,7 +1388,14 @@ def _admin_join_worker(server: PluginServerInterface, player: str) -> None:
     report = _last_report
     window_minutes = max(0, int(_config.report.reuse_report_minutes))
     age = report.age_seconds() if report is not None else None
-    reused = age is not None and 0 < age <= window_minutes * 60
+    # Age is not the only question: a report carried across a restart, or a mods folder that
+    # has been pointed somewhere else since, describes a server this admin is not on.
+    reused = (
+        report is not None
+        and age is not None
+        and 0 < age <= window_minutes * 60
+        and _report_still_applies(report, _config, server)
+    )
 
     if not reused:
         # No broadcast here: the admin who just joined is about to get the same figures in
@@ -1838,6 +1953,42 @@ def _approved_install_count(server: PluginServerInterface) -> int:
     return len(ledger.approved_keys())
 
 
+def _manual_map_state(server: PluginServerInterface) -> str:
+    """One line for the status page: is the mapping file loaded, and with how much in it?
+
+    Worth a line because the file is silent by design — it changes no setting and prints
+    nothing while it works. Without this, "I wrote that file and nothing happened" has no way
+    to be answered other than by reading the config and guessing.
+    """
+    configured = str(_config.sources.manual_map or "").strip()
+    if not configured:
+        return tr("command.status.manual_map_off")
+
+    try:
+        base = Path(server.get_data_folder())
+    except Exception as error:  # noqa: BLE001 - a status page is not worth failing over
+        return tr(
+            "command.status.manual_map_broken",
+            detail="{}: {}".format(type(error).__name__, error),
+        )
+
+    path, _reason = resolve_map_file(base, configured)
+    if path is None:
+        return tr("command.status.manual_map_invalid", value=configured)
+
+    mapping = ProjectMap(path)
+    if mapping.error:
+        return tr("command.status.manual_map_broken", detail=mapping.error)
+    if not mapping.loaded:
+        return tr("command.status.manual_map_empty", name=path.name)
+    return tr(
+        "command.status.manual_map",
+        name=path.name,
+        hashes=mapping.hashes,
+        ids=mapping.mod_ids,
+    )
+
+
 def _show_status(source: CommandSource) -> None:
     """What the plugin currently thinks the server is, and what it is configured to do.
 
@@ -1883,6 +2034,12 @@ def _show_status(source: CommandSource) -> None:
         _field(tr("command.status.upstream_label"),
                tr("command.status.upstream", modrinth=modrinth_state),
                RColor.white),
+        "\n",
+        _field(
+            tr("command.status.manual_map_label"),
+            _manual_map_state(server),
+            RColor.white,
+        ),
         # The setting that changes files on this server belongs on the page that describes
         # what the plugin is doing, not only in the config file.
         "\n",
@@ -2202,6 +2359,11 @@ def on_load(server: PluginServerInterface, prev_module: Any) -> None:
     if _config.check.ignored_mods:
         server.logger.info(tr("console.ignored_mods", count=len(_config.check.ignored_mods),
                               names=", ".join(_config.check.ignored_mods[:8])))
+
+    # Only when nothing was carried over from a reload. A reload keeps the live report, which
+    # is by definition at least as fresh as the one on disk.
+    if _last_report is None:
+        _last_report = _load_previous_report(server, _config)
 
     _log_cache_summary(server, _config)
 

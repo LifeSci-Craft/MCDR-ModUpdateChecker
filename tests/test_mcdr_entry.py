@@ -8,6 +8,7 @@ firing — so they are pinned here rather than left to a review.
 import ast
 import hashlib
 import json
+import sys
 import time
 from pathlib import Path
 
@@ -497,7 +498,7 @@ def _report_with(entries):
     )
 
 
-def _report(updates=2, age_seconds=0.0):
+def _report(updates=2, age_seconds=0.0, mods_directory=None):
     """A report with ``updates`` pending updates, produced ``age_seconds`` ago."""
     from datetime import datetime, timedelta, timezone
 
@@ -508,7 +509,7 @@ def _report(updates=2, age_seconds=0.0):
     report = Report(
         generated_at=produced.isoformat(timespec="seconds"),
         server=ServerContext(mc_version="26.3", mc_version_source="config", loader="fabric"),
-        mods_directory="server/mods",
+        mods_directory=_MODS_DIRECTORY if mods_directory is None else mods_directory,
     )
     for index in range(updates):
         report.entries.append(
@@ -524,10 +525,19 @@ def _report(updates=2, age_seconds=0.0):
     return report
 
 
+#: The mods directory the plugin resolves for the fake server. ``entry_env`` sets it to what
+#: the fixture's server actually implies, because a stored report is only reused when it
+#: describes the server in front of us — so a synthetic report naming some other directory is
+#: correctly refused, and every test of the reuse window would quietly turn into a test of the
+#: fresh-check path instead.
+_MODS_DIRECTORY = "mods"
+
+
 @pytest.fixture
 def entry_env(tmp_path, monkeypatch):
     """The plugin module wired to a fake server, with a recording check function."""
     import mod_update_checker as plugin
+    from mod_update_checker.scanner import resolve_mods_directory
 
     # Only two departures from the shipped defaults here; everything else this fixture used to
     # spell out was already the default, and saying so twice is how a stub drifts.
@@ -535,6 +545,12 @@ def entry_env(tmp_path, monkeypatch):
         plugin,
         "_config",
         _config_with({"report.in_game": True, "report.reuse_report_minutes": 30}),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_MODS_DIRECTORY",
+        str(resolve_mods_directory(str(tmp_path), "")),
         raising=False,
     )
     plugin._stop_event.clear()
@@ -1622,3 +1638,336 @@ def test_the_automatic_setting_installs_the_whole_ledger(tmp_path, monkeypatch):
 
     assert pending_records(ledger, approved_only=False) == ["other", "sodium"]
     assert pending_records(ledger, approved_only=True) == []
+
+
+# --------------------------------------------------------------------------------------
+# Whether a report may be reused at all
+#
+# The age window used to be the only question, which was enough while the report only ever
+# lived in memory. Now that ``last_report.json`` is read back after a restart, "produced
+# recently" and "still describes this server" became different questions — and answering only
+# the first one means an admin who just swapped their mods folder, changed loader, or upgraded
+# Minecraft is shown the previous server's answer as though it were current.
+# --------------------------------------------------------------------------------------
+
+
+def _scan_of(tmp_path, *jar_names):
+    from mod_update_checker.scanner import scan_mods
+
+    mods = Path(tmp_path) / "mods"
+    mods.mkdir(parents=True, exist_ok=True)
+    for name in jar_names:
+        (mods / name).write_bytes(b"not read; only listed")
+    return scan_mods(mods)
+
+
+def _run_with_stub(plugin, server, tmp_path, monkeypatch, report, **config):
+    """Drive ``_run_check`` with ``_scan_current`` and ``Checker`` stubbed out."""
+    from mod_update_checker.serverinfo import ServerContext
+
+    recorded = {}
+
+    class _RecordingChecker:
+        def __init__(self, options, logger=None):
+            recorded["options"] = options
+
+        def run(self, scan, context, cache_path=None, map_path=None):
+            recorded["map_path"] = map_path
+            report.server = context
+            report.mods_directory = scan.directory
+            return report
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(plugin, "Checker", _RecordingChecker, raising=False)
+    monkeypatch.setattr(
+        plugin,
+        "_scan_current",
+        lambda *_a: (
+            _scan_of(tmp_path),
+            ServerContext(mc_version="26.3", mc_version_source="config", loader="fabric"),
+        ),
+        raising=False,
+    )
+    settings = {"report.write_file": False}
+    settings.update(config)
+    monkeypatch.setattr(plugin, "_config", _config_with(settings), raising=False)
+    plugin._stop_event.clear()
+    plugin._last_report = None
+
+    plugin._run_check(server)
+    plugin._last_report = None
+    return recorded
+
+
+def test_a_report_for_a_different_mods_folder_is_not_reused(entry_env, tmp_path):
+    """Pointing ``server.mods_directory`` somewhere else makes the stored answer wrong."""
+    plugin, server, calls = entry_env
+    plugin._last_report = _report(updates=1, age_seconds=60, mods_directory="D:/somewhere/else")
+
+    plugin._admin_join_worker(server, "Admin")
+
+    assert calls, "the stored report described another folder and should not have been reused"
+
+
+def test_a_report_for_a_different_pinned_game_version_is_not_reused(entry_env, tmp_path,
+                                                                  monkeypatch):
+    """Upgrading Minecraft is exactly when a stale answer is most dangerous.
+
+    With ``mc_version: auto`` there is nothing cheap to compare against, so this asserts the
+    case the admin can control — and the README already tells them to pin it after a major
+    upgrade.
+    """
+    plugin, server, calls = entry_env
+    monkeypatch.setattr(
+        plugin, "_config",
+        _config_with({"report.reuse_report_minutes": 30, "server.mc_version": "1.22"}),
+        raising=False,
+    )
+    plugin._last_report = _report(updates=1, age_seconds=60)
+
+    plugin._admin_join_worker(server, "Admin")
+
+    assert calls, "the stored report was for another game version"
+
+
+def test_a_report_from_another_loader_is_not_reused(entry_env, monkeypatch):
+    from mod_update_checker.serverinfo import ServerContext
+
+    plugin, server, calls = entry_env
+    monkeypatch.setattr(
+        plugin, "_config",
+        _config_with({"report.reuse_report_minutes": 30, "server.loader": "neoforge"}),
+        raising=False,
+    )
+    stale = _report(updates=1, age_seconds=60)
+    stale.server = ServerContext(mc_version="26.3", loader="fabric")
+    plugin._last_report = stale
+
+    plugin._admin_join_worker(server, "Admin")
+
+    assert calls, "the stored report was produced for a different loader"
+
+
+def test_a_report_that_still_applies_is_reused(entry_env):
+    """The other direction, so the gate cannot pass by refusing everything."""
+    plugin, server, calls = entry_env
+    plugin._last_report = _report(updates=1, age_seconds=60)
+
+    plugin._admin_join_worker(server, "Admin")
+
+    assert calls == []
+
+
+# --------------------------------------------------------------------------------------
+# last_report.json being read back
+# --------------------------------------------------------------------------------------
+
+
+def _store_report(server, **overrides):
+    from mod_update_checker.report import Report
+
+    values = {
+        "generated_at": "2026-01-01T00:00:00+00:00",
+        "mods_directory": _MODS_DIRECTORY,
+    }
+    values.update(overrides)
+    report = overrides.get("report")
+    if report is None:
+        from mod_update_checker.serverinfo import ServerContext
+
+        report = Report(
+            generated_at=values["generated_at"],
+            server=ServerContext(mc_version="26.3", mc_version_source="config",
+                                 loader="fabric"),
+            mods_directory=values["mods_directory"],
+        )
+    Path(server.get_data_folder(), "last_report.json").write_text(
+        report.to_json(), encoding="utf-8"
+    )
+    return report
+
+
+def test_a_stored_report_is_read_back_at_load(tmp_path, monkeypatch):
+    """Otherwise every restart throws the reuse window away and re-asks Modrinth."""
+    import mod_update_checker as plugin
+    from mod_update_checker.report import Report
+
+    server = _FakeServer(tmp_path)
+    _store_report(server)
+    monkeypatch.setattr(plugin, "_last_report", None, raising=False)
+    plugin._stop_event.clear()
+
+    plugin.on_load(server, None)
+
+    assert isinstance(plugin._last_report, Report)
+    assert plugin._last_report.mods_directory == _MODS_DIRECTORY
+    plugin._last_report = None
+    plugin._stop_scheduler()
+
+
+def test_a_stored_report_is_not_read_when_report_files_are_off(tmp_path, monkeypatch):
+    """``write_file: false`` means "do not persist results", so nothing is read back either."""
+    import mod_update_checker as plugin
+
+    server = _FakeServer(tmp_path)
+    _store_report(server)
+    plugin._stop_event.clear()
+    monkeypatch.setattr(plugin, "_last_report", None, raising=False)
+    monkeypatch.setattr(
+        plugin, "_config",
+        _config_with({"report.write_file": False}),
+        raising=False,
+    )
+
+    assert plugin._load_previous_report(server, plugin._config) is None
+
+    plugin._stop_scheduler()
+
+
+def test_an_unreadable_stored_report_is_ignored_rather_than_raising(tmp_path):
+    import mod_update_checker as plugin
+
+    server = _FakeServer(tmp_path)
+    Path(server.get_data_folder(), "last_report.json").write_text("{not json", encoding="utf-8")
+
+    assert plugin._load_previous_report(server, _config_with()) is None
+
+
+def test_a_live_report_from_a_reload_is_kept_over_the_one_on_disk(tmp_path, monkeypatch):
+    """A reload carries the in-memory report, which is by definition at least as fresh."""
+    import mod_update_checker as plugin
+
+    server = _FakeServer(tmp_path)
+    _store_report(server, generated_at="2020-01-01T00:00:00+00:00")
+    live = _report(updates=1)
+    plugin._stop_event.clear()
+    monkeypatch.setattr(plugin, "_last_report", live, raising=False)
+
+    plugin.on_load(server, None)
+
+    assert plugin._last_report is live
+    plugin._last_report = None
+    plugin._stop_scheduler()
+
+
+def test_the_configured_map_file_reaches_the_checker(tmp_path, monkeypatch):
+    """The map is only useful if the path assembled in ``_run_check`` arrives intact."""
+    import mod_update_checker as plugin
+
+    server = _FakeServer(tmp_path)
+    recorded = _run_with_stub(
+        plugin, server, tmp_path, monkeypatch,
+        _report(updates=0, mods_directory=str(Path(tmp_path) / "mods")),
+    )
+
+    assert recorded["map_path"] == Path(server.get_data_folder()) / "project-map.json"
+
+
+def test_a_map_setting_that_is_a_path_is_rejected_and_warned_about(tmp_path, monkeypatch):
+    """It has to be a file name, and a silent refusal would look like a broken feature."""
+    import mod_update_checker as plugin
+
+    server = _FakeServer(tmp_path)
+    recorded = _run_with_stub(
+        plugin, server, tmp_path, monkeypatch,
+        _report(updates=0, mods_directory=str(Path(tmp_path) / "mods")),
+        **{"sources.manual_map": "../outside.json"},
+    )
+
+    assert recorded["map_path"] is None
+    assert any("manual_map" in message for message in server.logger.messages), (
+        server.logger.messages
+    )
+
+
+def test_an_empty_map_setting_switches_the_feature_off_without_a_warning(tmp_path, monkeypatch):
+    import mod_update_checker as plugin
+
+    server = _FakeServer(tmp_path)
+    recorded = _run_with_stub(
+        plugin, server, tmp_path, monkeypatch,
+        _report(updates=0, mods_directory=str(Path(tmp_path) / "mods")),
+        **{"sources.manual_map": ""},
+    )
+
+    assert recorded["map_path"] is None
+    assert not any("manual_map" in message for message in server.logger.messages)
+
+
+# --------------------------------------------------------------------------------------
+# The status page's one line about the map
+#
+# The file is silent by design, so this line is the only way to answer "I wrote that file and
+# nothing happened" without reading the config and guessing.
+# --------------------------------------------------------------------------------------
+
+
+def _status_with_map(tmp_path, monkeypatch, map_payload=None, setting=None):
+    import mod_update_checker as plugin
+
+    server = _FakeServer(tmp_path)
+    if map_payload is not None:
+        Path(server.get_data_folder(), "project-map.json").write_text(
+            map_payload, encoding="utf-8"
+        )
+
+    overrides = {"language": "zh_cn"}
+    if setting is not None:
+        overrides["sources.manual_map"] = setting
+    config = _config_with(overrides)
+
+    class _Scan:
+        directory = "server/mods"
+        mods = []
+        disabled = []
+
+    previous = (plugin._config, plugin._scan_current, plugin._server)
+    try:
+        plugin._config = config
+        plugin._apply_language(server, config)
+        plugin._scan_current = lambda *_a: (
+            _Scan(),
+            __import__(
+                "mod_update_checker.serverinfo", fromlist=["ServerContext"]
+            ).ServerContext(mc_version="26.3", mc_version_source="config", loader="fabric"),
+        )
+        plugin._server = server
+        source = _ReplyRecorder()
+        plugin._show_status(source)
+    finally:
+        plugin._config, plugin._scan_current, plugin._server = previous
+    return "\n".join(str(item) for item in source.replies)
+
+
+def test_the_status_page_says_the_map_is_off(tmp_path, monkeypatch):
+    rendered = _status_with_map(tmp_path, monkeypatch, setting="")
+
+    assert "本地映射表" in rendered and "关" in rendered
+
+
+def test_the_status_page_counts_what_is_in_the_map(tmp_path, monkeypatch):
+    import json
+
+    payload = json.dumps(
+        {"version": 1, "by_sha1": {"a" * 40: "sodium"}, "by_mod_id": {"mycustommod": "lithium"}}
+    )
+    rendered = _status_with_map(tmp_path, monkeypatch, map_payload=payload)
+
+    assert "project-map.json" in rendered
+    assert "1 条按哈希" in rendered and "1 条按 mod id" in rendered
+
+
+def test_the_status_page_says_when_the_map_file_is_missing_pieces(tmp_path, monkeypatch):
+    """The reason is carried through, because "cannot read it" alone is not actionable."""
+    rendered = _status_with_map(tmp_path, monkeypatch, map_payload='{"by_sha1": []}')
+
+    assert "无法读取" in rendered
+    assert "by_sha1" in rendered
+
+
+def test_the_status_page_says_when_the_map_name_is_not_a_file_name(tmp_path, monkeypatch):
+    rendered = _status_with_map(tmp_path, monkeypatch, setting="sub/dir.json")
+
+    assert "已忽略" in rendered and "sub/dir.json" in rendered

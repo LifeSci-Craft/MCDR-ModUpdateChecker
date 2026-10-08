@@ -50,6 +50,7 @@ __all__ = [
     "DownloadLedger",
     "safe_jar_name",
     "resolve_folder",
+    "is_safe_component",
     "entry_key",
     "classify_downloaded",
 ]
@@ -144,6 +145,34 @@ def safe_jar_name(raw: str, fallback: str = "mod") -> str:
     return "{}.jar".format(stem)
 
 
+def is_safe_component(name: str) -> Tuple[bool, str]:
+    """Whether ``name`` may be used as a single file or folder name inside a managed folder.
+
+    ``(True, "")`` or ``(False, reason)``. The reason is a short code rather than a sentence,
+    because two callers report it in two different places — the download folder and the local
+    project map — and each wants its own wording.
+
+    One definition, used by both, on purpose. Two copies of "is this name a path in
+    disguise?" would eventually disagree, and the disagreement would be the half that forgot
+    to check for a drive letter.
+    """
+    text = str(name or "").strip()
+    if not text:
+        return False, "empty"
+    normalised = text.replace("\\", "/")
+    if "/" in normalised:
+        return False, "contains-a-separator"
+    if normalised in (".", "..") or normalised.startswith(".."):
+        return False, "relative"
+    if _ILLEGAL.search(normalised):
+        return False, "illegal-characters"
+    if normalised.upper() in _RESERVED_NAMES:
+        return False, "reserved-name"
+    if Path(normalised).is_absolute() or re.match(r"^[A-Za-z]:", normalised):
+        return False, "absolute"
+    return True, ""
+
+
 def resolve_folder(base: Union[str, Path], name: str) -> Tuple[Optional[Path], str]:
     """The download folder inside ``base``. Returns ``(path, reason)``; ``None`` means no.
 
@@ -152,21 +181,11 @@ def resolve_folder(base: Union[str, Path], name: str) -> Tuple[Optional[Path], s
     its own data folder, for example into ``server/mods``. A value containing a separator, a
     drive letter or ``..`` is rejected with a reason the caller can put in the log.
     """
-    text = str(name or "").strip()
-    if not text:
-        return None, "empty"
-    normalised = text.replace("\\", "/")
-    if "/" in normalised:
-        return None, "contains-a-separator"
-    if normalised in (".", "..") or normalised.startswith(".."):
-        return None, "relative"
-    if _ILLEGAL.search(normalised):
-        return None, "illegal-characters"
-    if normalised.upper() in _RESERVED_NAMES:
-        return None, "reserved-name"
-    if Path(normalised).is_absolute() or re.match(r"^[A-Za-z]:", normalised):
-        return None, "absolute"
+    ok, reason = is_safe_component(name)
+    if not ok:
+        return None, reason
 
+    normalised = str(name or "").strip().replace("\\", "/")
     folder = Path(base).expanduser() / normalised
     # Defence in depth. The checks above already make escape impossible, but this is the
     # assertion that keeps that true if the checks are ever edited: whatever we are about to

@@ -24,7 +24,7 @@ No MCDR import: callers pass in the pieces they can get.
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .scanner import ScanResult
 from .versioning import covers
@@ -92,6 +92,34 @@ class ServerContext:
     @property
     def known(self) -> bool:
         return bool(self.mc_version)
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "ServerContext":
+        """Rebuild a context from a stored report. Never raises.
+
+        Needed to read the last report back after a restart, so that the "reuse the previous
+        answer instead of asking again" window survives one. Every field is coerced rather
+        than trusted: the file is on disk between versions of the plugin, and an unrecognised
+        shape has to mean "no usable context" rather than an exception on plugin load.
+        """
+        if not isinstance(data, dict):
+            return cls()
+
+        version = data.get("mc_version")
+        loader_version = data.get("loader_version")
+        counts = data.get("mod_loader_counts")
+        return cls(
+            mc_version=str(version) if version else None,
+            mc_version_source=str(data.get("mc_version_source") or "unknown"),
+            loader=str(data.get("loader") or "fabric").lower(),
+            loader_source=str(data.get("loader_source") or "config"),
+            loader_version=str(loader_version) if loader_version else None,
+            mod_loader_counts={
+                str(key): int(value)
+                for key, value in (counts.items() if isinstance(counts, dict) else [])
+                if isinstance(value, int) and not isinstance(value, bool)
+            },
+        )
 
     def describe(self) -> str:
         """A one-line summary for the report header."""

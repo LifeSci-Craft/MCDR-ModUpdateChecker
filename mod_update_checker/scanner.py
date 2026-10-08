@@ -35,6 +35,7 @@ from .versioning import RangeSpec, normalize_spec
 
 __all__ = [
     "MOD_METADATA_ENTRIES",
+    "PLATFORM_MOD_IDS",
     "ModMetadata",
     "ScannedMod",
     "ScanResult",
@@ -42,6 +43,7 @@ __all__ = [
     "iter_mod_jars",
     "scan_jar",
     "scan_mods",
+    "missing_dependencies",
 ]
 
 _LOGGER = logging.getLogger(__name__)
@@ -69,6 +71,32 @@ _LINE_COMMENT = re.compile(r"(?m)^\s*//.*$")
 _BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
 _TRAILING_COMMA = re.compile(r",(\s*[}\]])")
 
+#: Dependency names that are the platform rather than another mod. A server that is missing
+#: "minecraft" is not missing a mod, and reporting it as one would bury the real findings.
+#:
+#: Kept deliberately short and exact. Adding a guess here — ``fabric-api``, for instance —
+#: would suppress a genuinely missing library, which is the failure mode worth avoiding: a
+#: list that stays silent is indistinguishable from a folder with no problems.
+PLATFORM_MOD_IDS = frozenset(
+    (
+        "minecraft",
+        "java",
+        "fabricloader",
+        "fabric-loader",
+        "quilt_loader",
+        "quilt-loader",
+        "quilt_base",
+        "forge",
+        "neoforge",
+        "minecraftforge",
+        "fml",
+        "javafml",
+        "lowcodefml",
+        "modlauncher",
+        "mcloader",
+    )
+)
+
 
 @dataclass
 class ModMetadata:
@@ -85,6 +113,14 @@ class ModMetadata:
     description: Optional[str] = None
     sources: Tuple[str, ...] = ()
     provides: Tuple[str, ...] = ()
+    #: Other mods this jar says it **must** have, by mod id, platform names already removed.
+    #:
+    #: Only hard requirements: a Fabric ``depends``, a Quilt ``depends``, or a Forge/NeoForge
+    #: dependency with ``mandatory`` not set to false. ``recommends`` and ``suggests`` are
+    #: left out on purpose — a mod that merely prefers another one to be present is not a
+    #: broken server, and reporting it as one would be the sort of noise that teaches an
+    #: admin to ignore the advisory line.
+    requires: Tuple[str, ...] = ()
     bundled_jars: int = 0
 
     @property
@@ -275,6 +311,8 @@ def _metadata_from_fabric(data: Dict[str, Any], entry: str, loader: str) -> ModM
     # ``_string_list`` already flattens the bare-string form, so ``provides`` needs no
     # special case of its own here.
     provided = _string_list(data.get("provides"))
+    # ``depends`` is ``{"<mod id>": "<version range>"}``, so the keys are the requirements.
+    # ``recommends`` / ``suggests`` are not read: they are preferences, not breakage.
     return ModMetadata(
         mod_id=_first_string(data.get("id")),
         name=_first_string(data.get("name")) or _first_string(data.get("id")),
@@ -287,7 +325,19 @@ def _metadata_from_fabric(data: Dict[str, Any], entry: str, loader: str) -> ModM
         description=_first_string(data.get("description")) or None,
         sources=_contact_links(data.get("contact")),
         provides=tuple(item for item in provided if item),
+        requires=_required_mods(depends.keys()),
     )
+
+
+def _quilt_dependency_ids(depends: Any) -> Tuple[str, ...]:
+    """Quilt declares dependencies as a list of ``{"id": ...}`` objects, or as a mapping."""
+    if isinstance(depends, dict):
+        return _required_mods(depends.keys())
+    if isinstance(depends, list):
+        return _required_mods(
+            item.get("id") for item in depends if isinstance(item, dict)
+        )
+    return ()
 
 
 def _metadata_from_quilt(data: Dict[str, Any], entry: str) -> ModMetadata:
@@ -321,6 +371,7 @@ def _metadata_from_quilt(data: Dict[str, Any], entry: str) -> ModMetadata:
         description=_first_string(metadata_block.get("description")) or None,
         sources=_contact_links(metadata_block.get("contact")),
         provides=tuple(item for item in provided if item),
+        requires=_quilt_dependency_ids(depends),
     )
 
 
@@ -337,6 +388,59 @@ def _toml_value(block: str, key: str) -> str:
         r'^\s*' + re.escape(key) + r'\s*=\s*"((?:[^"\\]|\\.)*)"', block, re.MULTILINE
     )
     return match.group(1) if match else ""
+
+
+def _toml_bool(block: str, key: str) -> Optional[bool]:
+    """``key = true`` / ``key = false`` in a TOML block, or ``None`` when it is not there.
+
+    Only needed for ``mandatory``, and the distinction between "absent" and "false" is the
+    whole point: Forge treats an absent ``mandatory`` as required, so defaulting to ``False``
+    would silently drop the dependencies most likely to be missing.
+    """
+    match = re.search(
+        r"^\s*" + re.escape(key) + r"\s*=\s*(true|false)\b",
+        block,
+        re.MULTILINE | re.IGNORECASE,
+    )
+    return match.group(1).lower() == "true" if match else None
+
+
+def _required_mods(names: Iterable[Any]) -> Tuple[str, ...]:
+    """Normalise declared dependency names: lowercased, deduplicated, platform removed.
+
+    Returned sorted so a report never reshuffles because a metadata file listed the same
+    dependencies in a different order.
+    """
+    found: List[str] = []
+    for name in names:
+        text = str(name or "").strip().lower()
+        if not text or text in PLATFORM_MOD_IDS or text in found:
+            continue
+        found.append(text)
+    return tuple(sorted(found))
+
+
+def _required_from_dependencies(dependencies: Any) -> Tuple[str, ...]:
+    """Mod ids required by a parsed ``mods.toml`` dependency table.
+
+    Structure is ``{<owning mod id>: [<dependency>, ...]}`` — the outer key names the mod that
+    *declares* the dependency, and the target is the inner ``modId``. Reading the outer key
+    instead looks plausible and matches nothing, which is the bug this docstring exists to
+    stop being reintroduced.
+    """
+    if not isinstance(dependencies, dict):
+        return ()
+    names: List[str] = []
+    for entries in dependencies.values():
+        if not isinstance(entries, list):
+            continue
+        for dependency in entries:
+            if not isinstance(dependency, dict):
+                continue
+            if dependency.get("mandatory") is False:
+                continue
+            names.append(dependency.get("modId"))
+    return _required_mods(names)
 
 
 def _toml_string_list(block: str, key: str) -> Tuple[str, ...]:
@@ -411,6 +515,7 @@ def _metadata_from_toml_parsed(
         authors=_string_list(first.get("authors")),
         description=str(first.get("description", "") or "") or None,
         sources=(),
+        requires=_required_from_dependencies(parsed.get("dependencies")),
     )
 
 
@@ -418,19 +523,26 @@ def _metadata_from_toml_regex(raw: str, entry: str, loader: str) -> ModMetadata:
     """The ``tomllib``-free reader.
 
     Narrow on purpose: it takes the first ``[[mods]]`` block's id, version and name, plus the
-    ``minecraft`` dependency's range — the four things this plugin actually uses. It is not
-    a TOML parser, and it is tested directly rather than only through the ``tomllib`` path,
-    which is the one most interpreters will take.
+    declared dependencies — the things this plugin actually uses. It is not a TOML parser, and
+    it is tested directly rather than only through the ``tomllib`` path, which is the one most
+    interpreters will take.
     """
     match = _TOML_MODS_BLOCK.search(raw)
     block = match.group(1) if match else raw
 
     mc_range: RangeSpec = None
+    required: List[str] = []
     for dependency in _TOML_DEP_BLOCK.finditer(raw):
         body = dependency.group(1)
-        if _toml_value(body, "modId").lower() == "minecraft":
-            mc_range = _toml_value(body, "versionRange") or None
-            break
+        target = _toml_value(body, "modId")
+        if target.lower() == "minecraft":
+            # The first one wins, matching the strict parser's behaviour.
+            if mc_range is None:
+                mc_range = _toml_value(body, "versionRange") or None
+            continue
+        if _toml_bool(body, "mandatory") is False:
+            continue
+        required.append(target)
 
     return ModMetadata(
         mod_id=_toml_value(block, "modId"),
@@ -443,6 +555,7 @@ def _metadata_from_toml_regex(raw: str, entry: str, loader: str) -> ModMetadata:
         authors=_toml_string_list(block, "authors"),
         description=_toml_value(block, "description") or None,
         sources=(),
+        requires=_required_mods(required),
     )
 
 
@@ -543,3 +656,47 @@ def scan_mods(directory: Path, logger: Optional[Any] = None) -> ScanResult:
                 )
             )
     return result
+
+
+def missing_dependencies(scan: ScanResult) -> Dict[str, List[str]]:
+    """Hard dependencies no jar in the folder satisfies: ``{mod id: [dependent files]}``.
+
+    This is the same kind of finding as a duplicate mod id or a client-only mod in a server
+    folder — it is not an update, but it explains more crashes than a stale jar does, and the
+    information was already sitting in the metadata being read for other reasons.
+
+    A dependency counts as satisfied when some jar's own mod id matches, **or** when some jar
+    declares it in ``provides``: a mod that says "I am a drop-in replacement for X" is what
+    the loader will use to satisfy a requirement for X, so ignoring it would produce a
+    warning about a server that is working.
+
+    Two known ways to be wrong, both deliberate and both worth less than the finding is worth:
+
+    * a dependency **bundled inside another jar** (Fabric "jar-in-jar") is satisfied at
+      runtime but invisible here, since nested jars are counted rather than opened;
+    * a dependency sitting in ``mods/`` under a name that only *that* jar's metadata would
+      reveal, inside a ``.disabled``/``.old`` file, is likewise invisible.
+
+    Both make this list an over-report rather than an under-report, which is the direction
+    worth erring in for a warning — and the caller words it as such.
+    """
+    available: set = set()
+    for mod in scan.mods:
+        if not mod.metadata:
+            continue
+        if mod.metadata.mod_id:
+            available.add(mod.metadata.mod_id.lower())
+        for provided in mod.metadata.provides:
+            available.add(str(provided).lower())
+
+    missing: Dict[str, List[str]] = {}
+    for mod in scan.mods:
+        if not mod.metadata:
+            continue
+        own = mod.metadata.mod_id.lower()
+        for required in mod.metadata.requires:
+            if required in available or required == own:
+                continue
+            missing.setdefault(required, []).append(mod.file_name)
+
+    return {key: sorted(set(files)) for key, files in sorted(missing.items())}
