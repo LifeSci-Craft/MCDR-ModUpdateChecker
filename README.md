@@ -110,7 +110,7 @@ Fabric 服务端**没有任何原生手段**能发现 Mod 过期。加载器只�
 | `!!modupdate download <编号 / Mod 名>` | 从 Modrinth 下载这一个 Mod 的新版本（见下） |
 | `!!modupdate install <编号 / Mod 名>` | 安排下次关服时把它装进 `mods/`（见下） |
 | `!!modupdate confirm` | 确认上一条 `download` / `install` |
-| `!!modupdate status` | 显示识别到的服务端版本、加载器、上游开关、本地映射表、上次检查时间、已排除的 Mod |
+| `!!modupdate status` | 显示识别到的服务端版本、加载器、配置文件路径、上游开关、本地映射表、上次检查时间、已排除的 Mod |
 | `!!modupdate reload` | 重载配置文件 |
 | `!!modupdate help` | 帮助页（每行可点击） |
 
@@ -268,6 +268,16 @@ Sodium
 
 下面每张表的选项名都带上章节，也就是你在文件里写的完整路径（`check.ignored_mods` 表示
 `check` 章节下的忽略名单）。
+
+**升级后被新增的选项会自动出现，而且会告诉你。** MCDR 在加载插件时会把文件里缺少的选项按默认值
+补上并重写文件；插件会把补了什么打进控制台——文件里突然多出几行是正常的，而且你能看到是哪几行：
+
+```
+[Mod Update Checker] 配置文件缺少 2 个选项，已按默认值补上：download.install_on_stop, sources.manual_map（config\mod_update_checker\config.json）
+```
+
+**看不到这行、文件也没变**，只有两种可能：插件没有被真正加载（替换 `.mcdr` 后要重启服务端或执行
+`!!MCDR reload plugin`），或者你看的不是这一份文件——`!!modupdate status` 会显示插件正在用的完整路径。
 
 ### 顶层
 
@@ -621,6 +631,13 @@ A：加进 `check.ignored_mods`（见[排除某些 Mod 不检查](#排除某些-
 **Q：装完却什么都没发生？**
 A：默认要等服务端启动完成 + 60 秒（`check.start_delay_seconds`）。想立刻看到结果就
 `!!modupdate check`。如果 Mods 目录识别错了，`!!modupdate status` 会显示它实际用的路径。
+
+**Q：我升级了插件，但配置文件里没有新选项？**
+A：先看控制台有没有这一行：`配置文件缺少 N 个选项，已按默认值补上：…`——有的话文件已经补好了，
+这行还会告诉你补了哪几个、文件在哪。**没有这行、文件也没变化**，说明插件没有真正重新加载：
+替换 `.mcdr` 文件后必须重启服务端（或 `!!MCDR reload plugin`）才会生效，MCDR 启动时打印的
+`插件 mod_update_checker@版本 已加载` 那行就是版本证据。还不行，就核对 `!!modupdate status`
+显示的配置文件路径与你正在编辑的文件是不是同一个。
 
 **Q：`no_compatible_build` 和「无法识别」有什么区别？**
 A：前者是**项目找到了、但没有适配你当前配置的构建**（大版本升级后最常见）；后者是**根本不知道这个

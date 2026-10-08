@@ -447,37 +447,138 @@ _LEGACY_FLAT_OPTIONS: Dict[str, str] = {
 
 def _warn_about_flat_legacy_options(
     server: PluginServerInterface, raw: Dict[str, Any]
-) -> None:
+) -> bool:
     """Say so if the file still uses the old flat option names.
 
     Only a warning: the file is left alone and MCDR regenerates it in the new shape, so the
     plugin still starts. The point is that the admin is told which options moved where, instead
     of finding that their settings appear to have been forgotten.
+
+    Returns whether it warned, so the caller can stay quiet about the same rebuild — this
+    message already names every option that moved, and repeating it as a list of added keys
+    would be the same news twice.
     """
     found = [name for name in _LEGACY_FLAT_OPTIONS if name in raw]
     if not found:
-        return
+        return False
     moves = ", ".join(
         "{} -> {}".format(name, _LEGACY_FLAT_OPTIONS[name]) for name in sorted(found)
     )
     server.logger.warning(tr("console.config_flat_legacy", count=len(found), moves=moves))
+    return True
+
+
+def _leaf_paths(node: Any, prefix: str = "") -> List[str]:
+    """Every scalar in a config dict, as a ``section.option`` dotted path.
+
+    Walked rather than described, because "is this file complete" has to be answerable two
+    levels down: ``download.install_on_stop`` sits inside a section, and a check that only
+    looked at the root would call such a file complete.
+    """
+    paths: List[str] = []
+    if not isinstance(node, dict):
+        return paths
+    for key, value in node.items():
+        path = "{}.{}".format(prefix, key) if prefix else str(key)
+        if isinstance(value, dict):
+            paths.extend(_leaf_paths(value, path))
+        else:
+            paths.append(path)
+    return paths
+
+
+def _file_leaf_paths(path: str) -> Optional[List[str]]:
+    """The same, read from a file: ``None`` when nothing readable is there."""
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    return _leaf_paths(data) if isinstance(data, dict) else None
+
+
+def _report_config_file_state(
+    server: PluginServerInterface,
+    config: Config,
+    path: str,
+    existed_before: bool,
+    leaves_before: Optional[List[str]],
+    legacy_rebuilt: bool,
+) -> None:
+    """One line about the file itself — created, completed, or refusing to change.
+
+    MCDR heals this file silently: options the file does not have are filled in from the class
+    defaults and the whole file is written back, with nothing said about it. Silent is the
+    wrong default, and this is the case that proves it — a user's file predated
+    ``download.install_on_stop``, so the option was not in it. It was *supposed* to appear on
+    the next load, and nothing anywhere said whether it had; the user reinstalled the plugin,
+    looked again, and still could not find it. Whether a file was brought up to date is not a
+    question an admin should have to answer by reading source.
+
+    Three outcomes are worth a line, and the rest of the time there is nothing to say:
+
+    * there was no file and one has just been created — say where it is;
+    * the file was missing options and now has them — name them;
+    * the file is still missing options after the load — a warning, because that is not
+      supposed to happen, and the path plus the names are the two facts needed to find out why.
+    """
+    after = _file_leaf_paths(path)
+    if not existed_before:
+        if after is not None:
+            server.logger.info(tr("console.config_created", path=path, count=len(after)))
+        return
+    if legacy_rebuilt:
+        return  # the flat-legacy warning already described this rebuild, option by option
+    if leaves_before is None or after is None:
+        return
+    added = sorted(set(after) - set(leaves_before))
+    if added:
+        server.logger.info(
+            tr(
+                "console.config_completed",
+                count=len(added),
+                names=", ".join(added[:8]),
+                path=path,
+            )
+        )
+        return
+    missing = sorted(set(_leaf_paths(config.serialize())) - set(after))
+    if missing:
+        server.logger.warning(
+            tr(
+                "console.config_incomplete",
+                count=len(missing),
+                names=", ".join(missing[:8]),
+                path=path,
+            )
+        )
 
 
 def _load_config(server: PluginServerInterface) -> Config:
-    """Load the config, keeping a backup if the file had to be rebuilt.
+    """Load the config, keeping a backup if the file had to be rebuilt — and say what the
+    file itself did.
 
     MCDR's default ``failure_policy='regen'`` silently replaces an unparseable config with
     defaults. Silent is the problem: an admin who fat-fingered a comma would see their
     settings vanish with no explanation, so the old file is preserved and the reason logged.
+
+    The same silence covers the other two things MCDR does to this file — creating it when it
+    is missing, and filling in options it does not have and writing the result back. Both are
+    reported here (see :func:`_report_config_file_state`); the language is applied first so
+    that report is written in the language the file just asked for.
     """
     path = _config_path(server)
-    if os.path.isfile(path):
+    existed = os.path.isfile(path)
+    leaves_before: Optional[List[str]] = None
+    legacy_rebuilt = False
+    if existed:
         try:
             with open(path, "r", encoding="utf-8") as handle:
                 raw = json.load(handle)
             if not isinstance(raw, dict):
                 raise ValueError("config root must be a JSON object")
-            _warn_about_flat_legacy_options(server, raw)
+            leaves_before = _leaf_paths(raw)
+            legacy_rebuilt = _warn_about_flat_legacy_options(server, raw)
         except (OSError, ValueError) as error:
             backup = "{}.broken.{}".format(path, time.strftime("%Y%m%d-%H%M%S"))
             try:
@@ -491,7 +592,15 @@ def _load_config(server: PluginServerInterface) -> Config:
     config = server.load_config_simple(
         CONFIG_FILE_NAME, target_class=Config, echo_in_console=False
     )
-    return config if isinstance(config, Config) else Config.get_default()
+    if not isinstance(config, Config):
+        config = Config.get_default()
+
+    # Applying the language lives here rather than at the two call sites because the report
+    # below is the first thing on the console that has to be readable, and the language
+    # setting is part of what was just read.
+    _apply_language(server, config)
+    _report_config_file_state(server, config, path, existed, leaves_before, legacy_rebuilt)
+    return config
 
 
 def _apply_language(server: PluginServerInterface, config: Config) -> None:
@@ -2060,6 +2169,16 @@ def _show_status(source: CommandSource) -> None:
             tr("command.status.mods_dir", directory=scan.directory, count=len(scan.mods)),
             RColor.white,
         ),
+        # The file the rest of this page was read from. Nothing else in the plugin ever shows
+        # it, and "which file is this server actually using" is otherwise unanswerable from
+        # the player's side of the server — the question that made a config file somebody had
+        # edited and an install the plugin had done look like two different things.
+        "\n",
+        _field(
+            tr("command.status.config_label"),
+            tr("command.status.config", path=_config_path(server)),
+            RColor.white,
+        ),
         "\n",
         _field(tr("command.status.upstream_label"),
                tr("command.status.upstream", modrinth=modrinth_state),
@@ -2122,7 +2241,6 @@ def _reload_config(source: CommandSource) -> None:
         return
     global _config
     _config = _load_config(server)
-    _apply_language(server, _config)
     # A plan is shown with the settings that were in force when it was staged — the size limit,
     # the retry count, the folder. Re-reading the config can change all three, so the plan is
     # dropped rather than carried out against numbers the admin never saw.
@@ -2354,7 +2472,6 @@ def on_load(server: PluginServerInterface, prev_module: Any) -> None:
 
     _stop_event.clear()
     _config = _load_config(server)
-    _apply_language(server, _config)
 
     _register_commands(server)
 

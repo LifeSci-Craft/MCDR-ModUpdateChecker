@@ -74,7 +74,38 @@ class _FakeServer:
         return str(self._folder)
 
     def load_config_simple(self, file_name=None, *, target_class=None, **_kwargs):
-        return target_class.get_default()
+        """Behave like MCDR for a ``Serializable`` target — file and all.
+
+        What the plugin says *about* its config file is a reaction to what MCDR does to the
+        file on disk: it creates it when it is missing, and it fills in options the file does
+        not have and writes the whole thing back. A stub that just returned
+        ``target_class.get_default()`` would leave the file untouched, so every such message
+        would be describing a state a real server cannot produce. This mirrors MCDR's
+        ``load_config_simple``: load, deserialize with the missing-field callback, and save
+        exactly when the file was unreadable or something was missing.
+        """
+        from mcdreforged.plugin.si._simple_config_handler import SimpleConfigHandler
+
+        handler = SimpleConfigHandler(file_name, None, self.get_data_folder())
+        incomplete = False
+
+        def note_missing(*_args):
+            nonlocal incomplete
+            incomplete = True
+
+        try:
+            raw = handler.load(encoding="utf8")
+        except OSError:
+            config = target_class.get_default()
+            handler.save(config.serialize(), encoding="utf8")
+            return config
+
+        config = target_class.deserialize(
+            raw, missing_callback=note_missing, redundancy_callback=note_missing
+        )
+        if incomplete:
+            handler.save(config.serialize(), encoding="utf8")
+        return config
 
     def get_mcdr_config(self):
         return dict(self._mcdr_config)
@@ -345,8 +376,13 @@ def test_a_config_file_still_using_the_flat_option_names_is_reported(tmp_path):
     assert "config_invalid" not in joined and ".broken." not in joined, joined
 
 
-def test_a_config_file_in_the_new_shape_is_not_reported(tmp_path):
-    """The warning must not fire on the file the plugin itself writes."""
+def test_a_config_file_in_the_new_shape_never_gets_the_legacy_warning(tmp_path):
+    """The flat-name warning must not fire on a file that is already grouped.
+
+    An incomplete file in the new shape is a different matter — it is filled in and reported
+    as such, which the tests below cover. What must not happen here is the *legacy* warning,
+    which would send the admin looking for options that never moved.
+    """
     import mod_update_checker as plugin
 
     server = _FakeServer(tmp_path)
@@ -356,6 +392,96 @@ def test_a_config_file_in_the_new_shape_is_not_reported(tmp_path):
 
     joined = "\n".join(server.logger.messages)
     assert "WARN" not in joined, joined
+
+
+def test_a_config_file_that_does_not_exist_yet_is_reported_where_it_was_created(tmp_path):
+    """A first install — or one where the file was deleted — says where the file went.
+
+    "Where is the config file" is otherwise a question about conventions: this plugin's, or
+    MCDR's, or a wiki's. One line, once, answers it.
+    """
+    import mod_update_checker as plugin
+
+    server = _FakeServer(tmp_path)
+    config = plugin._load_config(server)
+
+    written = Path(server.get_data_folder()) / plugin.CONFIG_FILE_NAME
+    assert written.is_file(), "loading must have created the file"
+    assert isinstance(config, plugin.Config)
+
+    joined = "\n".join(server.logger.messages)
+    assert "已按默认值创建" in joined, joined
+    assert str(written) in joined, joined
+
+
+def test_an_incomplete_config_file_is_healed_and_the_added_options_are_named(tmp_path):
+    """The report a user needed and did not get.
+
+    The missing option was never the whole story: what could not be answered from the outside
+    was whether the plugin had *noticed*, and whether the file had been brought up to date.
+    Both halves are asserted — the file gains the options, and the console names them with the
+    path — because either one alone can regress without the other.
+    """
+    import mod_update_checker as plugin
+
+    server = _FakeServer(tmp_path)
+    stale = plugin.Config.get_default().serialize()
+    del stale["download"]["install_on_stop"]
+    del stale["sources"]["manual_map"]
+    path = _write_config(server, stale)
+
+    plugin._load_config(server)
+
+    rewritten = path.read_text(encoding="utf-8")
+    assert "install_on_stop" in rewritten and "manual_map" in rewritten
+
+    joined = "\n".join(server.logger.messages)
+    assert "已按默认值补上" in joined, joined
+    assert "download.install_on_stop" in joined, joined
+    assert "sources.manual_map" in joined, joined
+    assert str(path) in joined, joined
+
+
+def test_a_config_file_that_was_not_updated_is_warned_about_with_its_path(tmp_path):
+    """The message for the state nobody has reproduced yet: the file just will not change.
+
+    It is reached when a load leaves the file missing options it should have gained — whatever
+    the cause, from another program holding the file to the plugin that was updated not being
+    the plugin that is running. When it appears, the path and the option names are the two
+    facts needed to find out which.
+    """
+    import mod_update_checker as plugin
+
+    server = _FakeServer(tmp_path)
+    stale = plugin.Config.get_default().serialize()
+    del stale["download"]["install_on_stop"]
+    path = _write_config(server, stale)
+
+    plugin._report_config_file_state(
+        server,
+        plugin.Config.get_default(),
+        str(path),
+        existed_before=True,
+        leaves_before=plugin._leaf_paths(stale),
+        legacy_rebuilt=False,
+    )
+
+    joined = "\n".join(server.logger.messages)
+    assert "WARN" in joined, joined
+    assert "download.install_on_stop" in joined, joined
+    assert str(path) in joined, joined
+
+
+def test_a_complete_config_file_is_not_talked_about(tmp_path):
+    """The report is for the three states worth knowing about — not for every single load."""
+    import mod_update_checker as plugin
+
+    server = _FakeServer(tmp_path)
+    _write_config(server, plugin.Config.get_default().serialize())
+
+    plugin._load_config(server)
+
+    assert server.logger.messages == [], server.logger.messages
 
 
 def test_two_default_configs_do_not_share_their_nested_state():
@@ -1231,7 +1357,7 @@ def _segments(node):
         yield from _segments(child)
 
 
-def test_the_status_screen_uses_the_same_title_bar_as_the_help():
+def test_the_status_screen_uses_the_same_title_bar_as_the_help(tmp_path):
     """The two screens are meant to look like one plugin's.
 
     Checked by shape rather than by exact text: the title bar is gold ``=`` bars around the
@@ -1255,7 +1381,7 @@ def test_the_status_screen_uses_the_same_title_bar_as_the_help():
                 "mod_update_checker.serverinfo", fromlist=["ServerContext"]
             ).ServerContext(mc_version="26.3", mc_version_source="config", loader="fabric"),
         )
-        plugin._server = object()
+        plugin._server = _FakeServer(tmp_path)
 
         source = _ReplyRecorder()
         plugin._show_status(source)
@@ -2003,6 +2129,20 @@ def test_the_status_page_says_when_the_map_name_is_not_a_file_name(tmp_path, mon
     rendered = _status_with_map(tmp_path, monkeypatch, setting="sub/dir.json")
 
     assert "已忽略" in rendered and "sub/dir.json" in rendered
+
+
+def test_the_status_page_says_which_config_file_it_read(tmp_path, monkeypatch):
+    """The page is where "which file is this server actually using" gets answered.
+
+    The question reads as trivial until a file has been edited, upgraded and reinstalled
+    without ever changing — at which point the first useful fact is the path the plugin
+    itself resolved, on the server that is running.
+    """
+    rendered = _status_with_map(tmp_path, monkeypatch, setting="")
+
+    expected = str(Path(tmp_path) / "config" / "mod_update_checker" / "config.json")
+    assert "配置文件" in rendered, rendered
+    assert expected in rendered, rendered
 
 
 def test_the_status_screen_does_not_hash_the_mods_folder(tmp_path, monkeypatch):
