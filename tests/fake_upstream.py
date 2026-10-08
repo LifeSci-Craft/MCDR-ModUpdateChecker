@@ -484,7 +484,16 @@ class FakeUpstream:
             ids = json.loads(raw)
         except ValueError:
             return []
-        return [self.projects[item].to_dict() for item in ids if item in self.projects]
+        # ``ids`` accepts project ids *and* slugs, like the real endpoint — and the difference
+        # matters here: a mod id that is really a slug (``cloth-config``) is how dependencies
+        # are looked up, and matching ids only would make the fake unable to resolve the one
+        # case that lookup exists for.
+        found = []
+        for item in ids:
+            project = self._find_project(item)
+            if project is not None:
+                found.append(project.to_dict())
+        return found
 
     def _project_versions(
         self, project: FakeProject, query: Dict[str, List[str]]

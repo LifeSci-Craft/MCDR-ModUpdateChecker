@@ -1354,11 +1354,13 @@ def test_only_the_row_that_needs_an_argument_suggests_instead_of_running():
         assert rows[command]["clickEvent"]["value"].endswith(" "), command
 
     # Every command the tree registers is on the page, so a new one cannot be added and left
-    # undiscoverable — the failure this list would otherwise not notice at all. (The bare
-    # ``!!muc`` row is the summary, and is excluded by the ``"!!muc "`` filter above.)
+    # undiscoverable — the failure this list would otherwise not notice at all. The bare
+    # ``!!muc`` row is excluded by the ``"!!muc "`` filter above, which is also what keeps this
+    # list about *subcommands*: the bare form is this very page, so a row for it would be a row
+    # for the screen the reader is already looking at.
     assert set(rows) == {
-        "!!muc check", "!!muc list", "!!muc info", "!!muc download", "!!muc install",
-        "!!muc confirm", "!!muc status", "!!muc reload", "!!muc help",
+        "!!muc check", "!!muc list", "!!muc summary", "!!muc info", "!!muc download",
+        "!!muc install", "!!muc confirm", "!!muc status", "!!muc reload", "!!muc help",
     }
 
 
@@ -1518,6 +1520,283 @@ def test_the_chat_summary_offers_a_button_where_the_log_offers_a_url(tmp_path, m
 
 
 # --------------------------------------------------------------------------------------
+# 翻页、候选补全、裸命令、通知配色（v1.5.0）
+#
+# 四件事都是「让界面更会用」：列表翻页而不是截断、歧义时给可点的候选、不带参数的命令显示
+# 帮助、通知按语义上色。这里的断言都盯着发给客户端的东西（segment、clickEvent、color），
+# 因为它们正是 ``str()`` 会丢掉的那部分。
+# --------------------------------------------------------------------------------------
+
+
+def _listing_entries(count, status="up_to_date"):
+    return [
+        _bulk_entry("mod{:02d}".format(index), "Mod {:02d}".format(index),
+                    "mod{:02d}.jar".format(index), status=status)
+        for index in range(count)
+    ]
+
+
+def _pager_clicks(source):
+    """玩家看到的翻页按钮（run_command 的点击目标），按出现顺序。"""
+    return [
+        item["clickEvent"]
+        for item in _segments(source.raw[-1])
+        if "clickEvent" in item
+    ]
+
+
+def test_the_listing_pages_with_clickable_buttons(tmp_path, monkeypatch):
+    """一页装不下的列表翻页看，而不是被截断。
+
+    14 个 Mod、每页 11 行，所以有两页：第一页只有 [下一页]，第二页只有 [上一页]，而回到
+    第一页的命令**不带页码**——``!!muc list`` 就是第一页，命令短一点更值得。
+    """
+    plugin, _server = _one_screen_setup(tmp_path, monkeypatch, _listing_entries(14))
+    source = _PlayerSource("Admin")
+
+    plugin._show_list(source, "", "!!muc")
+
+    assert "Mod 00" in source.body and "Mod 13" not in source.body
+    segments = list(_segments(source.raw[-1]))
+    assert "第 1/2 页" in "".join(item.get("text", "") for item in segments)
+    clicks = _pager_clicks(source)
+    assert [click["value"] for click in clicks] == ["!!muc list 2"]
+    assert clicks[0]["action"] == "run_command"
+    assert "上一页" not in "".join(item.get("text", "") for item in segments)
+
+    second = _PlayerSource("Admin")
+    plugin._show_list(second, "2", "!!muc")
+
+    assert "Mod 13" in second.body and "Mod 00" not in second.body
+    assert [click["value"] for click in _pager_clicks(second)] == ["!!muc list"]
+
+
+def test_turning_the_page_does_not_widen_a_filtered_listing(tmp_path, monkeypatch):
+    """筛选后翻页仍在筛选里翻——翻页不能把「待安装的」悄悄变成「全部」。
+
+    这是把 filter_text 一路带到按钮里的原因：命令是拼出来的，拼接的地方错了，第二页就会
+    变成另一份列表。
+    """
+    plugin, _server = _one_screen_setup(
+        tmp_path, monkeypatch, _listing_entries(13, status="awaiting_install"))
+    source = _PlayerSource("Admin")
+
+    plugin._show_list(source, "awaiting_install", "!!muc")
+
+    assert [click["value"] for click in _pager_clicks(source)] == [
+        "!!muc list awaiting_install 2"
+    ]
+
+
+def test_a_page_number_does_not_hide_a_misspelled_status(tmp_path, monkeypatch):
+    """页码先被摘掉，剩下的词才是状态——报错时显示的是那个词，不是整串。"""
+    plugin, _server = _one_screen_setup(tmp_path, monkeypatch, _listing_entries(14))
+    source = _ReplyRecorder()
+
+    plugin._show_list(source, "updateable 2", "!!muc")
+
+    message = str(source.replies[0])
+    assert "未知的状态" in message and "updateable" in message
+    assert "updateable 2" not in message, "页码不该出现在报错里"
+
+
+def test_the_console_gets_the_pager_as_a_command_not_a_button(tmp_path, monkeypatch):
+    """控制台点不了，所以给它能敲的命令——带按钮的那一行在终端里只是装饰。"""
+    plugin, _server = _one_screen_setup(tmp_path, monkeypatch, _listing_entries(14))
+    source = _ReplyRecorder()
+
+    plugin._show_list(source, "", "!!muc")
+
+    pager = str(source.replies[-1])
+    assert "第 1/2 页" in pager
+    assert "下一页：!!muc list 2" in pager
+    assert "上一页" not in pager
+
+
+def _run_bare(tree, source, command):
+    """Run a command through MCDR's own parser, without a server.
+
+    ``_entry_execute`` is marked private, but it is what MCDR's CommandManager calls, and
+    ``DirectCallbackInvoker`` is MCDR's own helper for invoking the scheduled callbacks — so
+    this asserts "what happens when that command is typed" rather than "the handler can
+    print", which is the difference between testing the wiring and testing the string.
+    """
+    from mcdreforged.command.builder.callback import DirectCallbackInvoker
+
+    executions = tree._entry_execute(source, command)
+    assert executions, "{} matched nothing".format(command)
+    for execution in executions:
+        execution.scheduled_callback.invoke(DirectCallbackInvoker())
+
+
+def test_the_bare_command_shows_the_help_page(tmp_path, monkeypatch):
+    """裸命令 = 帮助页，这是本项目的约定（v1.5.0 起）。"""
+    plugin, _server = _one_screen_setup(tmp_path, monkeypatch, [])
+    source = _PlayerSource("Admin")
+
+    _run_bare(plugin._command_tree("!!muc"), source, "!!muc")
+
+    assert "用法：!!muc <子命令>" in source.body
+    assert "不带子命令就是本页" in source.body
+    assert "!!muc check" in source.body and "!!muc summary" in source.body
+
+
+def test_the_summary_is_still_reachable_by_its_own_word(tmp_path, monkeypatch):
+    """汇总从裸命令搬到了 ``!!muc summary``——少一个词，不少一条路。"""
+    plugin, _server = _one_screen_setup(tmp_path, monkeypatch, [_entry_for_screens()])
+    source = _PlayerSource("Admin")
+
+    _run_bare(plugin._command_tree("!!muc"), source, "!!muc summary")
+
+    assert "Alpha" in source.body, source.body
+
+
+def _ambiguous_entry(name):
+    from mod_update_checker.report import UpdateEntry
+
+    item = UpdateEntry(
+        mod_id=name.lower().replace(" ", "_"), name=name,
+        file_name=name.lower().replace(" ", "-") + ".jar",
+        status="update_available",
+    )
+    item.download_url = "https://cdn.example/x.jar"
+    item.download_sha1 = "a" * 40
+    return item
+
+
+def test_an_ambiguous_handle_offers_clickable_completions(tmp_path, monkeypatch):
+    """歧义时列出候选，每个候选都能点——点一下把**完整命令填进输入框**。
+
+    这是游戏内的候选列表：用 suggest_command 而不是 run_command，因为读者正在打字，填进去
+    后还可以改；而且这样他们看得到完整的拼写，下次不用再点。
+    """
+    plugin, _server = _one_screen_setup(
+        tmp_path, monkeypatch, [_ambiguous_entry("Sodium"), _ambiguous_entry("Sodium Extra")]
+    )
+    source = _PlayerSource("Admin")
+
+    plugin._manual_download(source, "sod", "!!muc")
+
+    assert plugin._pending_action is None, "歧义的时候不该暂存任何操作"
+    assert "同时匹配 2 个 Mod" in source.body
+    clicks = [item["clickEvent"] for item in _segments(source.raw[-1]) if "clickEvent" in item]
+    assert [click["value"] for click in clicks] == [
+        "!!muc download Sodium", "!!muc download Sodium Extra",
+    ]
+    assert {click["action"] for click in clicks} == {"suggest_command"}
+
+
+def test_the_console_gets_the_candidates_without_a_button_row(tmp_path, monkeypatch):
+    """控制台里候选已经在句子里了，不再多打一行点不了的东西。"""
+    plugin, _server = _one_screen_setup(
+        tmp_path, monkeypatch, [_ambiguous_entry("Sodium"), _ambiguous_entry("Sodium Extra")]
+    )
+    source = _ReplyRecorder()
+
+    plugin._manual_download(source, "sod", "!!muc")
+
+    assert len(source.replies) == 1, [str(item) for item in source.replies]
+    assert "Sodium Extra" in str(source.replies[0])
+
+
+def test_the_mcdr_console_can_tab_complete_mod_names(tmp_path, monkeypatch):
+    """控制台里的 Tab 补全，走 MCDR 自己的建议管线。
+
+    游戏内做不到（``!!`` 是聊天消息，原版只补全 ``/`` 命令），控制台可以——``suggests()``
+    是 MCDR 的建议接口，这两条断言的就是「敲 ``!!muc download `` 再按 Tab 会看到什么」。
+    """
+    plugin, _server = _one_screen_setup(
+        tmp_path, monkeypatch,
+        [
+            _bulk_entry("sodium", "Sodium", "sodium.jar"),
+            _bulk_entry("flaky", "Flaky Mod", "flaky.jar", status="awaiting_install"),
+        ],
+    )
+    tree = plugin._command_tree("!!muc")
+    source = _PlayerSource("Admin")
+
+    def complete(command):
+        return [item.command for item in tree._entry_generate_suggestions(source, command)]
+
+    assert complete("!!muc download ") == ["!!muc download all", "!!muc download Sodium"]
+    assert complete("!!muc install ") == ["!!muc install all", "!!muc install Flaky Mod"]
+    assert "!!muc list up_to_date" in complete("!!muc list ")
+    assert "!!muc info Flaky Mod" in complete("!!muc info ")
+
+    # 没有报告时不给候选——比给一份过期名单好。
+    plugin._last_report = None
+    assert complete("!!muc download ") == []
+
+
+class _TextRecorder:
+    """A server that keeps the raw text object of every delivery, for colour assertions."""
+
+    def __init__(self):
+        self.deliveries = []
+
+    def is_server_running(self):
+        return True
+
+    def tell(self, player, text, **_kwargs):
+        self.deliveries.append((player, text))
+
+
+def test_an_install_notice_is_coloured_by_role_not_painted_one_colour(tmp_path, monkeypatch):
+    """「已替换 N 个 Mod」不再整段同色：头部白、替换行灰、装不上的行黄。
+
+    颜色由行的**角色**决定，而角色在构造句子的地方就定了——不是投递层读文本猜出来的
+    （v1.3.0 的教训）。所以这里断言的是 segment 的 color 字段。
+    """
+    plugin, _server = _one_screen_setup(tmp_path, monkeypatch, [])
+    server = _TextRecorder()
+    data = {
+        "at": "2026-10-08T18:55:17+08:00",
+        "installed": [
+            {"name": "Fabric API", "version": "0.162.0", "backup_file": "fabric.old"},
+            {"name": "Just Enough Items", "version": "31.9.0", "backup_file": "jei.old"},
+        ],
+        "skipped": [{"name": "Broken Mod", "detail": "hash-mismatch"}],
+    }
+
+    plugin._tell_player(server, "Admin", plugin._install_summary_lines(data))
+
+    _player, text = server.deliveries[0]
+    coloured = {
+        item.get("text", "").strip(): item.get("color")
+        for item in _segments(text)
+        if item.get("text", "").strip()
+    }
+    header = [color for body, color in coloured.items() if "已替换" in body]
+    rows = [color for body, color in coloured.items() if "Fabric API" in body]
+    skipped = [color for body, color in coloured.items() if "没有被安装" in body]
+
+    assert header == ["white"], coloured
+    assert rows == ["gray"], coloured
+    assert skipped == ["yellow"], coloured
+    assert len(set(coloured.values())) > 1, "还是一整片同色"
+
+
+def test_the_update_notice_gives_each_kind_of_line_its_role(tmp_path, monkeypatch):
+    """更新通知的每一行也带角色：小节标题、要处理的行、脚注。
+
+    角色断言在这里、颜色断言在上面那条：映射只有一份（``_NOTICE_COLOURS``），所以分开钉
+    才不会让两套东西各自演化。
+    """
+    from mod_update_checker.report import UpdateEntry
+
+    waiting = UpdateEntry(mod_id="a", name="Alpha", file_name="a.jar",
+                          local_version="1.0.0", latest_version="1.1.0",
+                          status="update_available")
+    plugin, _server = _one_screen_setup(tmp_path, monkeypatch, [waiting])
+
+    lines = plugin._notification_lines(plugin._last_report)
+
+    assert lines[0].role == "heading"
+    assert any(notice.role == "action" for notice in lines)
+    assert lines[-1].role == "hint"
+
+
+# --------------------------------------------------------------------------------------
 # !!muc download / install / confirm
 #
 # The three commands exist so a single mod can be fetched and installed without switching the
@@ -1529,15 +1808,25 @@ def test_the_chat_summary_offers_a_button_where_the_log_offers_a_url(tmp_path, m
 
 
 class _PlayerSource:
-    """A named player command source that records the replies."""
+    """A named player command source that records the replies.
+
+    Keeps the raw objects alongside their string form: colour and click events live in the
+    segments, and ``str()`` is exactly what drops them. ``has_permission`` answers like an
+    admin's, so a command tree can be executed against this source without MCDR itself.
+    """
 
     def __init__(self, player="Admin"):
         self.player = player
         self.is_player = True
         self.replies = []
+        self.raw = []
 
     def reply(self, text, **_kwargs):
+        self.raw.append(text)
         self.replies.append(str(text))
+
+    def has_permission(self, _level):
+        return True
 
     @property
     def body(self):

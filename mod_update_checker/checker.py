@@ -977,11 +977,26 @@ class Checker:
                  {"count": len(names), "files": ", ".join(names[:8])})
             )
         missing = missing_dependencies(scan)
-        if missing:
-            report.advisories.append(
-                ("advisory.missing_dependencies",
-                 {"count": len(missing), "files": ", ".join(list(missing)[:8])})
-            )
+        still_missing, client_only = self._split_client_only_dependencies(missing)
+        if still_missing:
+            args: Dict[str, Any] = {
+                "count": len(still_missing),
+                "files": ", ".join(list(still_missing)[:8]),
+            }
+            if client_only:
+                # Said out loud rather than silently dropped: the reader who saw this line
+                # before would otherwise wonder why a dependency disappeared from it.
+                report.advisories.append(
+                    ("advisory.missing_dependencies_excluded",
+                     dict(args, excluded=len(client_only)))
+                )
+            else:
+                report.advisories.append(("advisory.missing_dependencies", args))
+        for dep, files in client_only.items():
+            for file_name in files:
+                entry = entries.get(file_name)
+                if entry is not None:
+                    entry.add_note("note.client_only_dependency", dep=dep)
         if report.duplicate_ids:
             report.advisories.append(
                 ("advisory.duplicates", {"count": len(report.duplicate_ids)})
@@ -992,6 +1007,54 @@ class Checker:
             report.advisories.append(
                 ("advisory.guessed_mc_version", {"version": server.mc_version})
             )
+
+    def _split_client_only_dependencies(
+        self, missing: Dict[str, List[str]]
+    ) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
+        """Split the missing dependencies by whether a server could run them at all.
+
+        A mod's ``depends`` list is written for the mod, not for the side it is loaded on: a
+        jar that runs on both sides can legitimately require a library that only ever exists on
+        the client. Listing those as missing sends the admin looking for a jar that would do
+        nothing if they found it, and Modrinth's own ``server_side: unsupported`` is exactly
+        the statement that the project cannot run on a server.
+
+        Returns ``(still_missing, client_only)``. The second is reported as a note on the mod
+        that declared it rather than as an advisory line: there is nothing to do about it, so
+        it explains an absence instead of asking for an action.
+
+        Only the direct lookup is tried, and everything unresolved stays missing. A dependency
+        whose id does not resolve to a project is one nothing here can say a side about, and
+        this advisory has always erred towards over-reporting rather than going quiet.
+        """
+        if not missing or not self.options.use_modrinth:
+            return missing, {}
+        assert self._modrinth is not None
+        try:
+            projects = self._modrinth.projects(list(missing))
+        except UpstreamError as error:
+            self.logger.debug("could not classify missing dependencies: %s", error)
+            return missing, {}
+
+        by_name: Dict[str, ModrinthProject] = {}
+        for project in projects.values():
+            for name in (project.slug, project.id):
+                if name:
+                    by_name.setdefault(name.lower(), project)
+                    by_name.setdefault(report_normalise_name(name), project)
+
+        still_missing: Dict[str, List[str]] = {}
+        client_only: Dict[str, List[str]] = {}
+        for dep, files in missing.items():
+            project = by_name.get(dep)
+            if project is None:
+                normalised = report_normalise_name(dep)
+                project = by_name.get(normalised) if normalised else None
+            if project is not None and project.server_side == "unsupported":
+                client_only[dep] = files
+            else:
+                still_missing[dep] = files
+        return still_missing, client_only
 
     @staticmethod
     def _unidentified_reason(entry: UpdateEntry) -> str:

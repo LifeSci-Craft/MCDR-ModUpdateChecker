@@ -63,10 +63,11 @@ __all__ = [
     "render_entry_lines",
     "render_index_row",
     "render_index",
+    "render_pager",
     "render_tally",
     "action_row",
     "entry_detail_rows",
-    "index_selection",
+    "index_page",
     "CHAT_PAGE_LINES",
     "entry_from_scan",
     "mc_mismatch_note",
@@ -514,6 +515,12 @@ class Report:
         Two mods that normalise to the same string is not a lookup to guess at: guessing wrong
         means downloading and installing the wrong jar, so the ambiguity is reported instead.
 
+        A handle that is **the beginning of** exactly one mod's name is accepted too, which is
+        the closest thing to tab completion this game allows for chat commands (see
+        ``ambiguity_candidates``). The prefix is only tried after the exact forms, so ``lith``
+        can never shadow a mod actually named ``lith``; and it still has to be unique, for the
+        same reason the lenient form does.
+
         ``reason`` is ``""`` on success, and otherwise one of ``"empty"``, ``"out-of-range"``,
         ``"ambiguous"`` or ``"unknown"`` — kept apart so the caller can say which, since "that
         number does not exist" and "two mods answer to that name" need different next actions.
@@ -536,13 +543,46 @@ class Report:
 
         normalised = normalise_name(text)
         if normalised:
-            matches = [entry for entry in self.entries if normalised in _normalised_names(entry)]
+            matches = self._lenient_matches(normalised)
             if len(matches) == 1:
                 return matches[0], ""
             if matches:
                 return None, "ambiguous"
 
         return None, "unknown"
+
+    def _lenient_matches(self, normalised: str) -> List[UpdateEntry]:
+        """Entries a forgiving spelling could mean: exact hits first, then prefix hits.
+
+        The two are never mixed. If any entry matches exactly — itself, its id, its file name,
+        punctuation aside — then nothing else is considered, because widening a hit that was
+        already found is how a precise handle starts losing to a coincidence. Only when there
+        is no exact match at all does "starts with" get a say, and then it has to be unique for
+        the caller to act on it.
+        """
+        exact = [
+            entry for entry in self.entries if normalised in _normalised_names(entry)
+        ]
+        if exact:
+            return exact
+        return [
+            entry
+            for entry in self.entries
+            if any(name.startswith(normalised) for name in _normalised_names(entry))
+        ]
+
+    def ambiguity_candidates(self, handle: str) -> List[UpdateEntry]:
+        """The entries a handle could have meant, for the message that lists them.
+
+        Also the in-game substitute for tab completion: the caller turns each of these into a
+        clickable name that fills the command in, which is what the completion list would have
+        offered. Computed by the same helper ``resolve_handle`` uses, so the names in the
+        message cannot drift from the names that actually matched.
+        """
+        normalised = normalise_name(handle or "")
+        if not normalised:
+            return []
+        return self._lenient_matches(normalised)
 
     def entry_by_handle(self, handle: str) -> Optional[UpdateEntry]:
         """The entry for ``handle``, or ``None``.
@@ -982,47 +1022,39 @@ def render_index_row(number: Optional[int], entry: UpdateEntry, tr: Translator,
     return "[{}] {}".format(number, description)
 
 
-def index_selection(indexed, row_budget: int):
-    """``(rows_to_show, how_many_omitted)`` for a listing with a page budget.
+def index_page(indexed, page: int, size: int):
+    """``(rows_on_this_page, page, pages)`` for a listing cut into pages of ``size``.
 
-    Entries that need doing always make the cut: they are the reason the command was typed, and
-    the sort order already puts them first. Only the informational tail is truncated, which is
-    the part nobody needs in full — "these two hundred mods are all up to date" does not require
-    two hundred lines.
+    ``page`` is clamped into the valid range rather than refused: the buttons that carry a page
+    number are stale the moment the listing shrinks, and "the number you clicked no longer
+    exists" is a worse answer than showing the last page — which the pager line then states, so
+    the reader is not misled about where they are.
 
-    If even the actionable set overflows the page it is truncated too, because a reply that
-    scrolls is the problem being solved. The count of what was left out is the honest answer
-    then, rather than a silent omission.
-
-    The omission count is derived from what was actually shown rather than from the arithmetic
-    that selected it: an earlier version computed ``len(rest) - room`` and printed
-    "another -9 not shown" whenever the tail was shorter than the room available for it.
+    The order is the listing's own, which already puts the mods that need attention first; the
+    previous truncating version had to re-sort to guarantee that, and pagination gets it for
+    free. Nothing is dropped either — every entry is on some page.
     """
-    actionable = [item for item in indexed if item[1].actionable]
-    rest = [item for item in indexed if not item[1].actionable]
-
-    shown = actionable[:row_budget]
-    if len(shown) < row_budget:
-        shown = shown + rest[: row_budget - len(shown)]
-    return shown, len(indexed) - len(shown)
+    pages = max(1, (len(indexed) + size - 1) // size)
+    page = min(max(1, page), pages)
+    return indexed[(page - 1) * size: page * size], page, pages
 
 
 #: Lines a listing spends on something other than a row, reserved before the rows are chosen:
-#: the title bar, the server context, the section title, the tally, the hint, and — only when
-#: something was left out — the "not shown" line.
+#: the title bar, the server context, the section title, the tally, the hint, and the pager.
 #:
 #: The arithmetic lives here, with the listing, rather than at the call site. An earlier version
 #: kept it in the chat renderer and reserved three lines instead of five; the listing then came
 #: out two lines past the budget, which is exactly the failure this whole change exists to fix.
-#: It went to six when every screen gained the title bar — the constant has to be raised by
-#: whatever the screen adds above the rows, or the budget silently stops being a budget.
-_INDEX_FIXED_LINES = 6
+#: It went to six when every screen gained the title bar, and to seven when the listing gained
+#: a pager — the constant has to be raised by whatever the screen adds, or the budget silently
+#: stops being a budget.
+_INDEX_FIXED_LINES = 7
 
 
 def render_index(
-    report: Report, tr: Translator, entries=None, budget: int = CHAT_PAGE_LINES
+    report: Report, tr: Translator, entries=None, page: int = 1, budget: int = CHAT_PAGE_LINES
 ):
-    """``(rows, tail)`` for the numbered listing, capped to a page.
+    """``(rows, tail, page_info)`` for one page of the numbered listing.
 
     Split rather than joined because the two callers need different things from the same rows:
     the chat renderer attaches a click to each one, the console and the tests do not. Both need
@@ -1032,10 +1064,14 @@ def render_index(
 
     The line above the rows is not returned: it is the server context, and each renderer draws
     it in its own vocabulary — the screens use the same labelled field the status screen does.
-    The rows and the tail are the part that must not be computed twice.
+    The rows and the tail are the part that must not be computed twice. The pager line is not
+    returned either: it names commands, and the command spelling belongs to the caller that
+    knows which prefix the reader typed, so it is built by :func:`render_pager` there.
 
     ``entries`` narrows the listing to a subset (the status filter) while keeping the numbers
     from the full list, so a number means one mod whichever command produced the row.
+
+    ``page_info`` is ``(page, pages)``, or ``None`` when there is nothing to show.
     """
     indexed = report.indexed_entries()
     if entries is not None:
@@ -1043,20 +1079,39 @@ def render_index(
         indexed = [(number, entry) for number, entry in indexed if id(entry) in wanted]
 
     if not indexed:
-        return [], [tr("report.no_mods")]
+        return [], [tr("report.no_mods")], None
 
-    shown, omitted = index_selection(indexed, max(1, budget - _INDEX_FIXED_LINES))
+    shown, page, pages = index_page(indexed, page, max(1, budget - _INDEX_FIXED_LINES))
     rows = [
         (number, entry, render_index_row(number, entry, tr))
         for number, entry in shown
     ]
 
-    tail = [tr("report.index_title", count=len(indexed))]
-    if omitted:
-        tail.append(tr("report.index_truncated", count=omitted))
-    tail.append(render_tally(report, tr))
-    tail.append(tr("report.index_hint"))
-    return rows, tail
+    tail = [
+        tr("report.index_title", count=len(indexed)),
+        render_tally(report, tr),
+        tr("report.index_hint"),
+    ]
+    return rows, tail, (page, pages)
+
+
+def render_pager(page: int, pages: int, tr: Translator, command_for: Callable[[int], str]) -> str:
+    """The plain-text pager line, for a reader who cannot click on it.
+
+    The chat renderer draws the same numbers as two buttons; this is the form the console gets,
+    which has no clicks at all — ``[上一页]`` with nothing behind it would be decoration. The
+    commands are spelled out instead, which is the only way a console reader can turn the page.
+
+    ``command_for`` builds the command for a target page, so the filter the listing was made
+    with is carried along: paging must not silently widen "the ones waiting to be installed"
+    into "everything".
+    """
+    parts = [tr("command.list.page", page=page, pages=pages)]
+    if page > 1:
+        parts.append(tr("command.list.prev_command", command=command_for(page - 1)))
+    if page < pages:
+        parts.append(tr("command.list.next_command", command=command_for(page + 1)))
+    return "  ".join(parts)
 
 
 def action_row(

@@ -17,7 +17,6 @@ asserted rather than assumed.
 """
 
 import json
-import re
 import threading
 import time
 
@@ -55,6 +54,7 @@ from mod_update_checker.report import (
     render_full,
     render_index,
     render_index_row,
+    render_pager,
     render_summary,
     summarise,
 )
@@ -1278,22 +1278,30 @@ def _many(actionable=0, up_to_date=0):
     return entries
 
 
-def _listing(report, tr, entries=None, budget=CHAT_PAGE_LINES):
-    """Every line the listing puts on screen, as plain text.
+def _listing(report, tr, entries=None, budget=CHAT_PAGE_LINES, page=1):
+    """Every line one page of the listing puts on screen, as plain text.
 
-    ``render_index`` returns the rows and the tail; the title bar and the server context above
-    them belong to the screen and are counted here, because they are lines the reader scrolls
-    past — a budget measured without them is not the budget the reader gets.
+    ``render_index`` returns the rows, the tail and the page figures; the title bar, the server
+    context and the pager belong to the screen and are counted here, because they are lines the
+    reader scrolls past — a budget measured without them is not the budget the reader gets. The
+    pager is built with the real :func:`render_pager`, because a placeholder would let the one
+    line that was just added to the budget grow a second line without this noticing.
 
     The rows carry their number and no indentation any more: the colour says which of them need
     attention, so a leading pair of spaces would only spend width.
     """
-    rows, tail = render_index(report, tr, entries=entries, budget=budget)
-    return (
+    rows, tail, page_info = render_index(report, tr, entries=entries, page=page, budget=budget)
+    lines = (
         ["(title bar)", "(server context)"]
         + [text for _number, _entry, text in rows]
         + tail
     )
+    if page_info is not None and page_info[1] > 1:
+        lines.append(
+            render_pager(page_info[0], page_info[1], tr,
+                         lambda target: "list {}".format(target))
+        )
+    return lines
 
 
 def test_the_listing_fits_a_page_whatever_the_server_holds():
@@ -1301,7 +1309,9 @@ def test_the_listing_fits_a_page_whatever_the_server_holds():
 
     A reply that has to be scrolled to find the row you need is the reply that gets closed, so
     the budget holds at every size — including the two extremes where the actionable set alone
-    overflows, and where nothing is actionable at all.
+    overflows, and where nothing is actionable at all. Pagination is what makes that possible
+    without dropping anything: the previous version cut the tail off and reported how many rows
+    it had held back, which answered "what is here" but not "how do I see the rest".
     """
     tr = make_translator("zh_cn")
     for actionable, up_to_date in ((3, 4), (40, 160), (0, 200), (40, 0), (0, 0)):
@@ -1310,46 +1320,88 @@ def test_the_listing_fits_a_page_whatever_the_server_holds():
         assert len(lines) <= CHAT_PAGE_LINES, (actionable, up_to_date, len(lines))
 
 
-def test_the_actionable_mods_are_never_the_ones_left_out():
-    """Priority, not just a cap: what needs doing survives the truncation.
+def test_every_mod_is_on_exactly_one_page():
+    """Nothing is lost between the pages, and nothing is shown twice.
 
-    The sort order already puts them first, and this is what stops a future reordering — say,
-    alphabetical — from quietly pushing the one mod that needs attention off the page.
+    Read by walking the whole listing page by page and collecting the numbers — the failure
+    this catches is an off-by-one in the slice arithmetic, which no single-page assertion can
+    see: page two starting one row too early shows a mod twice and would still fit the budget.
+    """
+    tr = make_translator("zh_cn")
+    report = _index_report(_many(actionable=7, up_to_date=20))
+
+    seen = []
+    page = 1
+    while True:
+        rows, _tail, page_info = render_index(report, tr, page=page)
+        assert page_info is not None
+        page, pages = page_info
+        seen.extend(number for number, _entry, _text in rows)
+        if page >= pages:
+            break
+        page += 1
+
+    assert sorted(seen) == [number for number, _entry in report.indexed_entries()]
+
+
+def test_a_page_past_the_end_lands_on_the_last_one():
+    """The buttons are stale the moment the listing shrinks, and refusing is the worse answer.
+
+    A pager line carries a number; mods get installed, the listing gets shorter, and a click on
+    "next" can land past the end. Clamping shows the last page — and the pager line says which
+    page that is, so the reader is not misled about where they ended up.
+    """
+    tr = make_translator("zh_cn")
+    report = _index_report(_many(up_to_date=25))
+
+    rows, _tail, page_info = render_index(report, tr, page=99)
+
+    assert page_info is not None and page_info[0] == page_info[1]
+    assert rows, "clamping must not fall off the end into an empty page"
+    # The last page is the tail of the listing, not its head.
+    assert "Fresh Mod 000" not in "".join(text for _n, _e, text in rows)
+
+
+def test_the_pager_line_names_the_commands_a_console_can_type():
+    """The console's form of the pager has to be typeable; the buttons are for players only.
+
+    ``[上一页]`` in a terminal is decoration, so the console form spells the commands out.
+    Both ends are checked: the first page must not offer a previous page, and a middle page
+    must name both neighbours.
+    """
+    tr = make_translator("zh_cn")
+
+    def command_for(target):
+        return "!!muc list {}".format(target)
+
+    first = render_pager(1, 3, tr, command_for)
+    assert "第 1/3 页" in first
+    assert "上一页" not in first
+    assert "下一页：!!muc list 2" in first
+
+    middle = render_pager(2, 3, tr, command_for)
+    assert "第 2/3 页" in middle
+    assert "上一页：!!muc list" in middle
+    assert "下一页：!!muc list 3" in middle
+
+
+def test_the_first_page_is_the_mods_that_need_attention():
+    """Order, not a cap: the mods that need doing are the ones page one shows.
+
+    The listing's own order puts them first, and this is what stops a future reordering — say,
+    alphabetical — from quietly pushing the one mod that needs attention onto page fifteen.
     """
     tr = make_translator("zh_cn")
     report = _index_report(_many(actionable=40, up_to_date=160))
     body = "\n".join(_listing(report, tr))
 
     assert "Action Mod 000" in body
-    # 12 rows fit at this budget; every one of them is an actionable mod.
-    assert "Action Mod 011" in body
+    # 11 rows fit at this budget; every one of them is an actionable mod.
+    assert "Action Mod 010" in body
+    assert "Action Mod 011" not in body
     assert "Fresh Mod" not in body
-
-
-def test_a_truncated_listing_says_how_many_it_held_back():
-    """A silent cap is worse than no cap: the reader cannot tell a short list from a cut one.
-
-    The count is read out of the line and compared with the number of mods that are actually
-    missing from the body. Asserting on the *text* would not do: an earlier version printed
-    "另有 -9 个未显示", and the loose check written for it ("no ``-`` in the body") also
-    matched the version arrows in every row, so it could only ever fail — or, worse, pass for
-    the wrong reason.
-    """
-    tr = make_translator("zh_cn")
-    report = _index_report(_many(actionable=40, up_to_date=160))
-    body = "\n".join(_listing(report, tr))
-
-    assert "另有" in body and "未显示" in body
-    match = re.search(r"另有\s+(\d+)\s+个未显示", body)
-    assert match is not None, body
-    omitted = int(match.group(1))
-    # Every mod is either printed as a row or counted in that number, never both and never
-    # neither — which is the arithmetic the line is claiming. The row shape is matched exactly
-    # rather than loosely: the header used to open with the ``[Mod Update Checker]`` badge, and
-    # a loose "starts with a bracket" pattern counted it as a row.
-    printed = [line for line in body.splitlines() if re.match(r"^\[\d+\] ", line)]
-    assert omitted > 0
-    assert len(printed) + omitted == len(report.entries)
+    # And the rest is one page away, with the page count on the line.
+    assert "第 1/" in body, body
 
 
 def test_the_number_in_the_listing_identifies_the_mod_it_looks_up():
@@ -1392,7 +1444,7 @@ def test_the_listing_never_pads_the_number():
     assert "[ 1]" not in short
 
     # The case the second attempt got wrong: a listing long enough to reach double digits.
-    long_list = "\n".join(_listing(_index_report(_many(up_to_date=12)), tr, budget=40))
+    long_list = "\n".join(_listing(_index_report(_many(up_to_date=12)), tr))
     assert "[1] " in long_list
     assert "[ 1]" not in long_list
     assert "[10] " in long_list
@@ -1486,6 +1538,81 @@ def test_an_ambiguous_name_is_refused_rather_than_guessed():
 
     entry, reason = report.resolve_handle("alphamod")
     assert entry is None and reason == "ambiguous"
+
+
+def test_a_unique_prefix_of_a_name_is_enough():
+    """打一半就能对上，这是游戏内最接近 Tab 补全的东西。
+
+    ``!!`` commands are chat messages and vanilla completes only its own ``/`` commands, so no
+    MCDR plugin can offer real completion in game. Accepting a unique prefix is the practical
+    version of it: type the beginning of the name, press enter, done.
+    """
+    report = _index_report(
+        [
+            _entry_with_links("sodium", STATUS_UPDATE_AVAILABLE, name="Sodium"),
+            _entry_with_links("lithium", STATUS_UPDATE_AVAILABLE, name="Lithium"),
+        ]
+    )
+
+    entry, reason = report.resolve_handle("lith")
+
+    assert reason == ""
+    assert entry is report.entries[1]
+
+
+def test_a_prefix_that_matches_two_mods_is_refused_and_lists_them():
+    """The other half of the same feature: the candidates are what the caller shows.
+
+    A prefix that matches several mods is not narrowed down yet, and guessing would mean
+    downloading the wrong jar — so the refusal comes with the list of what it could have been,
+    which ``ambiguity_candidates`` gives the caller to turn into clickable completions.
+    """
+    report = _index_report(
+        [
+            _entry_with_links("sodium", STATUS_UPDATE_AVAILABLE, name="Sodium"),
+            _entry_with_links("sodium_extra", STATUS_UPDATE_AVAILABLE, name="Sodium Extra"),
+        ]
+    )
+
+    entry, reason = report.resolve_handle("sod")
+
+    assert entry is None and reason == "ambiguous"
+    assert [item.name for item in report.ambiguity_candidates("sod")] == [
+        "Sodium", "Sodium Extra"
+    ]
+
+
+def test_an_exact_match_is_never_widened_into_a_prefix_search():
+    """The two searches are never mixed: a hit found exactly *is* the answer.
+
+    A mod actually named ``Sod`` must win over ``Sodium`` when the reader typed ``sod`` —
+    otherwise the prefix search would turn a precise handle into an ambiguous one, and the
+    reader could no longer name the shorter mod at all.
+    """
+    report = _index_report(
+        [
+            _entry_with_links("sod", STATUS_UPDATE_AVAILABLE, name="Sod"),
+            _entry_with_links("sodium", STATUS_UPDATE_AVAILABLE, name="Sodium"),
+        ]
+    )
+
+    entry, reason = report.resolve_handle("sod")
+
+    assert entry is report.entries[0] and reason == ""
+
+
+def test_a_prefix_is_matched_through_the_same_normalisation_as_everything_else():
+    """Punctuation does not hide a prefix any more than it hides an exact name.
+
+    ``Fabric-API`` is one normalised word, so ``fabric ap`` — with the space exactly where the
+    reader's memory puts it — has to reach it, same as the exact-match path already allows.
+    """
+    report = _index_report(
+        [_entry_with_links("fabric_api", STATUS_UPDATE_AVAILABLE, name="Fabric-API")]
+    )
+
+    for handle in ("fab", "fabric ap", "fabricap"):
+        assert report.resolve_handle(handle) == (report.entries[0], ""), handle
 
 
 def test_a_handle_is_matched_exactly_before_leniently():
@@ -2125,6 +2252,93 @@ def test_a_satisfied_dependency_is_not_reported(tmp_path, upstream):
     report = run_check(upstream, scenario, tmp_path)
 
     assert "advisory.missing_dependencies" not in dict(report.advisories)
+
+
+def test_a_missing_dependency_that_cannot_run_on_a_server_is_not_reported(tmp_path, upstream):
+    """A client-only library is not a missing dependency — it is a dependency of the client.
+
+    A jar that runs on both sides can legitimately require something that only ever exists on
+    the client, and listing that as missing sends the reader looking for a file that would do
+    nothing if they found it. Modrinth's ``server_side: unsupported`` is exactly the statement
+    that the project cannot run on a server, so it is what this is keyed on.
+    """
+    scenario = Scenario(tmp_path, upstream)
+    scenario.add_jar(
+        "needs.jar",
+        id="needs",
+        version="1.0.0",
+        name="Needs",
+        depends={"minecraft": ">=26.3", "clientlib": "*"},
+    )
+    upstream.add_project(
+        FakeProject(id="proj-clientlib", slug="clientlib", title="Client Lib",
+                    server_side="unsupported")
+    )
+
+    report = run_check(upstream, scenario, tmp_path)
+
+    advisories = dict(report.advisories)
+    assert "advisory.missing_dependencies" not in advisories, advisories
+    assert "advisory.missing_dependencies_excluded" not in advisories, advisories
+    # And it is still said out loud, on the mod that declared it: an absence that explains
+    # itself beats an absence nobody mentions.
+    entry = entry_for(report, "needs")
+    assert ("note.client_only_dependency", {"dep": "clientlib"}) in entry.notes
+
+
+def test_only_the_client_only_dependencies_are_taken_out_of_the_list(tmp_path, upstream):
+    """The exclusion is per dependency, not per mod.
+
+    One jar declaring two missing dependencies — one client-only, one whose id resolves to
+    nothing at all — must come out as "one is still missing, one was excluded". Dropping the
+    whole jar's list would hide the real one behind the harmless one.
+    """
+    scenario = Scenario(tmp_path, upstream)
+    scenario.add_jar(
+        "needs.jar",
+        id="needs",
+        version="1.0.0",
+        name="Needs",
+        depends={"minecraft": ">=26.3", "clientlib": "*", "ghostlib": "*"},
+    )
+    upstream.add_project(
+        FakeProject(id="proj-clientlib", slug="clientlib", title="Client Lib",
+                    server_side="unsupported")
+    )
+
+    report = run_check(upstream, scenario, tmp_path)
+
+    advisories = dict(report.advisories)
+    assert "advisory.missing_dependencies_excluded" in advisories, advisories
+    assert advisories["advisory.missing_dependencies_excluded"]["files"] == "ghostlib"
+    assert advisories["advisory.missing_dependencies_excluded"]["count"] == 1
+    assert advisories["advisory.missing_dependencies_excluded"]["excluded"] == 1
+
+
+def test_a_dependency_on_a_server_capable_project_is_still_reported(tmp_path, upstream):
+    """The false-negative direction: only ``unsupported`` may silence the advisory.
+
+    A project that *can* run on a server — required or optional — is one the loader may need
+    here, and treating "we found it but it is optional" as "it is fine to be missing" would
+    turn a real finding into silence.
+    """
+    scenario = Scenario(tmp_path, upstream)
+    scenario.add_jar(
+        "needs.jar",
+        id="needs",
+        version="1.0.0",
+        name="Needs",
+        depends={"minecraft": ">=26.3", "real-lib": "*"},
+    )
+    upstream.add_project(
+        FakeProject(id="proj-real", slug="real-lib", title="Real Lib", server_side="optional")
+    )
+
+    report = run_check(upstream, scenario, tmp_path)
+
+    advisories = dict(report.advisories)
+    assert "advisory.missing_dependencies" in advisories, advisories
+    assert advisories["advisory.missing_dependencies"]["files"] == "real-lib"
 
 
 # --------------------------------------------------------------------------------------

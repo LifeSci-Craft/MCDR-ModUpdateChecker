@@ -19,7 +19,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, ClassVar, Dict, List, Optional, Sequence, Set, Tuple, Type
+from typing import Any, ClassVar, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple, Type
 
 from mcdreforged.api.all import (
     CommandSource,
@@ -71,6 +71,7 @@ from .report import (
     render_full,
     render_index,
     render_index_row,
+    render_pager,
     render_summary,
     summarise,
 )
@@ -141,6 +142,42 @@ ALL_TARGET = "all"
 #: cannot show forty rows without pushing the question off the screen, and a number plus the
 #: count is enough to decide with.
 BULK_PLAN_ROWS = 8
+
+#: How many of an ambiguous handle's candidates are named — in the sentence, and as buttons.
+#:
+#: A handle that matches thirty mods is a handle that did not narrow anything down, and thirty
+#: buttons is not a completion list, it is a wall. The count in the sentence still says how
+#: many there were, so the reader knows the list was cut.
+AMBIGUOUS_NAMES = 6
+
+
+class Notice(NamedTuple):
+    """One line of an in-game message: the text, and what the line is *for*.
+
+    The role decides the colour, and it is decided where the sentence is built — never guessed
+    from the text in the delivery layer. That was the lesson of v1.3.0's screens: colouring by
+    "does this line contain an arrow" coloured a line by what it happened to contain rather
+    than by what it meant, and made the same mod two colours on two screens. The roles are the
+    same vocabulary the screens use, so the two stay one system:
+
+    * ``heading`` — a section heading: white;
+    * ``action``  — a row that needs somebody to do something: yellow;
+    * ``done``    — a row about something already finished: gray, like the screens' rows that
+      need nothing;
+    * ``hint``    — a footnote or a command to type: gray.
+    """
+
+    text: str
+    role: str
+
+
+#: Role → colour. An unknown role falls back to yellow, which is loud rather than invisible.
+_NOTICE_COLOURS = {
+    "heading": RColor.white,
+    "action": RColor.yellow,
+    "done": RColor.gray,
+    "hint": RColor.gray,
+}
 
 
 class _Grouped(Serializable):
@@ -1026,11 +1063,15 @@ def _announce_download_complete(
     if not broadcast or not (_server_running(server) and _online_players):
         return
 
-    lines = [tr("download.complete_in_game", count=count, size=_format_size(size))]
+    lines = [Notice(tr("download.complete_in_game", count=count, size=_format_size(size)),
+                    "heading")]
     lines.append(
-        tr("download.complete_in_game_automatic")
-        if _config.download.install_on_stop
-        else tr("download.complete_in_game_manual")
+        Notice(
+            tr("download.complete_in_game_automatic")
+            if _config.download.install_on_stop
+            else tr("download.complete_in_game_manual"),
+            "hint",
+        )
     )
     for name in _permitted_players(
         server, sorted(_online_players), _config.report.in_game_permission
@@ -1135,23 +1176,50 @@ def _reason_text(family: str, code: str) -> str:
     return text if translated == key else translated
 
 
-def _install_summary_lines(data: Dict[str, Any]) -> List[str]:
-    """The lines that describe one install batch, for the console and for chat."""
+def _install_summary_lines(data: Dict[str, Any]) -> List[Notice]:
+    """The lines that describe one install batch, for the console and for chat.
+
+    Roles rather than colours, because the two readers disagree about colour: the console drops
+    it entirely (``server.logger`` stringifies its argument, and ``RTextBase.__str__`` returns
+    plain text), while chat paints by role. The role is the one thing both can share.
+
+    A replaced mod is ``done``: nothing about it needs anybody any more. Anything that *failed*
+    to install is ``action``, because that is the line somebody has to look at — and until
+    v1.5.0 both were the same yellow, so a clean batch looked exactly as alarming as a broken
+    one.
+    """
     installed = data.get("installed") or []
-    lines = [tr("install.header", count=len(installed), when=str(data.get("at") or ""))]
+    lines = [
+        Notice(
+            tr("install.header", count=len(installed), when=str(data.get("at") or "")),
+            "heading",
+        )
+    ]
     for item in installed[:NOTIFY_MAX_UPDATES]:
-        lines.append(tr("install.line", name=item.get("name") or "?",
-                        version=item.get("version") or "?",
-                        old=item.get("backup_file") or "?"))
+        lines.append(
+            Notice(
+                tr("install.line", name=item.get("name") or "?",
+                   version=item.get("version") or "?",
+                   old=item.get("backup_file") or "?"),
+                "done",
+            )
+        )
     if len(installed) > NOTIFY_MAX_UPDATES:
-        lines.append(tr("report.and_more", count=len(installed) - NOTIFY_MAX_UPDATES))
+        lines.append(
+            Notice(tr("report.and_more", count=len(installed) - NOTIFY_MAX_UPDATES), "hint")
+        )
     skipped = data.get("skipped") or []
     if skipped:
-        lines.append(tr("install.skipped_header", count=len(skipped)))
+        lines.append(Notice(tr("install.skipped_header", count=len(skipped)), "action"))
         for item in skipped[:NOTIFY_MAX_UPDATES]:
-            lines.append(tr("install.skipped_line", name=item.get("name") or "?",
-                            reason=_reason_text("install.reason.",
-                                               str(item.get("detail") or "unknown"))))
+            lines.append(
+                Notice(
+                    tr("install.skipped_line", name=item.get("name") or "?",
+                       reason=_reason_text("install.reason.",
+                                           str(item.get("detail") or "unknown"))),
+                    "action",
+                )
+            )
     return lines
 
 
@@ -1212,8 +1280,8 @@ def _announce_install_reminder(server: PluginServerInterface) -> None:
     data = _read_install_report(server)
     if data is None or data.get("logged"):
         return
-    for line in _install_summary_lines(data):
-        server.logger.info(line)
+    for notice in _install_summary_lines(data):
+        server.logger.info(notice.text)
     _mark_install_reported(server, data, "logged")
 
 
@@ -1426,20 +1494,73 @@ def _entry_row(number: Optional[int], entry: UpdateEntry, prefix: str,
 
 
 def _reply_index(
-    source: CommandSource, report: Report, entries=None, prefix: str = ROOT_LITERALS[0]
+    source: CommandSource, report: Report, entries=None, page: int = 1,
+    filter_text: str = "", prefix: str = ROOT_LITERALS[0],
 ) -> None:
-    """The numbered listing with a click on every row.
+    """The numbered listing with a click on every row, and a pager at the bottom.
 
     The rows and their selection come from ``report.render_index``; this only decorates them.
     Keeping the two apart is what stops the chat reply from being the place where the page
     budget is computed — which it was, briefly, and it came out two lines too long.
+
+    ``filter_text`` is the status the reader narrowed with, carried so the pager's commands
+    page within that filter instead of quietly widening to everything.
     """
-    rows, tail = render_index(report, tr, entries=entries, budget=CHAT_PAGE_LINES)
+    rows, tail, page_info = render_index(
+        report, tr, entries=entries, page=page, budget=CHAT_PAGE_LINES
+    )
     _title(source)
     source.reply(_context_field(report))
     for number, entry, _text in rows:
         source.reply(_entry_row(number, entry, prefix))
     _reply_lines(source, tail)
+    if page_info is not None and page_info[1] > 1:
+        source.reply(_pager_row(page_info[0], page_info[1], filter_text, prefix, source))
+
+
+def _list_command(prefix: str, filter_text: str, target: int) -> str:
+    """The command that opens page ``target`` of the listing the reader is looking at."""
+    parts = [prefix, "list"]
+    if filter_text:
+        parts.append(filter_text)
+    if target > 1:
+        parts.append(str(target))
+    return " ".join(parts)
+
+
+def _pager_row(
+    page: int, pages: int, filter_text: str, prefix: str, source: CommandSource
+) -> RText:
+    """``第 2/5 页  [上一页] [下一页]`` — or the same figures with the commands spelled out.
+
+    Players get the buttons, because their client can run a click. The console gets the command
+    text instead: a label nobody can press is decoration, and ``[上一页]`` is exactly that in a
+    terminal. The page figure is on the line either way, so "which page am I on" is answered
+    for both readers.
+    """
+
+    def command_for(target: int) -> str:
+        return _list_command(prefix, filter_text, target)
+
+    if not getattr(source, "is_player", False):
+        return RText(render_pager(page, pages, tr, command_for), RColor.gray)
+
+    row = RTextList(RText(tr("command.list.page", page=page, pages=pages), RColor.gray))
+    if page > 1:
+        row.append(RText("  "))
+        row.append(
+            RText(tr("command.list.prev"), RColor.aqua).set_click_event(
+                RAction.run_command, command_for(page - 1)
+            )
+        )
+    if page < pages:
+        row.append(RText("  "))
+        row.append(
+            RText(tr("command.list.next"), RColor.aqua).set_click_event(
+                RAction.run_command, command_for(page + 1)
+            )
+        )
+    return row
 
 
 def _reply_summary(source: CommandSource, report: Report,
@@ -1499,62 +1620,77 @@ def _reply_detail(
         source.reply(RTextList(RText(row.label, RColor.aqua), value) if row.label else value)
 
 
-def _notification_lines(report: Report) -> List[str]:
-    """The body of an in-game notification.
+def _notification_lines(report: Report) -> List[Notice]:
+    """The body of an in-game notification, line by line with its role.
 
     Two sections, because the two situations ask for different things and merging them would
     make the more urgent one invisible: "these need fetching" and "these are fetched, install
     them". A mod appears in exactly one of them, which is what stops an update being announced
-    again after it has already been downloaded.
+    again after it has already been downloaded. Both sections' rows ask somebody to act, so
+    both are ``action``; the headings stay white and the footnotes gray, which is what keeps a
+    six-line message readable as one block instead of one yellow smear.
     """
-    lines: List[str] = []
+    lines: List[Notice] = []
 
     updates = report.updates
     if updates:
-        lines.append(tr("check.in_game_header", count=len(updates)))
+        lines.append(Notice(tr("check.in_game_header", count=len(updates)), "heading"))
         for entry in updates[:NOTIFY_MAX_UPDATES]:
-            lines.append(tr("line.update", name=entry.name, local=entry.local_version or "?",
-                            latest=entry.latest_version or "?"))
+            lines.append(Notice(tr("line.update", name=entry.name,
+                                   local=entry.local_version or "?",
+                                   latest=entry.latest_version or "?"), "action"))
         if len(updates) > NOTIFY_MAX_UPDATES:
-            lines.append(tr("report.and_more", count=len(updates) - NOTIFY_MAX_UPDATES))
+            lines.append(Notice(tr("report.and_more",
+                                   count=len(updates) - NOTIFY_MAX_UPDATES), "hint"))
         # The list is the same every start until the admin acts on it, so the one thing worth
         # adding is which part of it just appeared.
         if report.new_since_last:
-            lines.append(tr("report.new_since_last", count=len(report.new_since_last),
-                            names=", ".join(report.new_since_last[:6])))
+            lines.append(Notice(tr("report.new_since_last", count=len(report.new_since_last),
+                                   names=", ".join(report.new_since_last[:6])), "hint"))
 
     pending = report.awaiting_install
     if pending:
-        lines.append(tr("check.in_game_awaiting", count=len(pending)))
+        lines.append(Notice(tr("check.in_game_awaiting", count=len(pending)), "heading"))
         for entry in pending[:NOTIFY_MAX_UPDATES]:
-            lines.append(tr("line.awaiting_install", name=entry.name,
-                            latest=entry.latest_version or "?"))
+            lines.append(Notice(tr("line.awaiting_install", name=entry.name,
+                                   latest=entry.latest_version or "?"), "action"))
         if len(pending) > NOTIFY_MAX_UPDATES:
-            lines.append(tr("report.and_more", count=len(pending) - NOTIFY_MAX_UPDATES))
-        lines.append(tr("check.in_game_awaiting_where"))
+            lines.append(Notice(tr("report.and_more",
+                                   count=len(pending) - NOTIFY_MAX_UPDATES), "hint"))
+        lines.append(Notice(tr("check.in_game_awaiting_where"), "hint"))
 
     if not lines:
-        lines.append(tr("report.no_updates"))
+        lines.append(Notice(tr("report.no_updates"), "hint"))
     elif updates or pending:
         # A truncated list with no way onward is a dead end, so the notification says which
         # command carries the rest.
-        lines.append(tr("check.in_game_more_hint"))
+        lines.append(Notice(tr("check.in_game_more_hint"), "hint"))
     return lines
 
 
-def _tell_player(server: PluginServerInterface, player: str, lines: List[str]) -> None:
-    """Send a few lines to one player.
+def _tell_player(server: PluginServerInterface, player: str, lines: Sequence[Notice]) -> None:
+    """Send a few lines to one player, each coloured by what it is for.
 
     ``server.tell`` rather than a hand-built ``tellraw``: it goes through the active handler's
     own "send message" command (so it is right for whatever handler the server runs, not just
     the vanilla-derived ones), it escapes the payload, and it uses the receiving player's
     preferred language. Delivery is best-effort — the player may have disconnected while a
     check was running.
+
+    The colouring lives here rather than in each builder so the vocabulary stays in one place;
+    the *roles* are decided by the builders, which are the only layer that knows whether a
+    line is a heading or a row. Until v1.5.0 every one of these messages was painted one
+    colour, which made a finished install look exactly as urgent as a broken one.
     """
     if not _server_running(server):
         return
+    message = RTextList()
+    for index, notice in enumerate(lines):
+        if index:
+            message.append(RText("\n"))
+        message.append(RText(notice.text, _NOTICE_COLOURS.get(notice.role, RColor.yellow)))
     try:
-        server.tell(player, RText("\n".join(lines), RColor.yellow))
+        server.tell(player, message)
     except Exception as error:  # noqa: BLE001 - a failed message must not break anything
         server.logger.debug("could not message {}: {}".format(player, error))
 
@@ -1653,13 +1789,15 @@ def _admin_join_worker(server: PluginServerInterface, player: str) -> None:
         _mark_install_reported(server, install, "notified")
 
     if report is None:
-        _tell_player(server, player, [tr("check.admin_join_no_report")])
+        _tell_player(server, player, [Notice(tr("check.admin_join_no_report"), "hint")])
         return
 
-    lines = [tr("check.admin_join_header", version=report.server.describe())]
+    lines = [Notice(tr("check.admin_join_header", version=report.server.describe()), "heading")]
     lines.extend(_notification_lines(report))
     if reused:
-        lines.append(tr("check.admin_join_reused", minutes=int((age or 0) // 60)))
+        lines.append(
+            Notice(tr("check.admin_join_reused", minutes=int((age or 0) // 60)), "hint")
+        )
     _tell_player(server, player, lines)
 
 
@@ -1774,49 +1912,70 @@ def _denied(_source: CommandSource) -> str:
 
 
 def _show_summary(source: CommandSource) -> None:
+    """``summary`` — the last check as a screen, without running anything.
+
+    This used to be what the bare command did. Since the bare command is the help page (the
+    project convention), this is how the stored result is read back on demand.
+    """
     if _last_report is None:
         source.reply(tr("command.no_report_yet"))
         return
     _reply_summary(source, _last_report)
 
 
-def _show_list(source: CommandSource, prefix: str = ROOT_LITERALS[0]) -> None:
-    """``list`` — the numbered index. Detail is one click away, not inline.
+def _show_list(source: CommandSource, raw: str = "", prefix: str = ROOT_LITERALS[0]) -> None:
+    """``list [状态] [页码]`` — the numbered index, optionally filtered and paged.
 
-    It used to print every mod's project page, download url and notes inline: five to seven
-    lines each, so even a small server's output ran past a chat page and the useful rows were
-    the ones that scrolled off.
+    Two optional words in one argument, told apart by shape rather than by position: a status
+    name narrows the rows, a plain number picks the page (``list 2``), and ``list awaiting_install
+    2`` does both — the number last, because that is where the pager buttons put it. A status is
+    never a number, so there is nothing to disambiguate.
+
+    Numbers keep their full-list meaning when a filter is on: numbering the filtered set would
+    make a click ambiguous, since the same number would mean different mods depending on which
+    command produced the row. One numbering means a number always identifies a mod.
     """
+    tokens = (raw or "").split()
+    page = 1
+    if tokens and tokens[-1].isdigit():
+        page = int(tokens.pop())
+    status_text = " ".join(tokens).strip()
+    wanted = status_text.lower()
+    # The typo is answered first, report or no report: telling a reader with a misspelled
+    # status that no check has run yet would send them to fix the wrong thing.
+    if wanted and wanted not in ALL_STATUSES:
+        source.reply(
+            tr("command.unknown_status", value=status_text, options=", ".join(ALL_STATUSES))
+        )
+        return
     if _last_report is None:
         source.reply(tr("command.no_report_yet"))
         return
-    _reply_index(source, _last_report, prefix=prefix)
+
+    entries = _last_report.by_status(wanted) if wanted else None
+    _reply_index(source, _last_report, entries=entries, page=page,
+                 filter_text=wanted, prefix=prefix)
 
 
-def _show_filtered(source: CommandSource, status: str, prefix: str = ROOT_LITERALS[0]) -> None:
-    """``list <状态>`` — the same index, filtered. Numbers keep their full-list meaning.
-
-    Numbering over the filtered set would be more natural to read, but it would make a click
-    ambiguous: the same number would mean different mods depending on which command produced
-    the row. Keeping one numbering means a number always identifies a mod.
-    """
-    wanted = (status or "").strip().lower()
-    if wanted not in ALL_STATUSES:
-        source.reply(tr("command.unknown_status", value=status, options=", ".join(ALL_STATUSES)))
-        return
-    if _last_report is None:
-        source.reply(tr("command.no_report_yet"))
-        return
-    _reply_index(source, _last_report, entries=_last_report.by_status(wanted), prefix=prefix)
-
-
-def _resolve_handle(source: CommandSource, report: Report, text: str) -> Optional[UpdateEntry]:
+def _resolve_handle(
+    source: CommandSource,
+    report: Report,
+    text: str,
+    prefix: str = ROOT_LITERALS[0],
+    action: str = "info",
+) -> Optional[UpdateEntry]:
     """Look up what the admin typed, and explain it when that fails.
 
     The three failures get three sentences, because they lead to three different next actions:
-    a number past the end of the list means "look at the list again", an ambiguous name means
-    "type more of it", and an unknown one means "that mod is not in this report". A single
-    "not found" would leave the reader guessing which of the three they hit.
+    a number past the end of the list means "look at the list again", an ambiguous handle means
+    "type more of it" — and the names that matched are offered as clickable completions, which
+    is the in-game stand-in for tab completion — and an unknown one means "that mod is not in
+    this report". A single "not found" would leave the reader guessing which of the three they
+    hit.
+
+    ``prefix`` and ``action`` are used only for those completion buttons: clicking one **fills
+    the input box** with ``!!muc download Sodium`` rather than running it, because the reader
+    is mid-sentence and may still want to edit before pressing enter.
     """
     entry, reason = report.resolve_handle(text)
     if entry is not None:
@@ -1824,10 +1983,39 @@ def _resolve_handle(source: CommandSource, report: Report, text: str) -> Optiona
     if reason == "out-of-range":
         source.reply(tr("command.handle.out_of_range", value=text, count=len(report.entries)))
     elif reason == "ambiguous":
-        source.reply(tr("command.handle.ambiguous", value=text))
+        _reply_ambiguous(source, report, text, prefix, action)
     else:
         source.reply(tr("command.info.unknown", value=text))
     return None
+
+
+def _reply_ambiguous(
+    source: CommandSource, report: Report, text: str, prefix: str, action: str
+) -> None:
+    """Name the mods a handle could have meant, and offer them as clickable completions.
+
+    The clickable row is only sent to a player. In the console the names are already spelled
+    out in the sentence above it, and ``[Sodium]`` with nothing to click is one more line to
+    read past — the same reason the console never got the listing's buttons.
+    """
+    candidates = report.ambiguity_candidates(text)
+    names = [entry.name for entry in candidates]
+    source.reply(
+        tr("command.handle.ambiguous", value=text, count=len(names),
+           names=", ".join(names[:AMBIGUOUS_NAMES]))
+    )
+    if not getattr(source, "is_player", False):
+        return
+    row = RTextList()
+    for index, name in enumerate(names[:AMBIGUOUS_NAMES]):
+        if index:
+            row.append(RText("  "))
+        row.append(
+            RText("[{}]".format(name), RColor.aqua).set_click_event(
+                RAction.suggest_command, "{} {} {}".format(prefix, action, name)
+            )
+        )
+    source.reply(row)
 
 
 def _show_info(source: CommandSource, target: str, prefix: str = ROOT_LITERALS[0]) -> None:
@@ -1839,7 +2027,7 @@ def _show_info(source: CommandSource, target: str, prefix: str = ROOT_LITERALS[0
     if not text:
         source.reply(tr("command.info.usage"))
         return
-    entry = _resolve_handle(source, _last_report, text)
+    entry = _resolve_handle(source, _last_report, text, prefix=prefix, action="info")
     if entry is None:
         return
     _reply_detail(source, entry, prefix=prefix)
@@ -1975,7 +2163,7 @@ def _manual_download(source: CommandSource, handle: str, prefix: str) -> None:
     if text.lower() == ALL_TARGET:
         _manual_download_all(source, prefix)
         return
-    entry = _resolve_handle(source, report, text)
+    entry = _resolve_handle(source, report, text, prefix=prefix, action="download")
     if entry is None:
         return
     number = _number_of(report, entry)
@@ -2097,7 +2285,7 @@ def _manual_install(source: CommandSource, handle: str, prefix: str) -> None:
     if text.lower() == ALL_TARGET:
         _manual_install_all(source, prefix)
         return
-    entry = _resolve_handle(source, report, text)
+    entry = _resolve_handle(source, report, text, prefix=prefix, action="install")
     if entry is None:
         return
     number = _number_of(report, entry)
@@ -2682,6 +2870,11 @@ def _help_line(description: str, command: str, action: Any, width: int) -> RText
 def _show_help(source: CommandSource, prefix: str = ROOT_LITERALS[0]) -> None:
     """The landing page: what this plugin's commands are, and what each one does.
 
+    Also what the bare command shows — ``!!muc`` with nothing after it. That is the convention
+    this project follows for every plugin: a bare invocation teaches the syntax instead of
+    guessing what the reader wanted, because a reader who typed no arguments is far more likely
+    to be looking for the command list than for a particular one of them.
+
     ``prefix`` is the spelling actually typed, so ``!!muc help`` lists ``!!muc ...`` and not
     the other alias. The other spelling is mentioned once in the usage line instead.
 
@@ -2695,9 +2888,9 @@ def _show_help(source: CommandSource, prefix: str = ROOT_LITERALS[0]) -> None:
     # catalogue invariant collects key literals from their call sites, so a key reached through
     # a variable would look unused and be reported as a stale entry.
     entries = (
-        (tr("command.help.entry_summary"), prefix, RAction.run_command),
         (tr("command.help.entry_check"), prefix + " check", RAction.run_command),
         (tr("command.help.entry_list"), prefix + " list", RAction.run_command),
+        (tr("command.help.entry_summary"), prefix + " summary", RAction.run_command),
         (tr("command.help.entry_info"), prefix + " info", RAction.suggest_command),
         (tr("command.help.entry_download"), prefix + " download", RAction.suggest_command),
         (tr("command.help.entry_install"), prefix + " install", RAction.suggest_command),
@@ -2730,6 +2923,34 @@ def _trigger_check(source: CommandSource) -> None:
     ).start()
 
 
+def _suggest_handles(pick: Any, include_all: bool = False) -> Any:
+    """A completion provider for a command that takes a mod handle.
+
+    Used by the MCDR **console**, which is the one place a ``!!`` command can be tab-completed:
+    in game these are chat messages, and vanilla completes only its own ``/`` commands — no
+    MCDR plugin can put suggestions into the chat box. So this is where "type half and press
+    Tab" actually works; in game the equivalent is typing half and pressing enter, which
+    :meth:`Report.resolve_handle` supports by accepting a unique prefix.
+
+    ``pick`` decides which entries are worth offering per command: a download can only fetch
+    what is waiting to be fetched, so suggesting the whole report would offer names that can
+    only come back with an error. Handles are offered by **display name**, the spelling the
+    listing shows, because that is the one a reader would have typed.
+    """
+
+    def provider(*_args: Any) -> List[str]:
+        report = _last_report
+        if report is None:
+            return []
+        entries = pick(report)
+        names = [entry.name for entry in entries if entry.name]
+        if include_all:
+            names.insert(0, ALL_TARGET)
+        return names
+
+    return provider
+
+
 def _command_tree(prefix: str):
     """The whole command tree for one root literal.
 
@@ -2741,19 +2962,25 @@ def _command_tree(prefix: str):
     return (
         Literal(prefix)
         .requires(_has_permission, _denied)
-        .runs(_show_summary)
+        # Bare command = the help page, by project convention: an invocation with no arguments
+        # is a reader asking what the commands are. The summary moved to its own word when this
+        # changed — it is still one keystroke away, and it is no longer what an explorer gets.
+        .runs(lambda source: _show_help(source, prefix))
         .then(
             Literal("help").runs(
                 lambda source: _show_help(source, prefix)
             )
         )
+        .then(Literal("summary").runs(_show_summary))
         .then(Literal("check").runs(_trigger_check))
         .then(
             Literal("list")
-            .runs(lambda source: _show_list(source, prefix))
+            .runs(lambda source: _show_list(source, "", prefix))
             .then(
-                GreedyText("status").runs(
-                    lambda source, context: _show_filtered(source, context["status"], prefix)
+                GreedyText("status").suggests(
+                    lambda *_args: list(ALL_STATUSES)
+                ).runs(
+                    lambda source, context: _show_list(source, context["status"], prefix)
                 )
             )
         )
@@ -2761,7 +2988,9 @@ def _command_tree(prefix: str):
             Literal("info")
             .runs(lambda source: source.reply(tr("command.info.usage")))
             .then(
-                GreedyText("target").runs(
+                GreedyText("target").suggests(
+                    _suggest_handles(lambda report: report.entries)
+                ).runs(
                     lambda source, context: _show_info(source, context["target"], prefix)
                 )
             )
@@ -2772,7 +3001,11 @@ def _command_tree(prefix: str):
             Literal("download")
             .runs(lambda source: source.reply(tr("command.download.usage", command=prefix)))
             .then(
-                GreedyText("target").runs(
+                GreedyText("target").suggests(
+                    _suggest_handles(
+                        lambda report: _download_all_candidates(report)[0], include_all=True
+                    )
+                ).runs(
                     lambda source, context: _manual_download(source, context["target"], prefix)
                 )
             )
@@ -2781,7 +3014,11 @@ def _command_tree(prefix: str):
             Literal("install")
             .runs(lambda source: source.reply(tr("command.install.usage", command=prefix)))
             .then(
-                GreedyText("target").runs(
+                GreedyText("target").suggests(
+                    _suggest_handles(
+                        lambda report: list(report.awaiting_install), include_all=True
+                    )
+                ).runs(
                     lambda source, context: _manual_install(source, context["target"], prefix)
                 )
             )
