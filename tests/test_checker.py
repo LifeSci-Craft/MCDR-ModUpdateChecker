@@ -18,10 +18,19 @@ asserted rather than assumed.
 
 import json
 import re
+import threading
+import time
 
 import pytest
 
-from mod_update_checker.checker import CheckOptions, Checker, ResolveCache, normalise_name
+from mod_update_checker.checker import (
+    _MAX_WORKERS,
+    _pool_size,
+    CheckOptions,
+    Checker,
+    ResolveCache,
+    normalise_name,
+)
 from mod_update_checker.i18n import make_translator
 from mod_update_checker.report import (
     CHAT_PAGE_LINES,
@@ -369,14 +378,14 @@ def test_an_ignored_mod_costs_no_requests_at_all(tmp_path, upstream):
     and then a name search, so any request at all means the exclusion leaked.
     """
     scenario = Scenario(tmp_path, upstream)
-    jar = scenario.add_jar("pinned.jar", id="pinned", version="1.0.0", name="Pinned Mod")
+    scenario.add_jar("pinned.jar", id="pinned", version="1.0.0", name="Pinned Mod")
     upstream.add_project(
         FakeProject(
             id="proj-pinned",
             slug="pinned",
             title="Pinned Mod",
             versions=[
-                # Deliberately not ``jar.sha1``: a hash match would resolve it without a
+                # Deliberately not the jar's own sha1: a hash match would resolve it without a
                 # search, and then the search could not be used as the signal.
                 _version("proj-pinned", "p-1", "1.0.0", "a" * 40),
                 _version("proj-pinned", "p-2", "2.0.0", "b" * 40, date="2026-02-01T00:00:00Z"),
@@ -603,6 +612,125 @@ def test_a_rate_limited_request_is_retried(tmp_path, upstream):
     report = run_check(upstream, scenario, tmp_path, retries=2)
 
     assert entry_for(report, "alpha").status == STATUS_UPDATE_AVAILABLE
+
+
+# --------------------------------------------------------------------------------------
+# The lookups that scale with the mod count are overlapped
+#
+# Two stages talk to the upstream once per mod, and both are latency-bound rather than
+# bandwidth-bound: a jar whose bytes are not published anywhere costs a search plus a version
+# list, and a jar that is published but has no build for this loader costs a version list. On a
+# server whose mods were built from source, that is most of the folder, so asking one at a time
+# is the difference between a check measured in seconds and one measured in minutes.
+#
+# These tests watch how many lookups are in flight rather than how long the run took, so they
+# assert the property that is actually wanted and do not depend on how loaded the machine is.
+# --------------------------------------------------------------------------------------
+
+
+def _leftovers(scenario, count, prefix="leftover"):
+    """Jars that no hash lookup can answer, so every one of them reaches the name-search stage."""
+    for index in range(count):
+        scenario.add_jar(
+            "{}{}.jar".format(prefix, index),
+            id="{}{}".format(prefix, index),
+            version="1.0.0",
+            name="{} {} ".format(prefix.capitalize(), index).strip(),
+        )
+
+
+def _watch_concurrency(monkeypatch, attribute):
+    """Wrap ``Checker.<attribute>`` so the highest number of simultaneous calls is recorded.
+
+    The sleep stands in for a round trip. Without it the calls would be over before the next
+    one started and there would be nothing to observe, whatever the threading did.
+    """
+    state = {"in_flight": 0, "peak": 0}
+    lock = threading.Lock()
+    real = getattr(Checker, attribute)
+
+    def watching(self, *args, **kwargs):
+        with lock:
+            state["in_flight"] += 1
+            state["peak"] = max(state["peak"], state["in_flight"])
+        try:
+            time.sleep(0.05)
+            return real(self, *args, **kwargs)
+        finally:
+            with lock:
+                state["in_flight"] -= 1
+
+    monkeypatch.setattr(Checker, attribute, watching)
+    return state
+
+
+def test_the_name_search_stage_asks_its_lookups_concurrently(tmp_path, upstream, monkeypatch):
+    """Eight mods that only a name search can identify, with four workers to spend on them."""
+    scenario = Scenario(tmp_path, upstream)
+    _leftovers(scenario, 8)
+    state = _watch_concurrency(monkeypatch, "_match_on_modrinth")
+
+    run_check(upstream, scenario, tmp_path, workers=4)
+
+    assert state["peak"] > 1, "the name searches were run one after another"
+
+
+def test_the_name_search_does_not_open_more_threads_than_it_has_work(tmp_path, upstream,
+                                                                    monkeypatch):
+    """Two mods and eight workers must not open eight threads to make two calls each."""
+    scenario = Scenario(tmp_path, upstream)
+    _leftovers(scenario, 2)
+    state = _watch_concurrency(monkeypatch, "_match_on_modrinth")
+
+    run_check(upstream, scenario, tmp_path, workers=8)
+
+    assert state["peak"] <= 2, state
+
+
+def test_overlapping_the_name_search_changes_no_verdict(tmp_path, upstream):
+    """The stage writes one entry per mod and a lock-protected cache, so order must not matter.
+
+    Worth asserting by running it both ways rather than trusting the argument: a shared mutable
+    default or a stray instance attribute would show up here as a difference and nowhere else.
+    """
+    scenario = Scenario(tmp_path, upstream)
+    _leftovers(scenario, 6)
+    # Half of them are knowable by name, so the stage produces both a match and a miss.
+    for index in range(0, 6, 2):
+        upstream.add_project(
+            FakeProject(
+                id="proj-leftover{}".format(index),
+                slug="leftover{}".format(index),
+                title="Leftover {}".format(index),
+                versions=[_version("proj-leftover{}".format(index),
+                                   "lv{}".format(index), "2.0.0", "e" * 40)],
+            )
+        )
+
+    def summary(workers):
+        report = run_check(upstream, scenario, tmp_path, workers=workers)
+        return sorted(
+            (entry.file_name, entry.status, entry.latest_version, entry.matched_by)
+            for entry in report.entries
+        )
+
+    assert summary(1) == summary(8)
+
+
+def test_the_worker_pool_is_capped_and_never_empty():
+    """Both bounds protect something different, so both are pinned.
+
+    The cap keeps a mistyped ``network.concurrent_requests`` from opening hundreds of
+    connections to a public API; the ``count`` bound keeps a three-mod server from starting
+    eight threads to make three calls; and the floor keeps a nonsense zero from deadlocking
+    the run on a pool that can never execute anything.
+    """
+    assert _pool_size(0, 10) == 1
+    assert _pool_size(-5, 10) == 1
+    assert _pool_size(4, 100) == 4
+    assert _pool_size(4, 2) == 2
+    assert _pool_size(99, 100) == _MAX_WORKERS
+    assert _pool_size(1, 100) == 1
 
 
 # --------------------------------------------------------------------------------------
@@ -1166,7 +1294,6 @@ def test_the_number_in_the_listing_identifies_the_mod_it_looks_up():
 def test_a_filtered_listing_keeps_the_numbers_the_full_one_used():
     """Otherwise the same number would mean two different mods in two replies."""
     report = _index_report(_many(actionable=2, up_to_date=3))
-    full = {number: entry.name for number, entry in report.indexed_entries()}
     filtered = report.by_status(STATUS_UP_TO_DATE)
 
     tr = make_translator("zh_cn")
