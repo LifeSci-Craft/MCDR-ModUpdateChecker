@@ -46,7 +46,7 @@ import publish  # noqa: E402  - reuses find_token / call / Failure
 API = publish.API
 Failure = publish.Failure
 
-#: Section heading for one release in ``CHANGELOG.md``, e.g. ``## v1.0.0 — 首次发布``.
+#: Section heading for one release in ``CHANGELOG.md``, e.g. ``## v1.0.1``.
 _RELEASE_HEADING = re.compile(r"^##\s+v?(\S+)(.*)$")
 
 
