@@ -663,6 +663,29 @@ def summarise(
         except (ValueError, AttributeError):
             cache_records = -1
 
+    # MCDR fills in the options a config file is missing and writes it back, and this run
+    # depends on it: the config written before the boot is deliberately incomplete (see
+    # ``plugin_config``). The two halves are asserted separately — the file gained the
+    # options, and the plugin said so on the console. Either can regress without the other,
+    # and both were once invisible, which is what made a stale config file look to a user
+    # like a feature that did not exist.
+    config_file = plugin_folder / "config.json"
+    config_healed = False
+    if config_file.is_file():
+        try:
+            written_config = json.loads(config_file.read_text(encoding="utf-8"))
+        except ValueError:
+            written_config = {}
+        if isinstance(written_config, dict):
+            download_section = written_config.get("download")
+            sources_section = written_config.get("sources")
+            config_healed = (
+                isinstance(download_section, dict)
+                and "install_on_stop" in download_section
+                and isinstance(sources_section, dict)
+                and "manual_map" in sources_section
+            )
+
     updates = report.get("counts", {}).get("update_available", 0)
     # Keyed by file name, not mod id: a jar with no mod metadata has an empty mod id, and two
     # jars of one mod share an id — neither is a usable key for "what happened to this jar".
@@ -741,6 +764,8 @@ def summarise(
         "report_entry_count": len(report.get("entries", [])),
         "cache_written": cache_path.is_file(),
         "cache_records": cache_records,
+        "config_healed": config_healed,
+        "config_reported": "配置文件缺少" in console and "已按默认值补上" in console,
         # Two distinct notifications are expected, and their markers differ, so a regression
         # that stops sending one of them cannot be masked by the other still arriving.
         "notify_in_game_sent": plugin_badge() + " 有" in joined,
@@ -840,6 +865,8 @@ CHECK_KEYS = [
     "report_file_written",
     "report_has_entries",
     "cache_written",
+    "config_healed",
+    "config_reported",
     "notify_in_game_sent",
     "admin_join_notified",
     "notify_payloads_valid",
