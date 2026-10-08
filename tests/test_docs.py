@@ -23,6 +23,7 @@ and the audience split itself.
 
 import json
 import re
+import unicodedata
 from pathlib import Path
 
 import pytest
@@ -157,6 +158,57 @@ def test_the_documented_check_count_is_the_real_one():
         "{} quotes a different check count than required_keys() reports ({})".format(
             DEVELOPER_DOC, download_checks
         )
+    )
+
+
+#: A Markdown link whose target is a heading in the same file: ``[文字](#锚点)``.
+_INTERNAL_LINK = re.compile(r"\]\(#([^)]+)\)")
+
+
+def _anchor(heading: str) -> str:
+    """GitHub's heading-anchor rule: lower-case, drop punctuation, spaces become hyphens.
+
+    Typed out rather than derived from a library because the whole point is to predict what
+    *GitHub* does with the heading, and the parts that matter here are the CJK ones: the
+    fullwidth colon and comma (``：`` ``，``) are punctuation and disappear, while the
+    characters around them are kept. A naive rule that "keeps everything above U+2E80" gets
+    the CJK right and the CJK *punctuation* wrong, which is the mistake this function was
+    written after making.
+    """
+    out = []
+    for character in heading.strip().lower():
+        category = unicodedata.category(character)
+        if character in "-_":
+            out.append(character)
+        elif character.isspace():
+            out.append("-")
+        elif category.startswith(("P", "S", "C")):
+            continue
+        else:
+            out.append(character)
+    return "".join(out)
+
+
+@pytest.mark.parametrize("name", DOCS)
+def test_every_internal_link_lands_on_a_heading_that_exists(name):
+    """A ``#anchor`` link outlives the heading it points at by exactly nothing.
+
+    Link rot inside a file is quiet in a different way from a wrong option name: nothing about
+    the page looks broken until somebody clicks it, and the edit that breaks it (moving,
+    renaming or merging a section) is usually the kind made *for* tidiness. This was written
+    after compressing ``README.md`` — a task that is almost entirely "move sections around".
+    """
+    text = _doc(name)
+    available = {
+        _anchor(line.lstrip("#").strip())
+        for line in text.splitlines()
+        if line.startswith("#")
+    }
+    offenders = sorted({target for target in _INTERNAL_LINK.findall(text)
+                        if target not in available})
+
+    assert offenders == [], "{} has links to headings it does not have: {}".format(
+        name, offenders
     )
 
 
