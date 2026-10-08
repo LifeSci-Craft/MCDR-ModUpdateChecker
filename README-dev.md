@@ -120,8 +120,11 @@ MC 的 Mod 版本号是一团乱麻：`1.2.3`、`v1.2.3`、`0.162.0+26.3`、`1.1
 | `!!muc status` 不会读 jar 的字节 | `test_the_status_screen_does_not_hash_the_mods_folder`：**数**摘要函数的调用次数，而不是让它抛异常。`scan_mods` 会吞掉单个 jar 的异常并把它记成「读不了」，所以抛异常那个写法会让这个测试在错误的原因下通过；配套的 `test_the_status_screen_still_reads_the_metadata` 防止「不哈希」退化成「不读文件夹」 |
 | 两个批量查询只花一个往返 | `test_the_two_batched_lookups_share_one_round_trip`：数同时在飞的调用数，并配一条断言证明 1c 失败只是少了标题、不会改变判定 |
 | 版本号三处写法一致 | `tests/test_docs.py`：README 里那张样例状态屏的版本、CHANGELOG 的**第一个** `## ` 标题（`tools/release.py` 就是拿它当发布正文的）都必须等于 `mcdreforged.plugin.json` 的版本，且 CHANGELOG 只允许有一个版本段 |
+| 配置文件是完整的 | 三条，两个方向：`Config` 的字段集与 `Config.get_default().serialize()` 的叶子集**必须相等**；每个选项都必须在 README 或本文件里出现过；一份缺了选项的旧配置文件会被 MCDR 补齐并重写（用 MCDR 自己的 `SimpleConfigHandler` + `deserialize` 模拟，不是启动一台服务器） |
+| 列表编号扛得住状态变化 | `test_downloading_a_mod_does_not_move_it_in_the_listing`：`update_available` 与 `awaiting_install` 共用一个排序名次，所以 `download 1` 之后 `install 1` 指的还是同一个 Mod |
+| 手柄查找的四种写法与三种失败 | `test_a_mod_can_be_looked_up_by_the_name_the_listing_shows` 等一组。**示例 Mod 的 id、文件名、显示名必须互不相同**，否则测试会经 mod id 命中而看起来通过 |
 
-测试套件共 **590 项**（其中 2 项是真实 MCDR 端到端，只在 CI 上跑；当前数量用
+测试套件共 **601 项**（其中 2 项是真实 MCDR 端到端，只在 CI 上跑；当前数量用
 `pytest --collect-only -q | tail -1` 查；这一行是快照，
 所以上面那张表里的「36 项检查」才是被测试自动核对的那个数字），细节见 [`tests/README.md`](tests/README.md)。
 

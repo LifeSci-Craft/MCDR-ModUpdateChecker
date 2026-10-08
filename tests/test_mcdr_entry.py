@@ -1457,6 +1457,38 @@ def test_install_refuses_a_mod_that_has_not_been_downloaded(tmp_path, monkeypatc
     assert "!!muc download 1" in source.body, source.body
 
 
+def test_the_number_the_install_hint_suggests_is_the_listing_number(tmp_path, monkeypatch):
+    """``!!muc install <name>`` may answer "type !!muc download 3" — the ``3`` has to be right.
+
+    Asserted with the mod **not** first in the listing, because a one-entry report would be
+    satisfied by any numbering at all. The handle is a name on purpose: that is the form which
+    has to go through the lookup and then still produce the listing's number.
+    """
+    import mod_update_checker as plugin
+    from mod_update_checker.report import UpdateEntry
+
+    monkeypatch.setattr(plugin, "_config", _config_with({"language": "zh_cn"}), raising=False)
+    plugin._apply_language(None, plugin._config)
+    plugin._stop_event.clear()
+    plugin._clear_pending()
+
+    server = _FakeServer(tmp_path, levels={"Admin": 4})
+    fetched = UpdateEntry(mod_id="alpha", name="Alpha", file_name="alpha.jar",
+                          local_version="1.0.0", latest_version="1.1.0",
+                          status="awaiting_install")
+    waiting = UpdateEntry(mod_id="zeta", name="Zeta", file_name="zeta.jar",
+                          local_version="1.0.0", latest_version="1.1.0",
+                          status="update_available")
+    # Both are actionable, so they share a rank and are ordered by name: Alpha is 1, Zeta is 2.
+    monkeypatch.setattr(plugin, "_last_report", _report_with([fetched, waiting]), raising=False)
+    monkeypatch.setattr(plugin, "_server", server, raising=False)
+
+    source = _PlayerSource("Admin")
+    plugin._manual_install(source, "Zeta", "!!muc")
+
+    assert "!!muc download 2" in source.body, source.body
+
+
 def test_install_stages_the_swap_and_confirm_authorises_only_that_mod(tmp_path, monkeypatch):
     """The whole point of the per-record flag: five downloads, one named, one installed."""
     from mod_update_checker.downloads import DownloadLedger
@@ -2045,3 +2077,89 @@ def test_the_status_screen_still_reads_the_metadata(tmp_path, monkeypatch):
         plugin._config, plugin._server = previous
 
     assert "3 个 jar" in "\n".join(str(item) for item in source.replies)
+
+
+# --------------------------------------------------------------------------------------
+# Is the config file complete?
+#
+# The question came from a user report that ``download.install_on_stop`` was missing from
+# their file. It turned out not to be reproducible — MCDR fills a missing field in from the
+# class default and rewrites the file, on every version this plugin supports, which is
+# asserted below — but asking it turned up no test that the shipped defaults *can* produce a
+# complete file at all. A field MCDR could not write would be invisible: the plugin would use
+# its class default and the admin would simply never see the option.
+# --------------------------------------------------------------------------------------
+
+
+def _serialised_leaf_paths(node, prefix=""):
+    """Every scalar in a serialised config, as a dotted path."""
+    leaves = []
+    for key, value in node.items():
+        path = "{}.{}".format(prefix, key) if prefix else key
+        if isinstance(value, dict):
+            leaves.extend(_serialised_leaf_paths(value, path))
+        else:
+            leaves.append(path)
+    return leaves
+
+
+def test_every_option_reaches_the_config_file():
+    """``Config``'s fields and the file MCDR writes must be the same set, both ways.
+
+    One direction catches an option that exists but never gets written — an admin would only
+    ever see the documented default and could not change it. The other catches a written key
+    with no field behind it, which ``deserialize`` reports as redundant and discards.
+    """
+    import mod_update_checker as plugin
+
+    from support import option_paths
+
+    fields = set(option_paths(plugin.Config))
+    written = set(_serialised_leaf_paths(plugin.Config.get_default().serialize()))
+
+    assert written - fields == set(), "written but not an option"
+    assert fields - written == set(), "an option that never reaches the file"
+
+
+def test_a_config_file_missing_an_option_is_filled_in_and_rewritten(tmp_path):
+    """Why "my file does not have that option" self-heals, and the reason it is worth knowing.
+
+    MCDR hands ``deserialize`` a callback for missing fields; any miss marks the result
+    imperfect and the file is saved again straight away. So an option added in a later release
+    appears in an upgraded server's file on the next plugin load, keeping whatever the admin
+    had already set.
+
+    Simulated with MCDR's own ``SimpleConfigHandler`` and ``deserialize`` rather than by booting
+    a server, because the behaviour under test is MCDR's and this is exactly the code path
+    ``load_config_simple`` takes.
+    """
+    from mcdreforged.plugin.si._simple_config_handler import SimpleConfigHandler
+
+    import mod_update_checker as plugin
+
+    handler = SimpleConfigHandler("config.json", None, str(tmp_path))
+    path = tmp_path / "config.json"
+
+    stale = plugin.Config.get_default().serialize()
+    del stale["download"]["install_on_stop"]      # as if written before that option existed
+    del stale["sources"]["manual_map"]
+    stale["download"]["folder_name"] = "jars"     # something the admin changed by hand
+    handler.save(stale, encoding="utf8")
+
+    state = {"imperfect": False}
+
+    def note_missing(*_args):
+        state["imperfect"] = True
+
+    config = plugin.Config.deserialize(
+        handler.load(encoding="utf8"),
+        missing_callback=note_missing,
+        redundancy_callback=note_missing,
+    )
+    assert state["imperfect"], "MCDR would not have noticed the file was incomplete"
+    handler.save(config.serialize(), encoding="utf8")
+
+    rewritten = json.loads(path.read_text(encoding="utf-8"))
+    assert rewritten["download"]["install_on_stop"] is False
+    assert rewritten["sources"]["manual_map"] == "project-map.json"
+    assert rewritten["download"]["folder_name"] == "jars", "the admin's own value was lost"

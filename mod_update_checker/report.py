@@ -23,10 +23,11 @@ goes through the plugin's translation catalogue.
 """
 
 import json
+import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from .serverinfo import ServerContext
 
@@ -49,6 +50,7 @@ __all__ = [
     "MATCHED_BY_NAME",
     "MATCHED_BY_MANUAL",
     "MATCHED_BY_NOTEWORTHY",
+    "normalise_name",
     "UpdateEntry",
     "Report",
     "render_summary",
@@ -105,7 +107,29 @@ ACTIONABLE_STATUSES: Tuple[str, ...] = (
 )
 
 #: Display order for a full listing: most urgent first, then the noise, then the good news.
-UPDATE_ENTRY_ORDER: Dict[str, int] = {status: index for index, status in enumerate(ALL_STATUSES)}
+#:
+#: ``update_available`` and ``awaiting_install`` deliberately share a rank, and that is the
+#: whole reason this is written out by hand instead of being derived from :data:`ALL_STATUSES`.
+#: They are one mod in two states — first the newer build exists, then it has been fetched —
+#: and the listing's number is the handle an admin types at the *next* command. Separate ranks
+#: meant that ``!!muc download 1`` moved that mod below every other update and renumbered the
+#: list, so the ``!!muc install 1`` the plugin had just suggested referred to a different mod.
+#: Sharing a rank leaves the position untouched: inside a rank the tie-break is the name, and
+#: fetching a file does not change a mod's name.
+#:
+#: Everything else keeps its status as its rank, and ``tests/test_checker.py`` asserts this
+#: table covers exactly :data:`ALL_STATUSES` — a status left out of it would silently sort last.
+UPDATE_ENTRY_ORDER: Dict[str, int] = {
+    STATUS_UPDATE_AVAILABLE: 0,
+    STATUS_AWAITING_INSTALL: 0,
+    STATUS_NO_COMPATIBLE_BUILD: 1,
+    STATUS_LOCAL_AHEAD: 2,
+    STATUS_UNRESOLVED: 3,
+    STATUS_ERROR: 4,
+    STATUS_NOT_A_MOD: 5,
+    STATUS_UP_TO_DATE: 6,
+    STATUS_IGNORED: 7,
+}
 
 #: Statuses whose next step is on the project page, and only those. An update to fetch, or a
 #: project with nothing published for this server — both end with somebody opening a web page.
@@ -158,6 +182,39 @@ CHAT_PAGE_LINES = 18
 DetailRow = Tuple[str, str, str]
 
 Translator = Callable[..., str]
+
+#: Everything that is not a lowercase letter or a digit, for :func:`normalise_name`.
+_NON_ALNUM = re.compile(r"[^a-z0-9]+")
+
+
+def normalise_name(text: str) -> str:
+    """Lowercase, strip everything that is not alphanumeric. Used to compare names loosely.
+
+    Two callers need exactly this comparison and they must not disagree about it:
+    ``check.ignored_mods``, where ``Fabric-API`` and ``fabricapi`` are the same entry, and the
+    handle lookup, where a reader types ``fabric api`` for a mod listed as ``Fabric-API``.
+
+    It lives here rather than in ``checker.py`` — where it used to — because ``checker`` imports
+    ``report`` and not the other way round, so a shared helper has to sit on this side.
+    ``checker`` re-exports the name, so its callers are unaffected.
+    """
+    return _NON_ALNUM.sub("", (text or "").lower())
+
+
+def _literal_names(entry: "UpdateEntry") -> Set[str]:
+    """Every exact spelling of a mod, lowercased. Empty ones dropped.
+
+    Annotated as a string because ``UpdateEntry`` is declared further down the module and the
+    annotation would otherwise be evaluated before it exists.
+    """
+    names = {entry.mod_id.lower(), entry.name.lower(), entry.file_name.lower()}
+    names.add(Path(entry.file_name).stem.lower())
+    return {name for name in names if name}
+
+
+def _normalised_names(entry: "UpdateEntry") -> Set[str]:
+    """The same spellings run through :func:`normalise_name`."""
+    return {normalise_name(name) for name in _literal_names(entry)} - {""}
 
 
 # --------------------------------------------------------------------------------------
@@ -426,29 +483,61 @@ class Report:
         """
         return list(enumerate(self.sorted_entries(), start=1))
 
-    def entry_by_handle(self, handle: str) -> Optional[UpdateEntry]:
-        """The entry a click or a typed argument refers to.
+    def resolve_handle(self, handle: str) -> Tuple[Optional[UpdateEntry], str]:
+        """The entry a click or a typed argument refers to, plus why it could not be found.
 
-        Accepts the listing's number, or a mod id, or a file name — a player copying either one
-        out of the listing they are looking at should not have to care which form the command
-        wanted. Returns ``None`` rather than raising so the caller can say what it did not find.
+        Four ways to spell a mod are accepted, because all four are what the reader actually has
+        in front of them:
+
+        * the listing's number, which is what the clickable row carries;
+        * the **display name** the row shows — the one spelling a reader is most likely to copy,
+          and the one this used to be missing;
+        * the mod id;
+        * the jar's file name, with or without ``.jar``.
+
+        The first three are matched literally (case-insensitively) before anything fuzzy is
+        tried, so a precise handle can never lose to a lenient comparison. Only then is the
+        forgiving form applied — the same one ``check.ignored_mods`` uses, where ``Fabric-API``
+        and ``fabricapi`` are the same thing — and it has to land on **exactly one** entry.
+        Two mods that normalise to the same string is not a lookup to guess at: guessing wrong
+        means downloading and installing the wrong jar, so the ambiguity is reported instead.
+
+        ``reason`` is ``""`` on success, and otherwise one of ``"empty"``, ``"out-of-range"``,
+        ``"ambiguous"`` or ``"unknown"`` — kept apart so the caller can say which, since "that
+        number does not exist" and "two mods answer to that name" need different next actions.
         """
         text = (handle or "").strip()
         if not text:
-            return None
+            return None, "empty"
+
         if text.isdigit():
             number = int(text)
             for index, entry in self.indexed_entries():
                 if index == number:
-                    return entry
-            return None
+                    return entry, ""
+            return None, "out-of-range"
+
         wanted = text.lower()
         for entry in self.entries:
-            names = {entry.mod_id.lower(), entry.file_name.lower()}
-            names.add(Path(entry.file_name).stem.lower())
-            if wanted in names:
-                return entry
-        return None
+            if wanted in _literal_names(entry):
+                return entry, ""
+
+        normalised = normalise_name(text)
+        if normalised:
+            matches = [entry for entry in self.entries if normalised in _normalised_names(entry)]
+            if len(matches) == 1:
+                return matches[0], ""
+            if matches:
+                return None, "ambiguous"
+
+        return None, "unknown"
+
+    def entry_by_handle(self, handle: str) -> Optional[UpdateEntry]:
+        """The entry for ``handle``, or ``None``.
+
+        The forgiving form of :meth:`resolve_handle` for callers that only need the answer.
+        """
+        return self.resolve_handle(handle)[0]
 
     # -- serialisation -----------------------------------------------------------------
 
@@ -788,15 +877,22 @@ def render_full(report: Report, tr: Translator) -> List[str]:
     return lines
 
 
-def render_index_row(number: int, entry: UpdateEntry, tr: Translator) -> str:
+def render_index_row(number: int, entry: UpdateEntry, tr: Translator, width: int = 0) -> str:
     """One row of the compact listing: ``[ 3] Sodium  1.0.0 -> 1.1.0  (可更新)``.
 
     No links and no notes. That is the whole point: with a project page, a download url and two
     or three notes per mod, a seven-mod server already ran past a screenful, and the detail is
     worth reading for exactly one mod at a time — the one the reader is about to act on.
+
+    ``width`` is the number column's width, computed by the caller from the rows it is about to
+    print. A constant of two produced ``[ 1]`` for a five-mod server, where the padding is
+    simply a gap after the bracket; a constant of one would leave ``[1]`` and ``[10]`` out of
+    line the moment there is a tenth row. Neither constant can be right, because the answer
+    depends on the list — so the list is asked.
     """
+    label = "[{}]".format(str(number).rjust(width) if width else str(number))
     description = _entry_parts(entry, tr, verbose=True)[0]
-    return "[{}] {}".format(str(number).rjust(2), description)
+    return "{} {}".format(label, description)
 
 
 def index_selection(indexed, row_budget: int):
@@ -860,7 +956,13 @@ def render_index(
         return head, [], [tr("report.no_mods")]
 
     shown, omitted = index_selection(indexed, max(1, budget - _INDEX_FIXED_LINES))
-    rows = [(number, entry, render_index_row(number, entry, tr)) for number, entry in shown]
+    # As wide as the largest number actually being printed, so a short list has no padding and
+    # a long one stays aligned. The rows are in ascending order, so the last one is the widest.
+    width = len(str(shown[-1][0])) if shown else 1
+    rows = [
+        (number, entry, render_index_row(number, entry, tr, width))
+        for number, entry in shown
+    ]
 
     tail = [tr("report.index_title", count=len(indexed))]
     if omitted:

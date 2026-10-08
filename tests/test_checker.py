@@ -33,6 +33,7 @@ from mod_update_checker.checker import (
 )
 from mod_update_checker.i18n import make_translator
 from mod_update_checker.report import (
+    ALL_STATUSES,
     CHAT_PAGE_LINES,
     STATUS_AWAITING_INSTALL,
     STATUS_ERROR,
@@ -43,6 +44,7 @@ from mod_update_checker.report import (
     STATUS_UNRESOLVED,
     STATUS_UP_TO_DATE,
     STATUS_UPDATE_AVAILABLE,
+    UPDATE_ENTRY_ORDER,
     Report,
     UpdateEntry,
     entry_detail_rows,
@@ -1303,7 +1305,144 @@ def test_a_filtered_listing_keeps_the_numbers_the_full_one_used():
 
     for number, entry in report.indexed_entries():
         if entry in filtered:
-            assert "[{}] {}".format(str(number).rjust(2), entry.name) in body
+            # Five mods, so the column is one digit wide and carries no padding at all.
+            assert "[{}] {}".format(number, entry.name) in body
+
+
+def test_the_number_column_is_as_wide_as_the_numbers_it_prints():
+    """One digit for a handful of mods, two once there is a tenth.
+
+    Asked of the rows rather than fixed, because neither constant is right: a width of two put
+    a visible gap after the bracket on a five-mod server, and a width of one leaves ``[1]`` and
+    ``[10]`` out of line the moment a tenth row exists.
+    """
+    tr = make_translator("zh_cn")
+
+    short = "\n".join(render_index_body(_index_report(_many(actionable=2, up_to_date=3)), tr))
+    assert "[1] " in short
+    assert "[ 1]" not in short
+
+    long_list = "\n".join(
+        render_index_body(_index_report(_many(up_to_date=12)), tr, budget=40)
+    )
+    assert "[ 1] " in long_list
+    assert "[10] " in long_list
+
+
+def test_downloading_a_mod_does_not_move_it_in_the_listing():
+    """The bug this fix exists for, stated as the sequence that produced it.
+
+    ``!!muc download 1`` followed by ``!!muc install 1`` is the two-step the plugin itself
+    prints. Between them the mod becomes ``awaiting_install`` — a different status — and while
+    that status had its own rank in the listing order, the whole list renumbered: the ``1`` the
+    plugin had just told the admin to type now meant a different mod, and ``install 1``
+    answered "that one has not been downloaded".
+
+    The listing's number is a handle, so it has to survive the state change it is used to cause.
+    """
+    report = _index_report(_many(actionable=3))
+    before = {number: entry.file_name for number, entry in report.indexed_entries()}
+
+    # Exactly what ``_reconcile_downloads`` does to the entry once its build is on disk.
+    report.entries[0].status = STATUS_AWAITING_INSTALL
+
+    after = {number: entry.file_name for number, entry in report.indexed_entries()}
+
+    assert after == before
+    assert report.entry_by_handle("1") is report.entries[0]
+
+
+def test_the_sort_order_covers_every_status():
+    """A status missing from the table sorts last (``.get(status, 99)``) instead of erroring.
+
+    Which means a newly added status would quietly sink below "up to date" — the listing's
+    whole purpose is to put what needs doing at the top. Cheaper to assert than to notice.
+    """
+    assert set(UPDATE_ENTRY_ORDER) == set(ALL_STATUSES)
+
+
+def test_a_mod_can_be_looked_up_by_the_name_the_listing_shows():
+    """The row says ``Lithium``; typing ``Lithium`` has to work.
+
+    It is the spelling in front of the reader, and it was the one form the lookup did not
+    accept — only the mod id, the file name and the number were.
+
+    The fixture's mod id and file name are deliberately *unlike* the display name. A mod whose
+    id happens to equal its name would resolve through the id and the test would pass without
+    the name ever being consulted — which is what an earlier version of this test did.
+    """
+    report = _index_report(
+        [_entry_with_links("lithium_mod", STATUS_UPDATE_AVAILABLE, name="Lithium")]
+    )
+    entry = report.entries[0]
+
+    for handle in ("Lithium", "lithium", "LITHIUM"):
+        assert report.resolve_handle(handle) == (entry, ""), handle
+    # The handles that always worked still do.
+    for handle in ("lithium_mod", "lithium_mod.jar", "1"):
+        assert report.resolve_handle(handle) == (entry, ""), handle
+
+
+def test_a_handle_forgives_case_spaces_and_punctuation():
+    """The same leniency ``check.ignored_mods`` has, because the reason is the same.
+
+    An admin looking at a mod listed as ``Applied Energistics 2`` should not have to reproduce
+    the exact spacing, and the id here is ``ae2`` so nothing but the name can answer.
+    """
+    report = _index_report(
+        [_entry_with_links("ae2", STATUS_UPDATE_AVAILABLE, name="Applied Energistics 2")]
+    )
+    entry = report.entries[0]
+
+    for handle in ("applied energistics 2", "applied-energistics-2", "AppliedEnergistics2"):
+        assert report.resolve_handle(handle) == (entry, ""), handle
+
+
+def test_an_ambiguous_name_is_refused_rather_than_guessed():
+    """Two mods that normalise to the same string is not a lookup to guess at.
+
+    Guessing wrong means downloading and installing the wrong jar, so the ambiguity is reported
+    and the caller can say so. Note that the *exact* spellings still resolve — the lenient
+    comparison only runs when nothing matched literally, so a precise handle never loses.
+    """
+    report = _index_report(
+        [
+            _entry_with_links("alpha_one", STATUS_UPDATE_AVAILABLE, name="Alpha Mod"),
+            _entry_with_links("alpha_two", STATUS_UPDATE_AVAILABLE, name="Alpha-Mod"),
+        ]
+    )
+
+    assert report.resolve_handle("Alpha Mod")[0] is report.entries[0]
+    assert report.resolve_handle("Alpha-Mod")[0] is report.entries[1]
+
+    entry, reason = report.resolve_handle("alphamod")
+    assert entry is None and reason == "ambiguous"
+
+
+def test_a_handle_is_matched_exactly_before_leniently():
+    """``sodium.jar`` must reach the jar, even when a mod is *named* "sodium.jar".
+
+    The loose comparison would happily match either, so the order of the two passes is the
+    thing being asserted — not the comparison itself.
+    """
+    report = _index_report(
+        [
+            _entry_with_links("first", STATUS_UPDATE_AVAILABLE, name="sodium.jar"),
+            _entry_with_links("second", STATUS_UPDATE_AVAILABLE, name="Second"),
+        ]
+    )
+    report.entries[1].file_name = "sodium.jar"
+
+    assert report.resolve_handle("sodium.jar")[0] is report.entries[0]
+
+
+def test_the_reason_a_handle_failed_is_told_apart():
+    """Four failures, four sentences, because they lead to four different next actions."""
+    report = _index_report(_many(actionable=2))
+
+    assert report.resolve_handle("") == (None, "empty")
+    assert report.resolve_handle("99") == (None, "out-of-range")
+    assert report.resolve_handle("no such mod") == (None, "unknown")
 
 
 def test_an_entry_can_be_looked_up_by_number_or_by_name():

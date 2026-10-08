@@ -158,21 +158,32 @@ COMMANDS = [
     "!!modupdate status",
     "!!modupdate list",
     "!!modupdate list update_available",
-    # The listing is a numbered index now; this is the click target on one of its rows.
+    # The listing is a numbered index now; this is the click target on one of its rows. A
+    # number is deliberate here — it is the one place the number path is exercised for real.
     "!!modupdate info 1",
     "!!modupdate reload",
     "!!muc help",
     # --- the on-demand pair, staged and confirmed -------------------------------------
-    # 1 is an update whose bytes never match, so the confirm below really does open a socket
-    # and really is refused — and nothing lands in the download folder either way.
-    "!!muc download 1",
+    #
+    # Addressed by **name**, not by number, and that is the point rather than a convenience:
+    # the listing's numbers depend on what the automatic pass has already fetched, which is a
+    # fact about timing. These four commands exist to exercise the two-step flow for three
+    # specific mods — one whose bytes never match, one not downloaded, one already fetched —
+    # and a number would silently start meaning a different mod the moment anything about the
+    # ordering changed. That is exactly what happened when the numbering was fixed, and the run
+    # failed for it. Naming them also means a real MCDR parses a multi-word name through the
+    # command tree's ``GreedyText`` argument, which nothing else covers.
+    #
+    # Tampered's bytes never match, so the confirm below really does open a socket and really
+    # is refused — and nothing lands in the download folder either way.
+    "!!muc download Tampered Mod",
     "!!muc confirm",
     # Not downloaded: must point at ``download`` rather than stage anything.
-    "!!muc install 1",
-    "!!muc install 5",
+    "!!muc install Tampered Mod",
+    "!!muc install Blocked Mod",
     # Staged and deliberately NOT confirmed in the default run: confirming it would authorise
     # an install, which would move the file the download assertions above are looking at.
-    "!!muc install 2",
+    "!!muc install Flaky Mod",
     "!!modupdate check",
 ]
 
@@ -206,8 +217,11 @@ COMMAND_EXPECTATIONS = {
     "download_staged": "内输入 !!muc confirm 确认",
     # The confirm really fetched and really gave up: the served bytes never match their hash.
     "download_refused": "失败",
-    "install_wants_download": "还没下载。请先输入 !!muc download 1",
-    "install_refused_status": "当前状态是「无适配构建」",
+    # Named, so the sentence is pinned to the mod it is about. The number it ends with is
+    # deliberately not pinned here — that number is the listing's, and ``tests/test_mcdr_entry``
+    # checks it is the right one without this file having to know the ordering.
+    "install_wants_download": "Tampered Mod 的新版本还没下载。请先输入 !!muc download ",
+    "install_refused_status": "Blocked Mod 当前状态是「无适配构建」",
     "install_staged": "即将安排安装",
     "install_authorised": "已授权",
 }
