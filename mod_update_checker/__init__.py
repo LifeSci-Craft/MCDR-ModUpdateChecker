@@ -128,6 +128,20 @@ DOWNLOAD_LOG_LIMIT = 20
 #: ``!!muc confirm`` typed days later would act on a plan nobody remembers making.
 CONFIRM_TIMEOUT_SECONDS = 120
 
+#: The word ``!!muc download`` and ``!!muc install`` take instead of a mod: ``all``.
+#:
+#: A reserved word rather than a lookup, deliberately — it has to mean the whole list even on
+#: a server that happens to ship a mod named "all". Such a mod is still reachable by its
+#: number, and a number is what the listing offers anyway.
+ALL_TARGET = "all"
+
+#: How many mods a bulk plan lists by name before collapsing the rest into "and N more".
+#:
+#: The plan exists so the admin can see what they are about to approve; a forty-mod server
+#: cannot show forty rows without pushing the question off the screen, and a number plus the
+#: count is enough to decide with.
+BULK_PLAN_ROWS = 8
+
 
 class _Grouped(Serializable):
     """A config section whose subsections are rebuilt on every construction.
@@ -738,7 +752,14 @@ def _run_check(
         # otherwise be announced as "not yet downloaded" and then downloaded, which makes the
         # report wrong the instant it is printed. The cost is waiting for the transfers, so a
         # line saying how many are starting goes out first.
-        _reconcile_downloads(server, report, config)
+        fetched, fetched_bytes = _reconcile_downloads(server, report, config)
+
+        # Its own line, right after the transfers it is about, and before the summary: an admin
+        # who stepped away while the files were coming down needs exactly one sentence saying
+        # they arrived and what to do next, and it reads in the wrong order if it ends up below
+        # a state description it is not part of.
+        if fetched:
+            _announce_download_complete(server, fetched, fetched_bytes, broadcast=broadcast)
 
         # After the download reconciliation, so the comparison describes the report as it will
         # be read: a build that was fetched just now is no longer "an update available".
@@ -929,18 +950,24 @@ def _sync_download_state(
 
 def _reconcile_downloads(
     server: PluginServerInterface, report: Report, config: Config
-) -> None:
+) -> Tuple[int, int]:
     """Bring the download folder and the report into agreement, fetching what is missing.
 
     Wholly self-contained. The check has already succeeded by the time this runs, so nothing in
     here — a misconfigured folder, an unreachable host, a full disk, a bug in the summary
     formatting — may turn a successful check into a reported failure.
+
+    Returns ``(count, bytes)`` for the files that were **newly** fetched, which is what the
+    completion notice is about: a file that was already sitting in the folder is not news, and
+    announcing it again on every run is how the notice would become noise.
     """
     http: Optional[HttpClient] = None
+    fetched_count = 0
+    fetched_bytes = 0
     try:
         folder, ledger = _sync_download_state(server, report, config)
         if folder is None or not config.download.enabled:
-            return
+            return 0, 0
 
         waiting = report.updates
         if waiting:
@@ -958,12 +985,57 @@ def _reconcile_downloads(
         # Anything that just arrived is no longer an update to fetch; it is ready to install.
         classify_downloaded(report.entries, folder, ledger)
         _log_download_outcomes(server, report, outcomes, folder)
+        arrived = [outcome for outcome in outcomes if outcome.status == STATUS_DOWNLOADED]
+        fetched_count = len(arrived)
+        fetched_bytes = sum(outcome.bytes_written or 0 for outcome in arrived)
     except Exception as error:  # noqa: BLE001 - see the docstring
         server.logger.warning(tr("download.crashed", error="{}: {}".format(
             type(error).__name__, error)))
     finally:
         if http is not None:
             http.close()
+    return fetched_count, fetched_bytes
+
+
+def _announce_download_complete(
+    server: PluginServerInterface, count: int, size: int, broadcast: bool = True
+) -> None:
+    """Say that files landed during a check, and what the admin can do about them.
+
+    Written for the moment, not for the state: the summary that follows describes where things
+    stand, while this says something *finished* — and the one thing a reader needs from that is
+    the next command, which the summary does not spell out in the same breath. It also names
+    the automatic setting when it is on, because on such a server "install them" is already
+    handled and telling the admin to do it would be telling them to do nothing.
+
+    The in-game half is deliberately **not** gated on ``report.in_game``. That setting governs
+    announcements that an update *exists* — information that is equally true tomorrow, and that
+    the admin also gets at their next login. This is news that this server's own files changed
+    a moment ago, the same category as the summary of what the last stop installed, which
+    reaches the same people the same way. The audience is still the permission-gated one; a
+    player who cannot act on it is not told.
+    """
+    server.logger.info(tr("download.complete", count=count, size=_format_size(size)))
+    if _config.download.install_on_stop:
+        server.logger.info(tr("download.complete_automatic"))
+    else:
+        server.logger.info(
+            tr("download.complete_manual", command=ROOT_LITERALS[0] + " install")
+        )
+
+    if not broadcast or not (_server_running(server) and _online_players):
+        return
+
+    lines = [tr("download.complete_in_game", count=count, size=_format_size(size))]
+    lines.append(
+        tr("download.complete_in_game_automatic")
+        if _config.download.install_on_stop
+        else tr("download.complete_in_game_manual")
+    )
+    for name in _permitted_players(
+        server, sorted(_online_players), _config.report.in_game_permission
+    ):
+        _tell_player(server, name, lines)
 
 
 # --------------------------------------------------------------------------------------
@@ -1836,6 +1908,32 @@ def _stage_action(
     _reply_lines(source, lines)
 
 
+def _stage_batch(
+    kind: str, source: CommandSource, files: Sequence[str], lines: Sequence[str]
+) -> None:
+    """``_stage_action`` for the bulk commands: the payload is a set of file names.
+
+    Names rather than numbers, for the same reason the single form stores one: a check can
+    finish between stage and confirm, and the whole batch is re-derived from the current report
+    before anything happens. A number that moved is one problem; a batch that silently grew or
+    shrank is worse, because it either spends bandwidth the admin never agreed to or leaves out
+    part of what they did. Comparing names is what makes "the same mods" mean the same thing
+    across two reports.
+    """
+    global _pending_action
+    with _pending_lock:
+        superseded = _pending_action is not None
+        _pending_action = {
+            "kind": kind,
+            "files": sorted(files),
+            "requester": _requester(source),
+            "deadline": time.monotonic() + CONFIRM_TIMEOUT_SECONDS,
+        }
+    if superseded:
+        source.reply(tr("command.action.superseded"))
+    _reply_lines(source, lines)
+
+
 def _pending_action_for(source: CommandSource) -> Optional[Dict[str, Any]]:
     """The staged action, or ``None`` after explaining why there is nothing to confirm.
 
@@ -1860,7 +1958,7 @@ def _pending_action_for(source: CommandSource) -> Optional[Dict[str, Any]]:
 
 
 def _manual_download(source: CommandSource, handle: str, prefix: str) -> None:
-    """``download <编号|Mod 名>`` — stage a fetch of one mod's newer build.
+    """``download <编号|Mod 名|all>`` — stage a fetch of one mod, or of every mod that needs one.
 
     Works with ``download.enabled`` off, which is the point: the automatic setting answers
     "fetch everything you find", and an admin who wants one mod now should not have to switch it
@@ -1873,6 +1971,9 @@ def _manual_download(source: CommandSource, handle: str, prefix: str) -> None:
     text = (handle or "").strip()
     if not text:
         source.reply(tr("command.download.usage", command=prefix))
+        return
+    if text.lower() == ALL_TARGET:
+        _manual_download_all(source, prefix)
         return
     entry = _resolve_handle(source, report, text)
     if entry is None:
@@ -1900,6 +2001,61 @@ def _manual_download(source: CommandSource, handle: str, prefix: str) -> None:
     )
 
 
+def _download_all_candidates(report: Report) -> Tuple[List[UpdateEntry], List[UpdateEntry]]:
+    """Split the pending updates into what can be fetched and what cannot.
+
+    The second list is what keeps the plan honest. A project can publish a version whose files
+    were all withdrawn, and the platform then hands us a version with nothing to fetch — the
+    plan says how many were passed over instead of quietly listing fewer mods than the report
+    shows. Both lists are returned rather than only the fetchable one so the caller can say so.
+    """
+    candidates: List[UpdateEntry] = []
+    blocked: List[UpdateEntry] = []
+    for entry in report.updates:
+        if entry.download_url and entry.download_sha1:
+            candidates.append(entry)
+        else:
+            blocked.append(entry)
+    return candidates, blocked
+
+
+def _manual_download_all(source: CommandSource, prefix: str) -> None:
+    """``download all`` — stage one fetch covering every mod that has something to fetch."""
+    report = _last_report
+    if report is None:
+        source.reply(tr("command.no_report_yet"))
+        return
+
+    candidates, blocked = _download_all_candidates(report)
+    if not candidates:
+        source.reply(
+            tr("command.download.all_no_files", count=len(blocked))
+            if blocked
+            else tr("command.download.all_none")
+        )
+        return
+
+    known = sum(entry.download_size or 0 for entry in candidates)
+    unknown = sum(1 for entry in candidates if not entry.download_size)
+    lines = [
+        tr("command.download.all_header_unknown", count=len(candidates), unknown=unknown)
+        if unknown
+        else tr("command.download.all_header", count=len(candidates),
+                size=_format_size(known))
+    ]
+    for entry in candidates[:BULK_PLAN_ROWS]:
+        lines.append(tr("line.update", name=entry.name, local=entry.local_version or "?",
+                        latest=entry.latest_version or "?"))
+    if len(candidates) > BULK_PLAN_ROWS:
+        lines.append(tr("report.and_more", count=len(candidates) - BULK_PLAN_ROWS))
+    if blocked:
+        lines.append(tr("command.download.all_skipped", count=len(blocked)))
+    lines.append(tr("command.action.ask", seconds=CONFIRM_TIMEOUT_SECONDS,
+                    command=prefix + " confirm"))
+
+    _stage_batch("download_all", source, [entry.file_name for entry in candidates], lines)
+
+
 def _download_blocker(entry: UpdateEntry, prefix: str, number: Optional[int]) -> Optional[str]:
     """Why this entry cannot be fetched, or ``None`` when it can.
 
@@ -1925,7 +2081,7 @@ def _download_blocker(entry: UpdateEntry, prefix: str, number: Optional[int]) ->
 
 
 def _manual_install(source: CommandSource, handle: str, prefix: str) -> None:
-    """``install <编号>`` — authorise one downloaded build for the next stop.
+    """``install <编号|Mod 名|all>`` — authorise downloaded builds for the next stop.
 
     The build has to be on disk already: fetching is ``!!muc download``'s job, and letting this
     command imply it would make the two-step form ambiguous about what is being confirmed.
@@ -1937,6 +2093,9 @@ def _manual_install(source: CommandSource, handle: str, prefix: str) -> None:
     text = (handle or "").strip()
     if not text:
         source.reply(tr("command.install.usage", command=prefix))
+        return
+    if text.lower() == ALL_TARGET:
+        _manual_install_all(source, prefix)
         return
     entry = _resolve_handle(source, report, text)
     if entry is None:
@@ -1969,10 +2128,41 @@ def _manual_install(source: CommandSource, handle: str, prefix: str) -> None:
     _stage_action("install", source, report, entry, lines)
 
 
+def _manual_install_all(source: CommandSource, prefix: str) -> None:
+    """``install all`` — stage the authorisation of every downloaded build."""
+    report = _last_report
+    if report is None:
+        source.reply(tr("command.no_report_yet"))
+        return
+
+    pending = report.awaiting_install
+    if not pending:
+        source.reply(tr("command.install.all_none"))
+        return
+
+    lines = [tr("command.install.all_header", count=len(pending))]
+    for entry in pending[:BULK_PLAN_ROWS]:
+        lines.append(tr("command.install.plan_swap", old=entry.file_name,
+                        new=safe_jar_name(entry.download_filename,
+                                          entry.fallback_file_name())))
+    if len(pending) > BULK_PLAN_ROWS:
+        lines.append(tr("report.and_more", count=len(pending) - BULK_PLAN_ROWS))
+    if _config.download.install_on_stop:
+        lines.append(tr("command.install.plan_already_automatic"))
+    lines.append(tr("command.action.ask", seconds=CONFIRM_TIMEOUT_SECONDS,
+                    command=prefix + " confirm"))
+
+    _stage_batch("install_all", source, [entry.file_name for entry in pending], lines)
+
+
 def _manual_confirm(source: CommandSource, prefix: str) -> None:
     """``confirm`` — carry out whatever ``download`` or ``install`` staged."""
     pending = _pending_action_for(source)
     if pending is None:
+        return
+
+    if pending["kind"] in ("download_all", "install_all"):
+        _confirm_batch(source, pending, prefix)
         return
 
     report = _last_report
@@ -1990,6 +2180,93 @@ def _manual_confirm(source: CommandSource, prefix: str) -> None:
         _confirmed_download(source, entry, number, prefix)
     else:
         _confirmed_install(source, entry, prefix)
+
+
+def _confirm_batch(source: CommandSource, pending: Dict[str, Any], prefix: str) -> None:
+    """Carry out a staged bulk action, after re-deriving it from the current report.
+
+    The *set* is compared rather than a single handle, because "these mods" is what the admin
+    approved. Comparing a count would not do either: two swapped entries keep the count and
+    change the work. Anything other than an exact match is dropped whole — running the
+    intersection and reporting success would leave part of the batch silently undone, which is
+    worse than asking for the command again.
+    """
+    kind = pending["kind"]
+    report = _last_report
+    if kind == "download_all":
+        entries: List[UpdateEntry] = (
+            _download_all_candidates(report)[0] if report is not None else []
+        )
+    else:
+        entries = list(report.awaiting_install) if report is not None else []
+
+    if sorted(entry.file_name for entry in entries) != pending["files"]:
+        _clear_pending()
+        source.reply(tr("command.action.stale_batch",
+                        command="{} {}".format(prefix, kind.split("_", 1)[0])))
+        return
+
+    if kind == "download_all":
+        _clear_pending()
+        _confirmed_download_all(source, entries, prefix)
+    else:
+        _confirmed_install_all(source, entries, prefix)
+
+
+def _confirmed_download_all(
+    source: CommandSource, entries: Sequence[UpdateEntry], prefix: str
+) -> None:
+    """Run the batch fetch on its own thread, for the same reason the single form does.
+
+    One transfer at a time inside that thread: the downloader is sequential by design, and a
+    batch is exactly the case where twenty parallel connections would be a worse neighbour.
+    """
+    source.reply(tr("command.download.batch_started", count=len(entries)))
+
+    def run() -> None:
+        try:
+            outcomes = _perform_manual_downloads(entries)
+        except Exception as error:  # noqa: BLE001 - a failure must not take the server down
+            server = _server
+            if server is not None:
+                server.logger.exception("batch download failed")
+            _reply_to(source, tr("command.download.batch_failed", reason="{}: {}".format(
+                type(error).__name__, error)))
+            return
+        if outcomes is None:
+            _reply_to(source, tr("command.download.batch_failed",
+                                 reason=tr("command.download.bad_folder")))
+            return
+
+        server = _server
+        if server is not None and _last_report is not None:
+            folder, _reason = resolve_download_folder(server, _config)
+            if folder is not None:
+                # The same lines the automatic pass prints, so a batch started by hand leaves
+                # the same trace in the console as one the schedule started.
+                _log_download_outcomes(server, _last_report, outcomes, folder)
+
+        counts = {status: 0 for status in (STATUS_DOWNLOADED, STATUS_ALREADY_PRESENT,
+                                           STATUS_SKIPPED, STATUS_FAILED)}
+        for outcome in outcomes:
+            counts[outcome.status] = counts.get(outcome.status, 0) + 1
+        _reply_to(source, tr("command.download.batch_done",
+                             downloaded=counts[STATUS_DOWNLOADED],
+                             existing=counts[STATUS_ALREADY_PRESENT],
+                             failed=counts[STATUS_FAILED],
+                             skipped=counts[STATUS_SKIPPED]))
+        failed = [outcome.name for outcome in outcomes if outcome.status == STATUS_FAILED]
+        if failed:
+            _reply_to(source, tr("command.download.batch_failed_names",
+                                 names=", ".join(failed[:5])))
+        if counts[STATUS_DOWNLOADED] or counts[STATUS_ALREADY_PRESENT]:
+            _reply_to(source, tr("command.download.batch_hint",
+                                 command="{} install all".format(prefix)))
+
+    threading.Thread(
+        target=run, name="mod_update_checker_batch_download", daemon=True
+    ).start()
+
 
 def _confirmed_download(
     source: CommandSource, entry: UpdateEntry, number: int, prefix: str
@@ -2030,8 +2307,15 @@ def _confirmed_download(
     ).start()
 
 
-def _perform_manual_download(entry: UpdateEntry) -> Optional[DownloadOutcome]:
-    """Fetch one entry, outside the check run. ``None`` when the folder is unusable."""
+def _perform_manual_downloads(
+    entries: Sequence[UpdateEntry],
+) -> Optional[List[DownloadOutcome]]:
+    """Fetch these entries, outside the check run. ``None`` when the folder is unusable.
+
+    One function for the single and the bulk form, because the mechanics — the size limit, the
+    retry budget, the ledger, the folder — must not be able to disagree between two commands
+    that differ only in how many mods they were pointed at.
+    """
     server = _server
     assert server is not None
     folder, _reason = resolve_download_folder(server, _config)
@@ -2048,17 +2332,24 @@ def _perform_manual_download(entry: UpdateEntry) -> Optional[DownloadOutcome]:
     )
     http = _make_http_client(_config)
     try:
-        outcomes = Downloader(
-            http, options, logger=server.logger, ledger=ledger
-        ).run([entry])
-        # The build is on disk now, so it stops being "an update to fetch". Done here rather
+        wanted = list(entries)
+        outcomes = Downloader(http, options, logger=server.logger, ledger=ledger).run(wanted)
+        # The builds are on disk now, so they stop being "updates to fetch". Done here rather
         # than left to the next check so the very next ``!!muc list`` shows the new state.
-        classify_downloaded([entry], folder, ledger)
-        if entry.status == STATUS_AWAITING_INSTALL and _last_report is not None:
+        classify_downloaded(wanted, folder, ledger)
+        if _last_report is not None:
             _last_report.download_folder = str(folder)
     finally:
         http.close()
         ledger.save()
+    return outcomes
+
+
+def _perform_manual_download(entry: UpdateEntry) -> Optional[DownloadOutcome]:
+    """The single-mod form, kept as its own seam so a test can stand in for one fetch."""
+    outcomes = _perform_manual_downloads([entry])
+    if outcomes is None:
+        return None
     for outcome in outcomes:
         if outcome.file_name == entry.file_name:
             return outcome
@@ -2090,6 +2381,38 @@ def _confirmed_install(
     source.reply(tr("command.install.approved", name=entry.name,
                     version=entry.latest_version or "?",
                     command="{} status".format(prefix)))
+
+
+def _confirmed_install_all(
+    source: CommandSource, entries: Sequence[UpdateEntry], prefix: str
+) -> None:
+    """Authorise a whole batch — one ledger record at a time.
+
+    Records rather than a flag flipped over the ledger, for the same reason the single form
+    refuses to widen into the whole set: the ledger is also the work list the *next stop* will
+    read, so marking all of it would authorise builds this command was never about — including
+    ones fetched on a day the admin has forgotten about. A record that cannot be found is
+    reported rather than created, because approving a file that nothing on disk claims would
+    authorise an install that may have nothing to install.
+    """
+    server = _server
+    assert server is not None
+    ledger = DownloadLedger(
+        Path(server.get_data_folder()) / DOWNLOAD_LEDGER_FILE_NAME, logger=server.logger
+    )
+    approved: List[UpdateEntry] = []
+    missing: List[UpdateEntry] = []
+    for entry in entries:
+        (approved if ledger.approve(entry_key(entry)) else missing).append(entry)
+    ledger.save()
+    _clear_pending()
+
+    if approved:
+        source.reply(tr("command.install.all_approved", count=len(approved),
+                        command="{} status".format(prefix)))
+    if missing:
+        source.reply(tr("command.install.all_missing", count=len(missing),
+                        names=", ".join(entry.name for entry in missing[:5])))
 
 
 def _reply_to(source: CommandSource, message: str) -> None:

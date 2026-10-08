@@ -364,3 +364,44 @@ def test_every_option_the_config_has_is_written_down_somewhere():
     )
 
     assert unexplained == [], "options nobody documents: {}".format(unexplained)
+
+
+#: Extensions that are not text and therefore not expected to be LF. ``.mcdr`` is a zip with a
+#: different name; the rest are assets.
+_BINARY_SUFFIXES = frozenset({".mcdr", ".jar", ".png", ".zip", ".pyc", ".pyo"})
+
+#: Directories that are not part of the source: the object store, the unpacked test
+#: dependencies, and the caches.
+_NOT_SOURCE = frozenset({".git", ".testlibs", "__pycache__", ".pytest_cache"})
+
+
+def test_no_source_file_carries_windows_line_endings():
+    """``.gitattributes`` declares ``eol=lf``; the working tree has to agree with it.
+
+    Git normalises on commit, so a CRLF file is invisible in the history — and that is exactly
+    why this needs asserting rather than trusting. The damage is elsewhere: a script that reads
+    a file and writes it back (the injection helpers in ``bench/`` do precisely that) flips the
+    whole file to CRLF on Windows without changing one character of its content, and the next
+    diff is a wall of warnings over a file nobody edited. It also cost a round of confusing
+    ``git status`` noise once: the files were listed as modified while ``git diff`` printed
+    nothing, because only the stat cache had noticed.
+
+    Scanned rather than derived from ``git ls-files --eol``, because the failure this guards
+    against happens *before* a commit — at the moment the file is on disk and wrong.
+    """
+    import os
+
+    offenders = []
+    for root, dirnames, filenames in os.walk(REPO):
+        dirnames[:] = [name for name in dirnames if name not in _NOT_SOURCE]
+        for name in filenames:
+            path = Path(root) / name
+            if path.suffix.lower() in _BINARY_SUFFIXES:
+                continue
+            try:
+                if b"\r\n" in path.read_bytes():
+                    offenders.append(str(path.relative_to(REPO)))
+            except OSError:
+                continue
+
+    assert offenders == [], "CRLF line endings in: {}".format(offenders)

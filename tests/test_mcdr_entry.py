@@ -666,13 +666,18 @@ def entry_env(tmp_path, monkeypatch):
     from mod_update_checker.scanner import resolve_mods_directory
 
     # Only two departures from the shipped defaults here; everything else this fixture used to
-    # spell out was already the default, and saying so twice is how a stub drifts.
+    # spell out was already the default, and saying so twice is how a stub drifts. The language
+    # is pinned for the same reason ``_manual_env`` pins it: the translator is module state, so
+    # a fixture that leaves it alone makes every assertion below depend on which test ran first
+    # — a green suite one day and a red one the next, depending on the collection order.
     monkeypatch.setattr(
         plugin,
         "_config",
-        _config_with({"report.in_game": True, "report.reuse_report_minutes": 30}),
+        _config_with({"report.in_game": True, "report.reuse_report_minutes": 30,
+                      "language": "zh_cn"}),
         raising=False,
     )
+    plugin._apply_language(None, plugin._config)
     monkeypatch.setattr(
         sys.modules[__name__],
         "_MODS_DIRECTORY",
@@ -1838,6 +1843,336 @@ def test_the_console_counts_as_its_own_requester(tmp_path, monkeypatch):
     assert "只有本人可以确认" in player.body, player.body
 
 
+# --------------------------------------------------------------------------------------
+# The bulk forms: ``download all`` / ``install all``
+#
+# A batch is a different promise from a single mod: instead of "this one", the admin approves
+# a *set*. So the tests below are about the set surviving whatever happens between the two
+# commands, about a batch never widening into the ledger, and about ``all`` being a word with
+# one meaning rather than sometimes-a-mod.
+# --------------------------------------------------------------------------------------
+
+
+def _bulk_entry(mod_id, name, file_name, status="update_available", latest="1.1.0",
+                downloadable=True):
+    """One report entry, with all three spellings deliberately different.
+
+    ``id``, ``file name`` and ``display name`` are unrelated on purpose: a test whose entry is
+    named after its own id can pass through the id path whatever happened to the name path —
+    this suite has made exactly that mistake once already (v1.2.0).
+    """
+    from mod_update_checker.report import UpdateEntry
+
+    entry = UpdateEntry(
+        mod_id=mod_id, name=name, file_name=file_name,
+        local_version="1.0.0", latest_version=latest, status=status,
+    )
+    if downloadable:
+        entry.download_url = "https://cdn.example/" + file_name
+        entry.download_filename = "{}-{}.jar".format(mod_id, latest)
+        entry.download_sha1 = "b" * 40
+        entry.download_size = 2048
+    return entry
+
+
+def _bulk_env(tmp_path, monkeypatch, entries):
+    """The plugin wired to a fake server whose report holds exactly ``entries``."""
+    import mod_update_checker as plugin
+
+    monkeypatch.setattr(plugin, "_config", _config_with({"language": "zh_cn"}), raising=False)
+    plugin._apply_language(None, plugin._config)
+    plugin._stop_event.clear()
+    plugin._clear_pending()
+
+    server = _FakeServer(tmp_path, levels={"Admin": 4})
+    monkeypatch.setattr(plugin, "_last_report", _report_with(entries), raising=False)
+    monkeypatch.setattr(plugin, "_server", server, raising=False)
+    return plugin, server, _PlayerSource("Admin")
+
+
+def test_download_all_stages_one_plan_for_every_fetchable_mod(tmp_path, monkeypatch):
+    """One confirmation for the lot, and the plan names what it is about.
+
+    The un-fetchable update is counted out loud rather than dropped: a plan that quietly covers
+    fewer mods than the report lists is how an admin comes to believe a mod was fetched.
+    """
+    fetchable = _bulk_entry("sodium", "Sodium", "sodium.jar")
+    second = _bulk_entry("lithium", "Lithium", "lithium.jar")
+    withdrawn = _bulk_entry("withdrawn", "Withdrawn", "withdrawn.jar", downloadable=False)
+    settled = _bulk_entry("iris", "Iris", "iris.jar", status="up_to_date")
+
+    plugin, _server, source = _bulk_env(
+        tmp_path, monkeypatch, [fetchable, second, withdrawn, settled]
+    )
+    monkeypatch.setattr(
+        plugin, "_perform_manual_downloads",
+        lambda items: pytest.fail("the batch ran before it was confirmed"), raising=False,
+    )
+
+    plugin._manual_download(source, "all", "!!muc")
+
+    assert plugin._pending_action["kind"] == "download_all"
+    assert plugin._pending_action["files"] == ["lithium.jar", "sodium.jar"]
+    assert "Sodium" in source.body and "Lithium" in source.body
+    assert "下载 2 个" in source.body, source.body
+    assert "1 个更新没有可下载的文件" in source.body, source.body
+    assert "!!muc confirm" in source.body
+
+
+def test_download_all_with_nothing_to_fetch_says_which_case_it_is(tmp_path, monkeypatch):
+    """Two empty answers, because they are two different situations.
+
+    "Nothing is pending" is a server that is up to date. "Nothing *fetchable*" is a platform
+    that published a version whose files were withdrawn — and an admin told the first while
+    the second is true stops looking for a problem that does not exist.
+    """
+    settled = _bulk_entry("iris", "Iris", "iris.jar", status="up_to_date")
+    plugin, _server, source = _bulk_env(tmp_path, monkeypatch, [settled])
+
+    plugin._manual_download(source, "all", "!!muc")
+
+    assert "没有待下载的更新" in source.body, source.body
+    assert plugin._pending_action is None
+
+    plugin._last_report = _report_with(
+        [_bulk_entry("withdrawn", "Withdrawn", "withdrawn.jar", downloadable=False)]
+    )
+    source.replies.clear()
+
+    plugin._manual_download(source, "all", "!!muc")
+
+    assert "都没有提供可下载的文件" in source.body, source.body
+    assert plugin._pending_action is None
+
+
+def test_confirm_runs_the_whole_batch_and_reports_it(tmp_path, monkeypatch):
+    """The outcome is a summary rather than a line per mod, and it names the next command."""
+    from mod_update_checker.downloads import STATUS_DOWNLOADED, STATUS_FAILED
+
+    first = _bulk_entry("sodium", "Sodium", "sodium.jar")
+    second = _bulk_entry("lithium", "Lithium", "lithium.jar")
+    plugin, _server, source = _bulk_env(tmp_path, monkeypatch, [first, second])
+
+    class _Outcome:
+        def __init__(self, file_name, name, status):
+            self.file_name, self.name, self.status = file_name, name, status
+            self.path = "config/mod_update_checker/downloads/" + file_name
+            self.detail = ""
+            self.bytes_written = 0
+
+    def stand_in(entries):
+        # Every candidate arrives at the downloader — a batch that quietly dropped one is the
+        # failure this test exists to catch, and it would be invisible from the summary alone.
+        assert {entry.file_name for entry in entries} == {"lithium.jar", "sodium.jar"}
+        return [
+            _Outcome("sodium.jar", "Sodium", STATUS_DOWNLOADED),
+            _Outcome("lithium.jar", "Lithium", STATUS_FAILED),
+        ]
+
+    monkeypatch.setattr(plugin, "_perform_manual_downloads", stand_in, raising=False)
+
+    plugin._manual_download(source, "all", "!!muc")
+    plugin._manual_confirm(source, "!!muc")
+
+    # The fetch runs on its own thread; wait for it rather than sleeping a fixed time.
+    for _ in range(200):
+        if "批量下载结束" in source.body:
+            break
+        time.sleep(0.02)
+
+    assert "1 个已下载" in source.body, source.body
+    assert "失败的是：Lithium" in source.body, source.body
+    assert "!!muc install all" in source.body, source.body
+    assert plugin._pending_action is None, "the plan was carried out, so it is spent"
+
+
+def test_all_is_the_bulk_word_even_when_a_mod_answers_to_it(tmp_path, monkeypatch):
+    """``all`` is reserved, and being reserved is the point.
+
+    It has to mean the list even on a server that ships a mod whose name, id and file stem are
+    all spelled that way — a bulk command that silently narrowed to one mod would be the worst
+    kind of surprise. Such a mod stays reachable by the number the listing shows it under.
+    """
+    tricky = _bulk_entry("allmod", "All", "all.jar")
+    other = _bulk_entry("sodium", "Sodium", "sodium.jar")
+    plugin, _server, source = _bulk_env(tmp_path, monkeypatch, [tricky, other])
+
+    plugin._manual_download(source, "all", "!!muc")
+
+    assert plugin._pending_action["kind"] == "download_all"
+    assert plugin._pending_action["files"] == ["all.jar", "sodium.jar"]
+
+    # And the same word on ``install``, on a report where it is the only candidate — which is
+    # the case where a name lookup would also have "worked" and meant something else.
+    plugin._clear_pending()
+    plugin._last_report = _report_with(
+        [_bulk_entry("allmod", "All", "all.jar", status="awaiting_install")]
+    )
+    plugin._manual_install(source, "all", "!!muc")
+
+    assert plugin._pending_action["kind"] == "install_all"
+
+
+def test_a_batch_confirmation_is_dropped_when_the_set_of_mods_changed(tmp_path, monkeypatch):
+    """Same rule as the single form, one level up — because "these mods" is what was approved.
+
+    Running whatever overlap is left would report success over a batch that partly did not
+    happen, and the admin would have no way to know which half.
+    """
+    first = _bulk_entry("sodium", "Sodium", "sodium.jar")
+    second = _bulk_entry("lithium", "Lithium", "lithium.jar")
+    plugin, _server, source = _bulk_env(tmp_path, monkeypatch, [first, second])
+    monkeypatch.setattr(
+        plugin, "_perform_manual_downloads",
+        lambda items: pytest.fail("a stale batch was carried out"), raising=False,
+    )
+
+    plugin._manual_download(source, "all", "!!muc")
+    # A re-run finished underneath: one of the two is no longer waiting to be fetched.
+    plugin._last_report = _report_with([first])
+
+    plugin._manual_confirm(source, "!!muc")
+
+    assert "作废" in source.body, source.body
+    assert "!!muc download all" in source.body, source.body
+    assert plugin._pending_action is None
+
+
+def test_install_all_authorises_every_downloaded_build(tmp_path, monkeypatch):
+    """One command for the lot, and one ledger record at a time underneath.
+
+    The records are the point: the ledger is also the work list the next stop reads, so the
+    batch must approve exactly the builds it named — and nothing else that happens to be in it.
+    """
+    from mod_update_checker.downloads import DownloadLedger
+
+    waiting = [
+        _bulk_entry("sodium", "Sodium", "sodium.jar", status="awaiting_install"),
+        _bulk_entry("lithium", "Lithium", "lithium.jar", status="awaiting_install"),
+        _bulk_entry("iris", "Iris", "iris.jar", status="awaiting_install"),
+    ]
+    plugin, server, source = _bulk_env(tmp_path, monkeypatch, waiting)
+
+    ledger = DownloadLedger(
+        Path(server.get_data_folder()) / plugin.DOWNLOAD_LEDGER_FILE_NAME
+    )
+    for entry in waiting:
+        ledger.record(entry.mod_id, entry.download_filename, "b" * 40, "1.1.0",
+                      "2026-01-01T00:00:00+00:00", installed_file=entry.file_name,
+                      name=entry.name)
+    ledger.save()
+
+    plugin._manual_install(source, "all", "!!muc")
+
+    assert plugin._pending_action["kind"] == "install_all"
+    assert plugin._pending_action["files"] == ["iris.jar", "lithium.jar", "sodium.jar"]
+    assert "即将安排安装 3 个" in source.body, source.body
+
+    plugin._manual_confirm(source, "!!muc")
+
+    assert "已授权 3 个 Mod" in source.body, source.body
+    # Read back from disk: the command writes its own ledger, because by the time an admin
+    # confirms, the plugin may have been reloaded and the record is what is on disk.
+    written = DownloadLedger(
+        Path(server.get_data_folder()) / plugin.DOWNLOAD_LEDGER_FILE_NAME
+    )
+    assert written.approved_keys() == ["iris", "lithium", "sodium"]
+
+
+def test_install_all_with_nothing_waiting_says_so(tmp_path, monkeypatch):
+    """Not an error, and not silence either: there is simply nothing at the install step yet."""
+    plugin, _server, source = _bulk_env(
+        tmp_path, monkeypatch, [_bulk_entry("sodium", "Sodium", "sodium.jar")]
+    )
+
+    plugin._manual_install(source, "all", "!!muc")
+
+    assert "没有已下载、等待安装的 Mod" in source.body, source.body
+    assert plugin._pending_action is None
+
+
+# --------------------------------------------------------------------------------------
+# The completion notice
+#
+# Two readers, one event: the console is where an admin who stepped away during the transfer
+# catches up, and the game is where an admin who is *there* finds out the files arrived. The
+# in-game gate is deliberately its own and these tests pin it in both directions — see
+# ``_announce_download_complete`` for why it is not ``report.in_game``.
+# --------------------------------------------------------------------------------------
+
+
+def _check_with_fetched_files(tmp_path, monkeypatch, count, size, broadcast=True):
+    """Drive one whole check whose download pass reports ``count`` files of ``size`` bytes.
+
+    Only the reconcile step is stubbed; the announcement, the summary and the in-game delivery
+    are the real code paths. The reconcile step is replaced rather than exercised because what
+    is under test here is the notice, and staging real transfers to produce it would make the
+    test a worse copy of ``test_e2e``.
+    """
+    import mod_update_checker as plugin
+
+    server = _FakeServer(tmp_path, levels={"Admin": 4, "Player": 0})
+    plugin._apply_language(server, _config_with({"language": "zh_cn"}))
+    monkeypatch.setattr(plugin, "_online_players", {"Admin", "Player"}, raising=False)
+    monkeypatch.setattr(
+        plugin, "_reconcile_downloads",
+        lambda server, report, config: (count, size), raising=False,
+    )
+
+    _run_with_stub(
+        plugin, server, tmp_path, monkeypatch,
+        _report(updates=0, mods_directory=str(Path(tmp_path) / "mods")),
+        broadcast=broadcast, language="zh_cn",
+    )
+    return server
+
+
+def test_a_finished_download_is_announced_to_the_console_and_to_admins(tmp_path, monkeypatch):
+    """One line in the console, and the same news in game — addressed to who can act on it.
+
+    Not gated on ``report.in_game``, which is off here as shipped: that switch is about "an
+    update exists" announcements, which stay true until acted on and are repeated at the next
+    login. This is this server's own files having changed a moment ago. The permission gate
+    still applies: a player who cannot run the command is not told.
+    """
+    server = _check_with_fetched_files(tmp_path, monkeypatch, count=2, size=5 * 1024 * 1024)
+
+    console = "\n".join(server.logger.messages)
+    assert "下载完成" in console, console
+    assert "2 个" in console and "5.0 MB" in console, console
+    assert "!!modupdate install all" in console, "the console line must name the next command"
+
+    told = "\n".join(server.told("Admin"))
+    assert "下载完成" in told, told
+    assert server.told("Player") == [], "a player who cannot act on the notice was told anyway"
+
+
+def test_a_check_that_fetched_nothing_says_nothing(tmp_path, monkeypatch):
+    """A completion line for a non-event is how a notice stops being read.
+
+    The summary already describes where things stand; "download finished" is only true when
+    something actually finished.
+    """
+    server = _check_with_fetched_files(tmp_path, monkeypatch, count=0, size=0)
+
+    assert "下载完成" not in "\n".join(server.logger.messages)
+    assert server.told() == []
+
+
+def test_a_join_check_keeps_the_completion_on_the_console_only(tmp_path, monkeypatch):
+    """The join path runs with ``broadcast=False``.
+
+    Its admin is being answered personally a moment later, and re-broadcasting at that instant
+    is how one event becomes two messages for everyone else. The console still records it,
+    because the console is where the history is.
+    """
+    server = _check_with_fetched_files(tmp_path, monkeypatch, count=1, size=2048,
+                                       broadcast=False)
+
+    assert "下载完成" in "\n".join(server.logger.messages)
+    assert server.told() == []
+
+
 def test_install_on_stop_installs_only_what_was_authorised(tmp_path, monkeypatch):
     """With the automatic half off, the ledger is not a work list — the approvals are.
 
@@ -1932,7 +2267,7 @@ def _scan_of(tmp_path, *jar_names):
     return scan_mods(mods)
 
 
-def _run_with_stub(plugin, server, tmp_path, monkeypatch, report, **config):
+def _run_with_stub(plugin, server, tmp_path, monkeypatch, report, broadcast=True, **config):
     """Drive ``_run_check`` with ``_scan_current`` and ``Checker`` stubbed out."""
     from mod_update_checker.serverinfo import ServerContext
 
@@ -1967,7 +2302,7 @@ def _run_with_stub(plugin, server, tmp_path, monkeypatch, report, **config):
     plugin._stop_event.clear()
     plugin._last_report = None
 
-    plugin._run_check(server)
+    plugin._run_check(server, broadcast=broadcast)
     plugin._last_report = None
     return recorded
 
