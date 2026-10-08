@@ -82,7 +82,7 @@ Fabric 服务端**没有任何原生手段**能发现 Mod 过期。加载器只�
 **输入不带任何子命令的 `!!muc` 就是帮助页**——**每一行都可以直接点击**：
 
 ```
-============  Mod Update Checker v1.4.0  ============
+============  Mod Update Checker v1.5.0  ============
 用法：!!muc <子命令>（!!modupdate 亦可）——不带子命令就是本页
 以上命令均需 MCDR 权限等级 3（与游戏内是否为 OP 无关）
 !!muc check    -- 立即检查一次
@@ -203,7 +203,7 @@ Mod，用它的编号。`!!modupdate install all` 同理，指所有「已下载
 `!!modupdate list` 只给**一行一个 Mod**，因为它要在一页聊天框内读完：
 
 ```
-============  Mod Update Checker v1.4.0  ============
+============  Mod Update Checker v1.5.0  ============
 服务端: 26.3 / Fabric（版本来源：server_info）
 [1] Sodium  1.0.0 -> 1.1.0  (可更新)  [详细信息]
 [2] Lithium  1.0.0 -> 1.1.0  (可更新)  [详细信息]
@@ -242,7 +242,7 @@ Mod，用它的编号。`!!modupdate install all` 同理，指所有「已下载
 点某一行的 `[详细信息]`（或输入 `!!modupdate info 3`）才展开那一个 Mod：
 
 ```
-============  Mod Update Checker v1.4.0  ============
+============  Mod Update Checker v1.5.0  ============
 Sodium
 状态: 可更新
 版本: 1.0.0 -> 1.1.0
