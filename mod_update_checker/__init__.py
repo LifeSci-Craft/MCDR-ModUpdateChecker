@@ -1583,8 +1583,28 @@ def _show_filtered(source: CommandSource, status: str, prefix: str = ROOT_LITERA
     _reply_index(source, _last_report, entries=_last_report.by_status(wanted), prefix=prefix)
 
 
+def _resolve_handle(source: CommandSource, report: Report, text: str) -> Optional[UpdateEntry]:
+    """Look up what the admin typed, and explain it when that fails.
+
+    The three failures get three sentences, because they lead to three different next actions:
+    a number past the end of the list means "look at the list again", an ambiguous name means
+    "type more of it", and an unknown one means "that mod is not in this report". A single
+    "not found" would leave the reader guessing which of the three they hit.
+    """
+    entry, reason = report.resolve_handle(text)
+    if entry is not None:
+        return entry
+    if reason == "out-of-range":
+        source.reply(tr("command.handle.out_of_range", value=text, count=len(report.entries)))
+    elif reason == "ambiguous":
+        source.reply(tr("command.handle.ambiguous", value=text))
+    else:
+        source.reply(tr("command.info.unknown", value=text))
+    return None
+
+
 def _show_info(source: CommandSource, target: str, prefix: str = ROOT_LITERALS[0]) -> None:
-    """``info <编号|mod id|文件名>`` — one mod's version change, links and notes."""
+    """``info <编号|Mod 名|mod id|文件名>`` — one mod's version change, links and notes."""
     if _last_report is None:
         source.reply(tr("command.no_report_yet"))
         return
@@ -1592,9 +1612,8 @@ def _show_info(source: CommandSource, target: str, prefix: str = ROOT_LITERALS[0
     if not text:
         source.reply(tr("command.info.usage"))
         return
-    entry = _last_report.entry_by_handle(text)
+    entry = _resolve_handle(source, _last_report, text)
     if entry is None:
-        source.reply(tr("command.info.unknown", value=text))
         return
     _reply_detail(source, entry, prefix=prefix)
 
@@ -1686,7 +1705,7 @@ def _pending_action_for(source: CommandSource) -> Optional[Dict[str, Any]]:
 
 
 def _manual_download(source: CommandSource, handle: str, prefix: str) -> None:
-    """``download <编号>`` — stage a fetch of one mod's newer build.
+    """``download <编号|Mod 名>`` — stage a fetch of one mod's newer build.
 
     Works with ``download.enabled`` off, which is the point: the automatic setting answers
     "fetch everything you find", and an admin who wants one mod now should not have to switch it
@@ -1700,9 +1719,8 @@ def _manual_download(source: CommandSource, handle: str, prefix: str) -> None:
     if not text:
         source.reply(tr("command.download.usage", command=prefix))
         return
-    entry = report.entry_by_handle(text)
+    entry = _resolve_handle(source, report, text)
     if entry is None:
-        source.reply(tr("command.info.unknown", value=text))
         return
     number = _number_of(report, entry)
 
@@ -1765,9 +1783,8 @@ def _manual_install(source: CommandSource, handle: str, prefix: str) -> None:
     if not text:
         source.reply(tr("command.install.usage", command=prefix))
         return
-    entry = report.entry_by_handle(text)
+    entry = _resolve_handle(source, report, text)
     if entry is None:
-        source.reply(tr("command.info.unknown", value=text))
         return
     number = _number_of(report, entry)
 

@@ -37,7 +37,6 @@ while a stale positive would be a claim about bytes that may have been replaced 
 import json
 import logging
 import os
-import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -65,6 +64,7 @@ from .report import (
     entry_from_scan,
     mc_mismatch_note,
 )
+from .report import normalise_name as report_normalise_name
 from .scanner import ScanResult, ScannedMod, missing_dependencies
 from .serverinfo import ServerContext
 from .upstream import HttpClient, RateLimiter, UpstreamError
@@ -80,7 +80,6 @@ USER_AGENT = "LifeSci-Craft/MCDR-ModUpdateChecker (+https://github.com/LifeSci-C
 #: Fallback per-mod query budget, so one misbehaving upstream cannot stall a whole run.
 _MAX_WORKERS = 8
 
-_NON_ALNUM = re.compile(r"[^a-z0-9]+")
 
 
 def _pool_size(configured: int, count: int) -> int:
@@ -94,8 +93,14 @@ def _pool_size(configured: int, count: int) -> int:
 
 
 def normalise_name(text: str) -> str:
-    """Lowercase, strip everything that is not alphanumeric. Used for slug comparison."""
-    return _NON_ALNUM.sub("", (text or "").lower())
+    """Lowercase, strip everything that is not alphanumeric. Used for slug comparison.
+
+    Defined in :mod:`~mod_update_checker.report` and re-exported here, because the report's
+    handle lookup needs the same comparison and ``report`` cannot import ``checker``. Two
+    copies would eventually disagree, and the disagreement would be a mod the admin excluded
+    being looked up anyway — or a name that resolves in one command and not the next.
+    """
+    return report_normalise_name(text)
 
 
 @dataclass

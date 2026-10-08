@@ -341,3 +341,26 @@ def test_the_changelog_keeps_only_the_latest_release():
     headings = [line for line in _doc("CHANGELOG.md").splitlines() if line.startswith("## ")]
 
     assert len(headings) == 1, headings
+
+
+def test_every_option_the_config_has_is_written_down_somewhere():
+    """The other direction from ``test_every_option_path_in_the_docs_exists``.
+
+    That one catches a name in the prose that the config does not have. This catches the
+    opposite and quieter problem: an option that exists, and works, and that nobody can find —
+    because the only way to learn about it would be to read the source. The failure looks like
+    "the feature is missing", which is how a user reports it.
+    """
+    from support import option_paths
+
+    import mod_update_checker as plugin
+
+    user_doc = _doc(USER_DOC)
+    developer_doc = _doc(DEVELOPER_DOC)
+    unexplained = sorted(
+        path
+        for path in option_paths(plugin.Config)
+        if path not in user_doc and path not in developer_doc
+    )
+
+    assert unexplained == [], "options nobody documents: {}".format(unexplained)
