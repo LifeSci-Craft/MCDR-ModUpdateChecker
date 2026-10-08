@@ -73,6 +73,16 @@ _MAX_WORKERS = 8
 _NON_ALNUM = re.compile(r"[^a-z0-9]+")
 
 
+def _pool_size(configured: int, count: int) -> int:
+    """How many workers to use for ``count`` lookups.
+
+    Capped at :data:`_MAX_WORKERS` so a large configured value cannot turn a check into a
+    stampede against a public API, and at ``count`` so a three-mod server does not start eight
+    threads to make three calls.
+    """
+    return max(1, min(_MAX_WORKERS, max(1, int(configured)), count))
+
+
 def normalise_name(text: str) -> str:
     """Lowercase, strip everything that is not alphanumeric. Used for slug comparison."""
     return _NON_ALNUM.sub("", (text or "").lower())
@@ -440,7 +450,7 @@ class Checker:
                 self.logger.debug("project %s lookup failed: %s", project_id, error)
                 return project_id, None
 
-        workers = min(_MAX_WORKERS, max(1, self.options.workers), len(project_ids))
+        workers = _pool_size(self.options.workers, len(project_ids))
         versions: Dict[str, List[ModrinthVersion]] = {}
         failures: Set[str] = set()
         with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -593,7 +603,17 @@ class Checker:
         all, "Modrinth does not know this jar" is not something that was learned, and caching
         it would hide the mod from every check for the whole TTL — a transient outage promoted
         into a day-long blind spot.
+
+        The lookups run concurrently, for the same reason the per-project follow-up in stage 1
+        does: each one is two latency-bound round trips and the count is unbounded. A server
+        whose mods were built from source, forked, or re-signed reaches this stage with all of
+        them, and a hundred mods asked one at a time is a check measured in minutes rather
+        than seconds. Nothing is decided here, so there is nothing for the ordering to carry:
+        every mod owns its own entry, and the resolve cache takes a lock around its own state.
         """
+        # Everything that needs no network is decided first, serially, so the pool is only
+        # ever handed work that has to happen.
+        queue: List[ScannedMod] = []
         for mod in mods:
             entry = entries[mod.file_name]
             if entry.status in (STATUS_IGNORED, STATUS_ERROR):
@@ -609,23 +629,43 @@ class Checker:
                 entry.add_note("note.cached_unresolved")
                 continue
 
-            query = mod.mod_id or Path(mod.file_name).stem
-            if not query:
-                entry.status = STATUS_UNRESOLVED
-                continue
+            queue.append(mod)
 
-            asked_modrinth = bool(self.options.use_modrinth)
-            by_modrinth = (
-                self._match_on_modrinth(mod, entry, query, server) if asked_modrinth else False
-            )
-            if by_modrinth:
-                continue
+        if not queue:
+            return
 
+        workers = _pool_size(self.options.workers, len(queue))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            # ``list`` so the pool is drained: an exception raised by a worker has to reach the
+            # caller, and a lazily consumed ``map`` would swallow it until the iterator is read.
+            list(pool.map(lambda mod: self._identify_by_name(mod, entries[mod.file_name], server),
+                          queue))
+
+    def _identify_by_name(
+        self, mod: ScannedMod, entry: UpdateEntry, server: ServerContext
+    ) -> None:
+        """Try to tie one leftover mod to a project by name, and fill in its entry.
+
+        Written to be safe to run for several mods at once — each call owns exactly one entry,
+        and the only shared state it touches is the resolve cache, which locks.
+        """
+        query = mod.mod_id or Path(mod.file_name).stem
+        if not query:
             entry.status = STATUS_UNRESOLVED
-            if asked_modrinth and by_modrinth is None:
-                entry.add_note("note.search_incomplete")
-            elif mod.sha1:
-                self._cache.put(mod.sha1, {"resolved": False})
+            return
+
+        asked_modrinth = bool(self.options.use_modrinth)
+        by_modrinth = (
+            self._match_on_modrinth(mod, entry, query, server) if asked_modrinth else False
+        )
+        if by_modrinth:
+            return
+
+        entry.status = STATUS_UNRESOLVED
+        if asked_modrinth and by_modrinth is None:
+            entry.add_note("note.search_incomplete")
+        elif mod.sha1:
+            self._cache.put(mod.sha1, {"resolved": False})
 
     def _match_on_modrinth(
         self, mod: ScannedMod, entry: UpdateEntry, query: str, server: ServerContext

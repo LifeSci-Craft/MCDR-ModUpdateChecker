@@ -24,12 +24,11 @@ throwaway directory.
 
 import json
 import logging
-import os
 import re
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from .digests import digests_of_file
 from .versioning import RangeSpec, normalize_spec

@@ -7,11 +7,8 @@ nothing.
 """
 
 import hashlib
-import json
 import zipfile
 from pathlib import Path
-
-import pytest
 
 from mod_update_checker.scanner import (
     _metadata_from_toml_regex,

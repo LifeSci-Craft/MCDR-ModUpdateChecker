@@ -1,0 +1,32 @@
+# Linting, for the code that ships and the code that tests it.
+#
+# The selection is deliberately narrow, and the narrowness is the point. A linter earns its
+# place by catching mistakes; a broad one mostly generates a diff, and this repository's
+# style is already consistent on purpose:
+#
+# * `target-version` is 3.8 because that is the real floor, not a preference. MCDR 2.13.0 and
+#   2.14.1 both declare `Requires-Python >= 3.8`, and 2.13.0 is the version this plugin claims
+#   to support. So nothing may be suggested that a 3.8 interpreter cannot run — which is also
+#   why the annotations are `typing.Dict` rather than `dict[...]`, and why `tomllib` is behind
+#   an `ImportError` guard. Those are correct here, not stale, and `UP` would be wrong to
+#   enforce.
+# * `.format()` over f-strings is the house style throughout. `UP032` would rewrite hundreds
+#   of lines and change nothing.
+#
+# What is on: the four default families — imports, statement-level errors, runtime errors and
+# pyflakes — plus bugbear's genuine bug patterns: closures capturing a loop variable, unbound
+# locals, mutable class defaults. Those find defects, which is the whole job.
+
+target-version = "py38"
+
+# Checked in from the repository root, so the local copy of MCDR and pytest that
+# `pip install --target .testlibs` leaves behind has to be kept out of the walk — otherwise
+# the same command reports thousands of issues in somebody else's code and none of ours.
+extend-exclude = [".testlibs", "dist"]
+
+[lint]
+select = ["E4", "E7", "E9", "F", "B"]
+ignore = [
+    # `zip(..., strict=)` arrived in Python 3.10, and the floor above is 3.8.
+    "B905",
+]

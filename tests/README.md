@@ -17,7 +17,7 @@ python -m pip install --target .testlibs -r tests/requirements-test.txt
 ## 跑测试
 
 ```bash
-PYTHONPATH=.testlibs python -m pytest          # 全量（496 项，约 4 分钟，含端到端）
+PYTHONPATH=.testlibs python -m pytest          # 全量（504 项，约 4 分钟，含端到端）
 PYTHONPATH=.testlibs python -m pytest -m "not e2e"   # 跳过端到端，约 1.5 分钟
 ```
 

@@ -349,8 +349,15 @@ def parse_spec(spec: RangeSpec) -> List[Callable[[str], bool]]:
         if not alternative.strip():
             continue
         tests = _parse_conjunction(alternative)
+        # The immediately-invoked lambda is the point, not an accident: passing ``tests`` in
+        # binds *this* iteration's list into the closure, so a later pass of the loop cannot
+        # retroactively change what an earlier predicate tests. A linter reads the shadowed
+        # name as a captured loop variable and flags it; the binding is what prevents exactly
+        # that capture, so the warning is silenced here rather than "fixed" into the bug.
         any_of.append(
-            (lambda tests: lambda version: all(test(version) for test in tests))(tests)
+            (lambda tests: lambda version: all(test(version) for test in tests))(  # noqa: B023
+                tests
+            )
         )
     if not any_of:
         return [lambda _version: True]

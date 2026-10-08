@@ -178,7 +178,9 @@ def packaged_source(path: Path) -> bytes:
     try:
         compile(stripped, str(path), "exec")
     except SyntaxError as error:  # pragma: no cover - a bug in the stripper
-        raise SystemExit("stripping {} produced invalid code: {}".format(path, error))
+        raise SystemExit(
+            "stripping {} produced invalid code: {}".format(path, error)
+        ) from error
     return stripped.encode("utf-8")
 
 
