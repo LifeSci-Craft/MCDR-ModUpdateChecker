@@ -1666,7 +1666,7 @@ def _status_hover(entry: UpdateEntry) -> RTextList:
 
     The tag on the row is the same two words for every mod, so everything the reader wants from
     it is in here. The **first line is the status itself, in the status colour** — red for a
-    problem, green for something to fetch, yellow for "you already have the newest" — because
+    problem, blue for something to fetch, green for "you already have the newest" — because
     that colour used to live on the status cell and the cell is now uniform by request. Then the
     sentence that used to sit in parentheses on every row, and the identification caveat, which
     matters: a mod matched loosely by name is a *suggestion*, and the reader hovering the tag is
@@ -1905,8 +1905,8 @@ def _notification_lines(report: Report) -> List[Notice]:
     if updates:
         lines.append(Notice(tr("check.in_game_header", count=len(updates)), "heading"))
         for entry in updates[:NOTIFY_MAX_UPDATES]:
-            # ``update`` is green — the same colour the listing gives an available update, so the
-            # notification and the listing agree about what green means.
+            # ``update`` is blue — the same colour the listing gives an available update, so the
+            # notification and the listing agree about what blue means.
             lines.append(Notice(entry_line_text(entry, tr), "update"))
         if len(updates) > NOTIFY_MAX_UPDATES:
             lines.append(Notice(tr("report.and_more",
@@ -3613,7 +3613,7 @@ def _rule_line(caption: str = "") -> RTextList:
 
 
 def _rows_rule_hint() -> str:
-    """The closing rule's caption for screens whose rows carry the two red/green handles.
+    """The closing rule's caption for screens whose rows carry the two hoverable handles.
 
     The labels are read from the same keys the rows themselves use, so the sentence cannot
     claim ``[版本]`` hoverable in a language where the label is spelled something else. The

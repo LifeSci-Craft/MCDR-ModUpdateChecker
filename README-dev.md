@@ -424,6 +424,7 @@ aqua=可操作的东西（按钮、命令、字段名）。
 | 语言文件里没有「写进去过、现在没人用」的条目 | `tests/test_i18n.py` 三条守卫：每个键都必须在发布模块里作为**字符串常量**出现、五个运行时拼出来的族（`status.` / `matched_by.` / `explain.` / `install.reason.` / `download.reason.`）必须与常量表**完全一致**、两种语言的键集相同。再加一把更细的审计器 `bench/audit_language.py`（AST 只收「作为调用实参出现的字面量」，专抓只在**注释或 docstring** 里出现的键——正则扫全文看不出来） |
 | 渲染不是瓶颈 | `bench/bench_render.py`：20 / 200 个 Mod 的列表、汇总、整份报告（日志形态）、详情页各量一次。列表 **0.75 ms** 且**与总共多少个 Mod 基本无关**（只画一页）；唯一的重复劳动是每行重算格宽，现按语言缓存（195 µs → 0.8 µs / 10 行） |
 | 扫描不并行是有理由的 | `bench/scan_bench.py` 留有线程池那一路的数字：扫描跑在开服 60 秒之后的守护线程上，不在任何关键路径上，几百毫秒不值得多开线程。摘要按块读，内存不随文件增长（`tests/test_digests.py` 有断言） |
+| 服务端的负担有数字 | `bench/perf_v1.6.0.py` 与 `bench/bench_render.py`：导入 ~68 ms（宿主已加载 mcdreforged 与 requests 时）、命令树与语言 0.1 ms 级、20 jar 扫描 ~90 ms、100 Mod（100 MiB）扫描 ~0.2 s + 比对与报告 ~17 ms + 3 次请求、空闲线程 0 CPU、峰值分配 ~2 MiB；渲染见 `bench/bench_render.py`（列表 0.7 ms） |
 | 源码行末统一 LF | `test_no_source_file_carries_windows_line_endings`：扫工作区（跳过二进制与缓存），任何 `\r\n` 都失败。它守的是 Git 看不见的那一侧——`.gitattributes` 只在**提交时**归一，而「读文件再写回」的脚本会在 Windows 上把整份文件翻成 CRLF，内容一个字没改，diff 却全是警告 |
 | 前缀能匹配、且绝不比精确更宽 | `test_a_unique_prefix_of_a_name_is_enough`（唯一前缀命中）、`test_a_prefix_that_matches_two_mods_is_refused_and_lists_them`（多个就列出候选并拒绝）、`test_an_exact_match_is_never_widened_into_a_prefix_search`（有一个 Mod 就叫 `sod` 时，它就是 `sod`）、`test_a_prefix_is_matched_through_the_same_normalisation_as_everything_else`（前缀走与精确同一套归一化）。矩阵里另有一条：控制台的补全接口真的列出候选（`tree._entry_generate_suggestions`） |
 | 游戏内没有 Tab 补全可用 | 不是「没做」，是**做不到**：原版的补全只对 `/` 开头的命令生效，`!!` 命令是一条聊天消息。所以游戏内给的是 `suggest_command` 点击事件（点一下把命令填进输入框），矩阵断言候选那一行确实带那个事件 |
@@ -432,8 +433,8 @@ aqua=可操作的东西（按钮、命令、字段名）。
 | 提醒按角色上色 | `test_an_install_notice_is_coloured_by_role_not_painted_one_colour`、`test_the_update_notice_gives_each_kind_of_line_its_role`；矩阵里读**发出去的 payload**核对标题段确实白、待办行确实黄——这是唯一能证明「游戏真的收到了这个颜色」的地方 |
 | README 里的样例屏就是插件画的那一屏 | `test_the_readme_sample_screens_start_with_the_bar_the_plugin_draws`：拿 `_title_line()` 的真输出跟 README 里每一条标题栏逐字比对。标题栏的 `=` 是按常量算出来的，而三条样例曾长期停在一个早已改掉的宽度上——只查版本号的话永远发现不了 |
 
-测试套件共 **722 项**（其中 2 项是真实 MCDR 端到端，只在 CI 上跑；当前数量用
-`pytest --collect-only -q | tail -1` 查；这一行是快照，
+测试套件共 **725 项**（其中 2 项是真实 MCDR 端到端，慢约一分钟——本地发布前整跑一遍，CI 的快跑
+用 `-m "not e2e"` 跳过；当前数量用 `pytest --collect-only -q` 查；这一行是快照，
 所以上面那张表里的「54 项检查」才是被测试自动核对的那个数字），细节见 [`tests/README.md`](tests/README.md)。
 
 ---
