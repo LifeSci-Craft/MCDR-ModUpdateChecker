@@ -232,9 +232,17 @@ def resolve(
 
 def make_translator(language: str):
     """Bind a language once, so call sites read ``tr("key", a=b)`` instead of
-    ``translate("key", language, a=b)``."""
+    ``translate("key", language, a=b)``.
+
+    The returned callable carries the language it was bound to as ``.language``. Nothing in the
+    message path needs it — but anything that *measures* a message does: a caller that caches
+    "how wide is this row" has to know when the answer has changed, and asking the callable
+    beats reaching for the module's current language, which is what a cache keyed on that would
+    have to do.
+    """
 
     def translator(key: str, **kwargs: Any) -> str:
         return translate(key, language, **kwargs)
 
+    translator.language = language
     return translator

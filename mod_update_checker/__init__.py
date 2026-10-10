@@ -19,7 +19,19 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, ClassVar, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple, Type
+from typing import (
+    Any,
+    ClassVar,
+    Dict,
+    Iterable,
+    List,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    Type,
+)
 
 from mcdreforged.api.all import (
     CommandSource,
@@ -29,11 +41,13 @@ from mcdreforged.api.all import (
     RAction,
     RColor,
     RText,
+    RTextBase,
     RTextList,
     Serializable,
 )
 
 from . import i18n
+from .jsonfile import read_json, write_json
 from .checker import USER_AGENT, CheckOptions, Checker
 from .installer import (
     STATUS_INSTALLED as INSTALL_INSTALLED,
@@ -58,23 +72,46 @@ from .downloads import (
 from .report import (
     ALL_STATUSES,
     CHAT_PAGE_LINES,
+    MATCHED_BY_NOTEWORTHY,
+    ROW_FIELD_BODY,
+    ROW_FIELD_MARK,
+    ROW_FIELD_NAME,
+    ROW_FIELD_NOTE,
+    ROW_FIELD_NUMBER,
+    QUARTERS_PER_LETTER,
     STATUS_AWAITING_INSTALL,
+    STATUS_ERROR,
     STATUS_LOCAL_AHEAD,
     STATUS_NO_COMPATIBLE_BUILD,
+    STATUS_OLD_BACKUP,
     STATUS_UP_TO_DATE,
     STATUS_UPDATE_AVAILABLE,
+    VERSION_ARROW,
+    VERSION_CURRENT,
+    VERSION_NEW,
+    VERSION_OLD,
+    VERSION_PLAIN,
+    VERSION_UPSTREAM,
     Report,
     SummarySection,
     UpdateEntry,
     action_row,
+    chat_row_fields,
+    display_width,
     entry_detail_rows,
+    entry_line_text,
+    has_version_label,
+    index_row_fields,
     render_full,
     render_index,
-    render_index_row,
     render_pager,
     render_summary,
     summarise,
+    text_quarters,
+    version_summary,
 )
+from .cleanup import Backup, expired, list_backups, remove_backups, total_bytes
+from .report import format_size as _format_size
 from .upstream import HttpClient
 from .projectmap import MAP_FILE_NAME, ProjectMap, resolve_map_file
 from .scanner import (
@@ -107,7 +144,9 @@ _FALLBACK_TITLE = "Mod Update Checker"
 #: window at the default font size; going wider wraps, which looks worse than a short bar.
 _TITLE_WIDTH = 53
 #: Never fewer than this many ``=`` on each side, however long the plugin name gets.
-_TITLE_BAR_MIN = 4
+#: 收尾线两侧最少几个 ``=``。3 而不是 4：底线现在要捎一句「悬停 [版本] [状态]，点击 [详细信息]」，
+#: 英文那份是 42 列，去掉两侧各 3 个 ``=`` 与两对空格正好等于标题栏的宽度——4 会让它长出两列。
+_TITLE_BAR_MIN = 3
 
 #: Cap on how many mods a one-shot notification lists.
 #:
@@ -143,6 +182,20 @@ ALL_TARGET = "all"
 #: count is enough to decide with.
 BULK_PLAN_ROWS = 8
 
+#: 清理计划最多列几行，其余折成计数。理由同 ``BULK_PLAN_ROWS``。
+CLEANUP_PLAN_ROWS = 8
+
+#: 待确认的删除操作有哪几种。名字写清楚是因为它们只差一点：
+#: ``delete`` 一个文件、``delete_expired`` 全部过期的（``cleanup``）、``delete_all`` 全部。
+#: 确认时必须按 **同一个** kind 重新推导集合——用错了就等于让管理员批准一个他没见过的集合。
+_KIND_DELETE = "delete"
+_KIND_DELETE_EXPIRED = "delete_expired"
+_KIND_DELETE_ALL = "delete_all"
+
+#: 每一种「一次删一批」的操作。确认门禁、重列计划的提示语都按这张表走。
+_BULK_DELETE_KINDS = (_KIND_DELETE_EXPIRED, _KIND_DELETE_ALL)
+_DELETE_KINDS = (_KIND_DELETE,) + _BULK_DELETE_KINDS
+
 #: How many of an ambiguous handle's candidates are named — in the sentence, and as buttons.
 #:
 #: A handle that matches thirty mods is a handle that did not narrow anything down, and thirty
@@ -177,6 +230,10 @@ _NOTICE_COLOURS = {
     "action": RColor.yellow,
     "done": RColor.gray,
     "hint": RColor.gray,
+    # 「有更新」与「有问题」用与列表行同一套颜色：blue = 有得更新（含已下载待安装），
+    # red = 要人看一眼（无适配、跳过、出错）。
+    "update": RColor.blue,
+    "blocked": RColor.red,
 }
 
 
@@ -299,6 +356,45 @@ class SourcesConfig(_Grouped):
     这个文件**只读不写**，格式见 README。改完直接 ``!!modupdate reload`` 或等下次检查即可生效。"""
 
 
+class CleanupConfig(_Grouped):
+    """The other optional half: what to do about the ``.old`` backups left in ``mods/``.
+
+    Separate from ``download`` on purpose. That section answers "shall the plugin fetch and
+    install newer builds"; this one answers "shall it tell me about the files the last install
+    left behind, and may it remove them". A server can very reasonably want the first and not
+    the second, and the second is the only one that ever deletes anything.
+
+    Two switches, and the order matters: :attr:`allow_delete` is the one that decides whether
+    anything may be removed at all, and :attr:`enabled` — the reminder — sits behind it, because
+    a reminder whose next step is refused is just noise.
+    """
+
+    allow_delete: bool = False
+    """是否允许删除类指令真的删东西（``!!muc delete`` / ``!!muc cleanup`` / 确认它们）。
+
+    **默认关闭，而且关着的时候插件不会删除 ``mods/`` 里的任何文件。**
+
+    关着的时候这两条指令**仍然存在**，但只会告诉你这个选项关着、以及去哪里打开——空着的
+    回绝读起来像 bug，而这里必须让人一眼看出「不是坏了，是有个开关没开」。详情页里那个
+    ``[删除此备份]`` 也会相应地变成一行说明，而不是一个点下去只会报错的按钮。
+
+    它**同时是 ``enabled`` 的前置开关**：这个关着时，到期提醒也不会出现——提醒的下一步
+    （``!!muc confirm``）在那种状态下必然被拒绝，说一句做不到的话就是废话。"""
+
+    enabled: bool = False
+    """是否主动提醒清理已过期的备份。**默认关闭，而且要先打开 ``allow_delete``。**
+
+    关着的时候插件仍然**看得见**这些文件：它们照样出现在 ``!!muc list``、可以用
+    ``!!muc list old_backup`` 筛选、``!!muc status`` 也会报个数。这个开关只决定插件会不会
+    自己开口提醒你——和 ``download`` 的分工一样：自动行为要开关，手动命令不要。"""
+
+    max_age_days: int = 30
+    """备份存在多少天之后算「过期」。``0`` = 任何备份都立刻算过期。
+
+    年龄取自文件的修改时间，而插件在**创建备份的那一刻**会把这个时间戳刷新成当下——
+    否则改名会保留原 jar 的时间戳，每个备份看起来都比实际老得多。"""
+
+
 class DownloadConfig(_Grouped):
     """The optional half: fetching newer builds into the plugin's own folder.
 
@@ -388,6 +484,7 @@ class Config(_Grouped):
         "report": ReportConfig,
         "sources": SourcesConfig,
         "download": DownloadConfig,
+        "cleanup": CleanupConfig,
         "network": NetworkConfig,
     }
 
@@ -414,6 +511,9 @@ class Config(_Grouped):
 
     download: DownloadConfig = DownloadConfig()
     """可选：把新版本下载到插件自己的文件夹（默认关闭，且从不写入 mods/）。"""
+
+    cleanup: CleanupConfig = CleanupConfig()
+    """可选：清理安装时留下的 ``.old`` 备份（默认关闭，只提醒不自动删）。"""
 
     network: NetworkConfig = NetworkConfig()
     """HTTP 超时、重试、并发与限速、识别缓存。"""
@@ -544,11 +644,7 @@ def _leaf_paths(node: Any, prefix: str = "") -> List[str]:
 
 def _file_leaf_paths(path: str) -> Optional[List[str]]:
     """The same, read from a file: ``None`` when nothing readable is there."""
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            data = json.load(handle)
-    except (OSError, ValueError):
-        return None
+    data = read_json(path)
     return _leaf_paths(data) if isinstance(data, dict) else None
 
 
@@ -805,6 +901,10 @@ def _run_check(
         _notify(server, report, source=source, announce_clean=announce_clean,
                 broadcast=broadcast)
 
+        # 在 Mod 汇总之后：这是家务，不是这次检查的结论。它自己带开关（cleanup.enabled），
+        # 不看 report.updates_only —— 那项管的是「没问题就别啰嗦」，而备份是另一回事。
+        _announce_cleanup(server, broadcast=broadcast)
+
         if config.report.write_file:
             _write_report_files(server, report)
         return report
@@ -896,14 +996,19 @@ def _report_still_applies(
         return False
 
     pinned = (config.server.mc_version or "").strip()
-    if pinned and pinned.lower() != i18n.AUTO:
-        if report.server.mc_version != pinned:
-            return False
+    if pinned and pinned.lower() != i18n.AUTO and report.server.mc_version != pinned:
+        return False
     return True
 
 
-def _write_report_files(server: PluginServerInterface, report: Report) -> None:
-    """Persist the report as JSON (for scripts) and as text (for a human)."""
+def _write_report_files(server: PluginServerInterface, report: Report,
+                        announce: bool = True) -> None:
+    """Persist the report as JSON (for scripts) and as text (for a human).
+
+    ``announce=False`` for the write that follows a deletion: the "报告已写入" line belongs to
+    "a check just finished", and printing it after a command makes it read as though something
+    was checking behind the admin's back.
+    """
     folder = server.get_data_folder()
     targets = (
         (REPORT_FILE_NAME, report.to_json()),
@@ -916,7 +1021,10 @@ def _write_report_files(server: PluginServerInterface, report: Report) -> None:
                 handle.write(content)
         except OSError as error:
             server.logger.warning("could not write {}: {}".format(path, error))
-    server.logger.info(tr("console.report_saved", path=os.path.join(folder, REPORT_FILE_NAME)))
+    if announce:
+        server.logger.info(
+            tr("console.report_saved", path=os.path.join(folder, REPORT_FILE_NAME))
+        )
 
 
 def _notify(
@@ -976,11 +1084,10 @@ def _sync_download_state(
 
     ledger = DownloadLedger(Path(server.get_data_folder()) / DOWNLOAD_LEDGER_FILE_NAME,
                             logger=server.logger)
-    if folder.is_dir():
-        if ledger.prune(folder):
-            # Records for files that are no longer there: the admin installed them, or removed
-            # them. Either way the bookkeeping should follow.
-            ledger.save()
+    if folder.is_dir() and ledger.prune(folder):
+        # Records for files that are no longer there: the admin installed them, or removed
+        # them. Either way the bookkeeping should follow.
+        ledger.save()
     classify_downloaded(report.entries, folder, ledger)
     return folder, ledger
 
@@ -1127,8 +1234,7 @@ def _write_install_report(server: PluginServerInterface, results) -> None:
     }
     path = Path(server.get_data_folder()) / INSTALL_REPORT_FILE_NAME
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        write_json(path, payload)
     except OSError as error:
         server.logger.warning(tr("install.report_failed", error=str(error)))
 
@@ -1137,10 +1243,7 @@ def _read_install_report(server: PluginServerInterface) -> Optional[Dict[str, An
     path = Path(server.get_data_folder()) / INSTALL_REPORT_FILE_NAME
     if not path.is_file():
         return None
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
+    data = read_json(path)
     if not isinstance(data, dict) or not isinstance(data.get("installed"), list):
         return None
     return data
@@ -1150,7 +1253,7 @@ def _mark_install_reported(server: PluginServerInterface, data: Dict[str, Any], 
     data[field] = True
     path = Path(server.get_data_folder()) / INSTALL_REPORT_FILE_NAME
     try:
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        write_json(path, data)
     except OSError:
         # Losing the flag means the message may be repeated, which is a far smaller problem
         # than failing the startup it is being written during.
@@ -1184,9 +1287,9 @@ def _install_summary_lines(data: Dict[str, Any]) -> List[Notice]:
     plain text), while chat paints by role. The role is the one thing both can share.
 
     A replaced mod is ``done``: nothing about it needs anybody any more. Anything that *failed*
-    to install is ``action``, because that is the line somebody has to look at — and until
-    v1.5.0 both were the same yellow, so a clean batch looked exactly as alarming as a broken
-    one.
+    to install is ``blocked`` — red, the same colour the listing uses for a mod that needs
+    looking at. Until v1.5.0 both were the same yellow, so a clean batch looked exactly as
+    alarming as a broken one.
     """
     installed = data.get("installed") or []
     lines = [
@@ -1210,14 +1313,15 @@ def _install_summary_lines(data: Dict[str, Any]) -> List[Notice]:
         )
     skipped = data.get("skipped") or []
     if skipped:
-        lines.append(Notice(tr("install.skipped_header", count=len(skipped)), "action"))
+        # ``blocked``（红）：装不上是「要人看一眼」，与列表里红色行同一个意思。
+        lines.append(Notice(tr("install.skipped_header", count=len(skipped)), "blocked"))
         for item in skipped[:NOTIFY_MAX_UPDATES]:
             lines.append(
                 Notice(
                     tr("install.skipped_line", name=item.get("name") or "?",
                        reason=_reason_text("install.reason.",
                                            str(item.get("detail") or "unknown"))),
-                    "action",
+                    "blocked",
                 )
             )
     return lines
@@ -1321,6 +1425,21 @@ def _make_http_client(config: Config) -> HttpClient:
     )
 
 
+def _download_tally(outcomes: Sequence[DownloadOutcome]) -> Dict[str, int]:
+    """How many outcomes landed in each bucket, by status. Every bucket is present, even empty.
+
+    One function rather than the same four lines at both places that report a batch — the
+    console summary and the reply to a manual ``download all``. They quote the same four
+    numbers, and two copies of "which statuses count as what" is how they would eventually
+    disagree about it.
+    """
+    tally = {status: 0 for status in (STATUS_DOWNLOADED, STATUS_ALREADY_PRESENT,
+                                      STATUS_SKIPPED, STATUS_FAILED)}
+    for outcome in outcomes:
+        tally[outcome.status] = tally.get(outcome.status, 0) + 1
+    return tally
+
+
 def _log_download_outcomes(
     server: PluginServerInterface,
     report: Report,
@@ -1331,11 +1450,9 @@ def _log_download_outcomes(
     if not outcomes:
         return
 
-    counts = {status: 0 for status in (STATUS_DOWNLOADED, STATUS_ALREADY_PRESENT,
-                                      STATUS_SKIPPED, STATUS_FAILED)}
+    counts = _download_tally(outcomes)
     by_file: Dict[str, DownloadOutcome] = {}
     for outcome in outcomes:
-        counts[outcome.status] = counts.get(outcome.status, 0) + 1
         by_file[outcome.file_name] = outcome
 
     server.logger.info(
@@ -1404,15 +1521,6 @@ def _entry_for(report: Report, file_name: str):
     return None
 
 
-def _format_size(count: int) -> str:
-    """Bytes as something a human reads at a glance."""
-    if count >= 1024 * 1024:
-        return "{:.1f} MB".format(count / (1024.0 * 1024.0))
-    if count >= 1024:
-        return "{:.0f} KB".format(count / 1024.0)
-    return "{} B".format(count)
-
-
 # --------------------------------------------------------------------------------------
 # In-game screens
 #
@@ -1454,42 +1562,176 @@ def _context_field(report: Report) -> RTextList:
     )
 
 
-def _row_colour(entry: UpdateEntry) -> Any:
-    """Yellow while this row needs somebody; gray once it does not."""
-    return RColor.yellow if entry.actionable else RColor.gray
+#: 一种状态用什么颜色。**唯一的一份**：列表行的状态图标、``[状态]`` 浮窗的第一行、汇总屏的分节
+#: 标题都查这里；通知里按状态上色的行在 ``_NOTICE_COLOURS``，用的是同一套颜色。
+#:
+#: 绿 = 已是最新，蓝 = 有得更新（含已下载待安装），红 = 有问题（无适配、查询出错），其余一律
+#: 灰——它们是信息而不是「要做什么」：本地比上游新、无法定位上游、不是 Mod、被忽略、旧版备份。
+#: （用户 2026-10-10 定稿：打勾绿、上下箭头蓝。）
+_STATUS_COLOURS = {
+    STATUS_UP_TO_DATE: RColor.green,
+    STATUS_UPDATE_AVAILABLE: RColor.blue,
+    STATUS_AWAITING_INSTALL: RColor.blue,
+    STATUS_NO_COMPATIBLE_BUILD: RColor.red,
+    STATUS_ERROR: RColor.red,
+}
+
+
+def _status_colour(status: str) -> Any:
+    return _STATUS_COLOURS.get(status, RColor.gray)
+
+
+#: 列表行里每一块怎么画。角色由 ``index_row_fields`` 给，颜色由这张表定：**号码永远黄、
+#: 名称永远白**，``[版本]`` 是绿的（见 ``_row_field_colour``）、``[详细信息]`` 是 aqua，
+#: 状态格 ``[状态: ✔]`` 的**文字部分永远黄**——而里面的**图标**查 ``_STATUS_COLOURS``
+#: （打叉红、打勾绿、有更新与待安装蓝……），所以它不在这张表里，走的是 ``_row_field_colour`` 的第一支。
+#:
+#: 以前整行只有一个颜色（「要人管就黄、否则灰」），于是号码的颜色会随行而变——读者看到的就是
+#: 「为什么 1 号是黄的、其他都是灰的」。一列号码就该看起来像一列；会变颜色的是状态。
+_ROW_FIELD_COLOURS = {
+    ROW_FIELD_NUMBER: RColor.yellow,
+    ROW_FIELD_NAME: RColor.white,
+    ROW_FIELD_BODY: RColor.white,
+    ROW_FIELD_NOTE: RColor.yellow,
+}
+
+#: ``[版本]`` 浮窗里每一块怎么画（角色由 ``version_summary`` 给）：**红=要被换掉的那个、
+#: 绿=新版本、黄=你手上的版本、灰=上游那个但不构成更新**，箭头与分隔符是白的。
+#: 红绿在这里是「换」的两端（红=被换下的、绿=换上的），与状态词表各自独立——状态色见 ``_STATUS_COLOURS``。
+_VERSION_COLOURS = {
+    VERSION_OLD: RColor.red,
+    VERSION_ARROW: RColor.white,
+    VERSION_NEW: RColor.green,
+    VERSION_CURRENT: RColor.yellow,
+    VERSION_UPSTREAM: RColor.gray,
+    VERSION_PLAIN: RColor.white,
+}
+
+
+def _version_hover(entry: UpdateEntry) -> RTextList:
+    """``[版本]`` 的浮窗：按 ``_VERSION_COLOURS`` 上色的几段，拼成一个 tooltip。"""
+    tooltip = RTextList()
+    for kind, text in version_summary(entry, tr):
+        tooltip.append(RText(text, _VERSION_COLOURS[kind]))
+    return tooltip
+
+
+def _row_field_colour(entry: UpdateEntry, role: str) -> Any:
+    if role == ROW_FIELD_MARK:
+        # 图标是这一格里唯一说「是哪个状态」的东西，所以状态色贴在它身上（用户点名：打叉红、
+        # 打勾绿、有更新与待安装蓝）。浮窗第一行用的是**同一个函数**，所以行上的图标和浮窗的
+        # 标题不会各说各话。
+        return _status_colour(entry.status)
+    if role == ROW_FIELD_BODY and has_version_label(entry):
+        # ``[版本]`` 永远绿：它是一个把手（把鼠标移上去就能看到底是什么版本），不是状态。
+        return RColor.green
+    return _ROW_FIELD_COLOURS[role]
 
 
 def _reply_lines(source: CommandSource, lines) -> None:
-    """One grey line per message — for a screen's closing lines, which are never the point."""
+    """One grey line per message — for a screen's closing lines, which are never the point.
+
+    An :class:`RTextBase` line is passed through as it is: the staged plans' closing line
+    (``_confirm_ask``) is built from pieces, because the command inside it is a red button, and
+    wrapping it in ``RText`` again would flatten the colours and the click away.
+    """
     for line in lines:
-        source.reply(RText(line, RColor.gray))
+        if isinstance(line, RTextBase):
+            source.reply(line)
+        else:
+            source.reply(RText(line, RColor.gray))
 
 
-def _detail_link(command: str) -> RText:
+def _detail_link(command: str, hover: str = "") -> RText:
     """A ``[详细信息]`` label that runs ``command`` when clicked.
 
     Clicking is by number rather than by mod id: the number is what the reader sees, and
     ``!!modupdate info 3`` is short enough to type if the chat log has since scrolled past the
     row. The command is spellable by hand, so a player is never stuck without the button.
+
+    ``hover`` is the tooltip, and it names the mod rather than the number the click happens to
+    carry: the reader hovering is asking "what will this do", and ``info <mod 名>`` is the
+    answer a person can read and type, number or no number.
     """
-    return RText(tr("command.list.detail_link"), RColor.aqua).set_click_event(
+    link = RText(tr("command.list.detail_link"), RColor.aqua).set_click_event(
         RAction.run_command, command
     )
+    if hover:
+        link.set_hover_text(hover)
+    return link
+
+
+def _status_hover(entry: UpdateEntry) -> RTextList:
+    """The ``[状态: ✔]`` tag's tooltip: which state it is, what that means, and how sure we are.
+
+    The tag on the row is the same two words for every mod, so everything the reader wants from
+    it is in here. The **first line is the status itself, in the status colour** — red for a
+    problem, green for something to fetch, yellow for "you already have the newest" — because
+    that colour used to live on the status cell and the cell is now uniform by request. Then the
+    sentence that used to sit in parentheses on every row, and the identification caveat, which
+    matters: a mod matched loosely by name is a *suggestion*, and the reader hovering the tag is
+    asking exactly that.
+    """
+    tooltip = RTextList(RText(tr("status." + entry.status), _status_colour(entry.status)))
+    tooltip.append("\n")
+    tooltip.append(RText(tr("explain." + entry.status), RColor.white))
+    if entry.matched_by in MATCHED_BY_NOTEWORTHY:
+        tooltip.append("\n")
+        tooltip.append(RText(tr("matched_by." + entry.matched_by), RColor.gray))
+    return tooltip
+
+
+def _facts_hover(entry: UpdateEntry) -> str:
+    """The tooltip behind ``[备份]`` / ``[文件]``: the facts the plain form prints on the row."""
+    if entry.status == STATUS_OLD_BACKUP:
+        return tr("line.old_backup", size=_format_size(entry.size_bytes), days=entry.age_days)
+    return entry.file_name
 
 
 def _entry_row(number: Optional[int], entry: UpdateEntry, prefix: str,
-               verbose: bool = True) -> RTextList:
-    """One mod as a clickable row: the text, then the button that opens its detail.
+               verbose: bool = True, chat_form: bool = True) -> RTextList:
+    """One mod as a clickable row: the pieces, coloured, then the button that opens its detail.
 
     Shared by the listing and the summary so a row looks and behaves the same on both, and so
     the button always carries the number the command takes. A row with no number — impossible
     for a real report, but the summary indexes by identity — simply has no button.
+
+    ``chat_form`` picks the row's shape, and it is the caller's answer to "can this reader use
+    a mouse?":
+
+    * the **chat** form (:func:`report.chat_row_fields`) pads the name into a column, collapses
+      the facts to a green ``[版本]`` / white ``[备份]`` / ``[文件]`` handle and turns the status
+      into its own ``[状态]`` tag — with a tooltip on **every** piece, because that is where the
+      numbers, sizes, file names and explanations went;
+    * the **plain** form keeps name, facts and the parenthetical note on the row, and is what
+      the console and the log get — a log line cannot be hovered, so hiding anything behind a
+      tooltip there would simply lose it. The caller decides because the source is the only
+      thing that knows; when the console was handed the chat form it silently lost every
+      version number to a label it has no way to open.
     """
-    row = RTextList(RText(render_index_row(number, entry, tr, verbose=verbose),
-                          _row_colour(entry)))
+    fields = (chat_row_fields(number, entry, tr, verbose=verbose)
+              if chat_form else
+              index_row_fields(number, entry, tr, verbose=verbose))
+    row = RTextList()
+    for role, text in fields:
+        piece = RText(text, _row_field_colour(entry, role))
+        if chat_form:
+            if role == ROW_FIELD_NAME:
+                # 全名：名字被截成 `...` 时，这是它唯一的去处。
+                piece.set_hover_text(entry.name)
+            elif role == ROW_FIELD_BODY:
+                piece.set_hover_text(_version_hover(entry) if has_version_label(entry)
+                                     else _facts_hover(entry))
+            elif role in (ROW_FIELD_NOTE, ROW_FIELD_MARK):
+                piece.set_hover_text(_status_hover(entry))
+        row.append(piece)
     if number is not None:
         row.append(RText("  "))
-        row.append(_detail_link("{} info {}".format(prefix, number)))
+        row.append(_detail_link(
+            "{} info {}".format(prefix, number),
+            tr("command.list.detail_hover",
+               command="{} info {}".format(prefix, entry.name)),
+        ))
     return row
 
 
@@ -1505,17 +1747,22 @@ def _reply_index(
 
     ``filter_text`` is the status the reader narrowed with, carried so the pager's commands
     page within that filter instead of quietly widening to everything.
+
+    Players close with the rule that names the two handles on the rows; a console gets the
+    plain rule, because the same sentence would describe hovering and clicking to a terminal.
     """
+    is_player = getattr(source, "is_player", False)
     rows, tail, page_info = render_index(
         report, tr, entries=entries, page=page, budget=CHAT_PAGE_LINES
     )
     _title(source)
     source.reply(_context_field(report))
     for number, entry, _text in rows:
-        source.reply(_entry_row(number, entry, prefix))
+        source.reply(_entry_row(number, entry, prefix, chat_form=is_player))
     _reply_lines(source, tail)
     if page_info is not None and page_info[1] > 1:
         source.reply(_pager_row(page_info[0], page_info[1], filter_text, prefix, source))
+    source.reply(_rule_line(_rows_rule_hint() if is_player else ""))
 
 
 def _list_command(prefix: str, filter_text: str, target: int) -> str:
@@ -1528,15 +1775,29 @@ def _list_command(prefix: str, filter_text: str, target: int) -> str:
     return " ".join(parts)
 
 
+def _pager_button(label: str, active: bool, command: str) -> RText:
+    """A pager button: aqua and clickable, or dark gray and dead at the end of the range.
+
+    The unavailable side stays on the line — the reader asked for a title-bar-shaped strip, and
+    a bar that loses one end reads as broken rather than as "there is no page that way".
+    """
+    if active:
+        return RText(label, RColor.aqua).set_click_event(RAction.run_command, command)
+    return RText(label, RColor.dark_gray)
+
+
 def _pager_row(
     page: int, pages: int, filter_text: str, prefix: str, source: CommandSource
 ) -> RText:
-    """``第 2/5 页  [上一页] [下一页]`` — or the same figures with the commands spelled out.
+    """``========  [上一页] 1/2 [下一页]  ========`` — or, for a console, the commands spelled out.
 
-    Players get the buttons, because their client can run a click. The console gets the command
-    text instead: a label nobody can press is decoration, and ``[上一页]`` is exactly that in a
-    terminal. The page figure is on the line either way, so "which page am I on" is answered
-    for both readers.
+    Players get the buttons, because their client can run a click. The line is shaped like the
+    title bar — gold rules either side, aqua for what can be pressed, yellow for the figure —
+    so the bottom of a listing looks like it belongs to the same plugin as the top. A button
+    with nowhere to go is gray rather than missing, so the bar keeps its shape from page to
+    page. The console gets the command text instead: a label nobody can press is decoration,
+    and ``[上一页]`` is exactly that in a terminal. The page figure is on the line either way,
+    so "which page am I on" is answered for both readers.
     """
 
     def command_for(target: int) -> str:
@@ -1545,21 +1806,22 @@ def _pager_row(
     if not getattr(source, "is_player", False):
         return RText(render_pager(page, pages, tr, command_for), RColor.gray)
 
-    row = RTextList(RText(tr("command.list.page", page=page, pages=pages), RColor.gray))
-    if page > 1:
-        row.append(RText("  "))
-        row.append(
-            RText(tr("command.list.prev"), RColor.aqua).set_click_event(
-                RAction.run_command, command_for(page - 1)
-            )
-        )
-    if page < pages:
-        row.append(RText("  "))
-        row.append(
-            RText(tr("command.list.next"), RColor.aqua).set_click_event(
-                RAction.run_command, command_for(page + 1)
-            )
-        )
+    caption = "{} {} {}".format(
+        tr("command.list.prev"),
+        tr("command.list.page_short", page=page, pages=pages),
+        tr("command.list.next"),
+    )
+    bars = max(_TITLE_BAR_MIN, (_TITLE_WIDTH - display_width(caption) - 4) // 2)
+    rule = "=" * bars
+
+    row = RTextList(RText(rule, RColor.gold), "  ")
+    row.append(_pager_button(tr("command.list.prev"), page > 1, command_for(page - 1)))
+    row.append(" ")
+    row.append(RText(tr("command.list.page_short", page=page, pages=pages), RColor.yellow))
+    row.append(" ")
+    row.append(_pager_button(tr("command.list.next"), page < pages, command_for(page + 1)))
+    row.append("  ")
+    row.append(RText(rule, RColor.gold))
     return row
 
 
@@ -1579,18 +1841,24 @@ def _reply_summary(source: CommandSource, report: Report,
     """
     _context, blocks, closing = summarise(report, tr)
     numbers = {id(entry): number for number, entry in report.indexed_entries()}
+    is_player = getattr(source, "is_player", False)
 
     _title(source)
     source.reply(_context_field(report))
     for block in blocks:
         if isinstance(block, SummarySection):
-            source.reply(RText(block.heading, RColor.white))
+            # 有状态的组：标题按状态上色（这就是这一屏的「状态字段」）。没有状态的组（理论上
+            # 不存在，分组都带状态）保持白色。
+            source.reply(RText(block.heading,
+                               _status_colour(block.status) if block.status else RColor.white))
             for entry in block.entries:
-                source.reply(_entry_row(numbers.get(id(entry)), entry, prefix, verbose=False))
+                source.reply(_entry_row(numbers.get(id(entry)), entry, prefix, verbose=False,
+                                        chat_form=is_player))
             _reply_lines(source, block.trailing)
         else:
             source.reply(RText(block, RColor.gray))
     _reply_lines(source, closing)
+    source.reply(_rule_line(_rows_rule_hint() if is_player else ""))
 
 
 def _reply_detail(
@@ -1604,7 +1872,7 @@ def _reply_detail(
     """
     report = _last_report
     number = _number_of(report, entry) if report is not None else None
-    action = action_row(entry, number, prefix, tr)
+    action = action_row(entry, number, prefix, tr, delete_allowed=_deletion_allowed())
 
     _title(source)
     for row in entry_detail_rows(entry, tr, action=action):
@@ -1618,6 +1886,7 @@ def _reply_detail(
         else:
             value = RText(row.value, RColor.white)
         source.reply(RTextList(RText(row.label, RColor.aqua), value) if row.label else value)
+    source.reply(_rule_line())
 
 
 def _notification_lines(report: Report) -> List[Notice]:
@@ -1636,9 +1905,9 @@ def _notification_lines(report: Report) -> List[Notice]:
     if updates:
         lines.append(Notice(tr("check.in_game_header", count=len(updates)), "heading"))
         for entry in updates[:NOTIFY_MAX_UPDATES]:
-            lines.append(Notice(tr("line.update", name=entry.name,
-                                   local=entry.local_version or "?",
-                                   latest=entry.latest_version or "?"), "action"))
+            # ``update`` is green — the same colour the listing gives an available update, so the
+            # notification and the listing agree about what green means.
+            lines.append(Notice(entry_line_text(entry, tr), "update"))
         if len(updates) > NOTIFY_MAX_UPDATES:
             lines.append(Notice(tr("report.and_more",
                                    count=len(updates) - NOTIFY_MAX_UPDATES), "hint"))
@@ -1652,8 +1921,7 @@ def _notification_lines(report: Report) -> List[Notice]:
     if pending:
         lines.append(Notice(tr("check.in_game_awaiting", count=len(pending)), "heading"))
         for entry in pending[:NOTIFY_MAX_UPDATES]:
-            lines.append(Notice(tr("line.awaiting_install", name=entry.name,
-                                   latest=entry.latest_version or "?"), "action"))
+            lines.append(Notice(entry_line_text(entry, tr), "update"))
         if len(pending) > NOTIFY_MAX_UPDATES:
             lines.append(Notice(tr("report.and_more",
                                    count=len(pending) - NOTIFY_MAX_UPDATES), "hint"))
@@ -1981,7 +2249,8 @@ def _resolve_handle(
     if entry is not None:
         return entry
     if reason == "out-of-range":
-        source.reply(tr("command.handle.out_of_range", value=text, count=len(report.entries)))
+        source.reply(tr("command.handle.out_of_range", value=text,
+                        count=len(report.entries), command=prefix))
     elif reason == "ambiguous":
         _reply_ambiguous(source, report, text, prefix, action)
     else:
@@ -2034,6 +2303,399 @@ def _show_info(source: CommandSource, target: str, prefix: str = ROOT_LITERALS[0
 
 
 # --------------------------------------------------------------------------------------
+# 旧版备份（.old）
+# --------------------------------------------------------------------------------------
+#
+# An install never deletes the jar it replaces; it renames it to ``<name>.jar.old``. That is
+# the rollback path, and it is worth keeping for a while — but not forever, and a folder that
+# has been updated monthly for a year is carrying a year of superseded jars nobody will rename
+# back.
+#
+# These two commands are the only place in the plugin that ever removes something from
+# ``mods/``, and the safety model is two rules, in this order:
+#
+#   1. ``cleanup.allow_delete`` — off by default, and nothing is removed while it is. It gates
+#      the commands, the confirmation, and the reminder, from one reader (``_deletion_allowed``)
+#      so the three cannot drift apart.
+#   2. ``cleanup.is_backup_name`` — a name this plugin did not create is refused, and refused
+#      again at the moment of deletion rather than only when the plan was drawn up.
+#
+# Both forms are staged and confirmed, including the one that names a single file. Naming it is
+# unambiguous, but this is the one irreversible thing an admin can ask for here: the file being
+# removed is the one that exists to be renamed back. Printing the plan first is also where a
+# mistyped number gets caught.
+
+
+def _deletion_allowed() -> bool:
+    """Whether this plugin may remove anything from ``mods/`` at all.
+
+    One reader, three call sites — the two commands, the confirmation that carries out what they
+    staged, and the reminder. They have to agree: a gate on the command but not on the
+    confirmation would let an admin who staged a plan and then switched the option off still
+    delete the files, which is exactly the thing the option exists to prevent.
+    """
+    return bool(_config.cleanup.allow_delete)
+
+
+def _refuse_deletion(source: CommandSource) -> None:
+    """Say no, and name the exact option and file that would change the answer.
+
+    Not a bare refusal: "you may not" without "here is how you may" reads like a bug, and the
+    next thing an admin does is go looking through the source. The path is the same one
+    ``!!muc status`` prints, so it can be opened directly.
+    """
+    server = _server
+    source.reply(tr("command.delete.disabled"))
+    source.reply(
+        tr(
+            "command.delete.disabled_hint",
+            option="cleanup.allow_delete",
+            path=_config_path(server) if server is not None else CONFIG_FILE_NAME,
+            command=ROOT_LITERALS[0] + " reload",
+        )
+    )
+
+
+def _backups_now(server: Optional[PluginServerInterface]) -> List[Backup]:
+    """Every ``.old`` backup in the mods folder, read fresh from the directory.
+
+    From the directory rather than from the last report, and that is the point: a report is a
+    snapshot that can be a day old, and every decision about deleting has to be about what is
+    actually in the folder at the moment the decision is carried out.
+    """
+    if server is None:
+        return []
+    folder = _mods_folder(server, _config)
+    return list_backups(folder) if folder is not None else []
+
+
+def _expired_now(server: Optional[PluginServerInterface]) -> List[Backup]:
+    """The backups old enough that the plugin would offer to remove them."""
+    return expired(_backups_now(server), _config.cleanup.max_age_days)
+
+
+def _backups_for(kind: str, folder: Any) -> List[Backup]:
+    """The set one bulk deletion is about: everything, or only what is past the threshold.
+
+    The two bulk forms ask different questions — ``cleanup`` means "the expired ones",
+    ``delete all`` means "all of them" — and the difference has to survive the trip back to the
+    confirmation, which re-derives the set from the folder to notice a change since the plan was
+    printed. One shared selector would make ``delete all`` silently narrow to the expired ones
+    on the way to ``confirm``: the admin would be confirming a set they were never shown, which
+    is exactly what the re-derivation exists to prevent.
+    """
+    backups = list_backups(folder) if folder is not None else []
+    if kind == _KIND_DELETE_ALL:
+        return backups
+    return expired(backups, _config.cleanup.max_age_days)
+
+
+#: What lays the same plan out again, per bulk kind — the sentence a stale plan points at.
+_BULK_DELETE_RETRY = {
+    _KIND_DELETE_EXPIRED: "cleanup",
+    _KIND_DELETE_ALL: "delete all",
+}
+
+
+def _forget_backups(gone: Iterable[str]) -> None:
+    """Drop the entries for backups that are no longer on disk from the last report.
+
+    The listing, the detail view and the summary all render *the report* — a snapshot from the
+    last check — and that snapshot still held the file this plugin had just deleted. Seen in a
+    real run: ``delete`` → "已删除 …" → the row is still there, with its number and its size, so
+    the admin deletes it again and the second attempt ends in "已经不在了". The plugin was
+    offering to act on a file it had removed itself, three times in a row.
+
+    The stored report is rewritten too, quietly: without that, the next start reads the ghost
+    back out of ``last_report.json`` and the listing resurrects it. Quietly because this is
+    housekeeping after a command, not a check result — the line ``_write_report_files`` normally
+    logs belongs to "a check just finished".
+    """
+    report = _last_report
+    server = _server
+    names = {name for name in gone}
+    if report is None or not names:
+        return
+    kept = [entry for entry in report.entries if entry.file_name not in names]
+    if len(kept) == len(report.entries):
+        # Nothing in the report described these files — a backup that was deleted by hand, or a
+        # report from before they existed. Not worth a write.
+        return
+    report.entries = kept
+    if server is not None and _config.report.write_file:
+        _write_report_files(server, report, announce=False)
+
+
+def _backup_line(file_name: str, size_bytes: int, age_days: int) -> str:
+    return tr("command.cleanup.plan_line", file=file_name,
+              size=_format_size(size_bytes), days=age_days)
+
+
+def _manual_delete(source: CommandSource, handle: str, prefix: str) -> None:
+    """``delete <文件名|编号>`` — stage the removal of one backup.
+
+    First thing checked is ``cleanup.allow_delete``, before even the argument: an admin who
+    typed the command on a server where deletion is off should learn that, not be walked
+    through the syntax of something that will refuse to run either way.
+    """
+    if not _deletion_allowed():
+        _refuse_deletion(source)
+        return
+
+    report = _last_report
+    if report is None:
+        source.reply(tr("command.no_report_yet"))
+        return
+    text = (handle or "").strip()
+    if not text:
+        source.reply(tr("command.delete.usage", command=prefix))
+        return
+    if text.lower() == ALL_TARGET:
+        # The bulk form, on the same word the other two verbs use. ``all`` is a reserved word
+        # here for the same reason it is there: it means "every backup", even on a server that
+        # happens to have a mod called ``all`` — that one is still reachable by its number.
+        _manual_delete_all(source, prefix)
+        return
+
+    entry = _resolve_handle(source, report, text, prefix=prefix, action="delete")
+    if entry is None:
+        return
+    if entry.status != STATUS_OLD_BACKUP:
+        # A real number and a real file, but not one this plugin put there. Explained in full:
+        # a bare refusal reads like a bug, and the next question is always "then what may I
+        # delete".
+        source.reply(tr("command.delete.not_a_backup", name=entry.file_name))
+        return
+
+    lines = [
+        tr("command.cleanup.plan_header", count=1, size=_format_size(entry.size_bytes)),
+        _backup_line(entry.file_name, entry.size_bytes, entry.age_days),
+        tr("command.cleanup.plan_undo"),
+        _confirm_ask(prefix),
+    ]
+    _stage_action("delete", source, report, entry, lines)
+
+
+def _manual_cleanup(source: CommandSource, prefix: str) -> None:
+    """``cleanup`` — stage the removal of every expired backup.
+
+    The age threshold is the thing an admin actually reasons about ("keep a month of
+    rollbacks"), so it is what picks the set. ``cleanup.enabled`` decides only whether the
+    plugin raises the subject on its own; asking for it by name works without it — the same
+    split as ``download``, where automatic behaviour needs a switch and a command does not.
+
+    ``cleanup.allow_delete`` is a different kind of switch and is checked first: it is not about
+    when to speak up but about whether this plugin may remove anything at all, so it gates the
+    command itself.
+    """
+    if not _deletion_allowed():
+        _refuse_deletion(source)
+        return
+
+    server = _server
+    backups = _backups_now(server)
+    if not backups:
+        source.reply(tr("command.cleanup.empty"))
+        return
+
+    days = max(0, int(_config.cleanup.max_age_days))
+    expired_now = expired(backups, days)
+    if not expired_now:
+        # "Nothing matched the threshold" is the answer an admin gets on their *first* run of
+        # this command — backups are young by definition — so the message says how old the
+        # oldest one is and what the two ways forward are. A bare "nothing to do" leaves the
+        # reader to work out that the threshold is a number they can change.
+        #
+        # ``backups[0]`` is the oldest: ``list_backups`` sorts by age.
+        source.reply(tr("command.cleanup.none", days=days, count=len(backups),
+                        oldest=backups[0].age_days))
+        source.reply(tr("command.cleanup.none_hint", command=prefix))
+        return
+
+    _stage_backup_plan(_KIND_DELETE_EXPIRED, source, expired_now, "command.cleanup.plan_header",
+                       prefix)
+
+
+def _manual_delete_all(source: CommandSource, prefix: str) -> None:
+    """``delete all`` — stage the removal of every backup, expired or not.
+
+    The bulk form of ``delete``, and the difference from ``cleanup`` is exactly one thing: this
+    one does not look at ``cleanup.max_age_days``. ``cleanup`` is the safe bulk command — it
+    keeps a month of rollbacks, which is what the threshold is for; this is the one an admin
+    reaches for when the point is to clear the pile out.
+
+    Same two steps as everything else. The plan lists every file with its size and age, which is
+    where "that one is from yesterday, I want to keep it" gets caught — and it is the reason
+    this can afford to ignore the threshold: the admin sees the whole set, by name, before
+    anything is removed.
+    """
+    if not _deletion_allowed():
+        _refuse_deletion(source)
+        return
+
+    backups = _backups_now(_server)
+    if not backups:
+        source.reply(tr("command.cleanup.empty"))
+        return
+    _stage_backup_plan(_KIND_DELETE_ALL, source, backups, "command.delete.all_header", prefix)
+
+
+def _stage_backup_plan(kind: str, source: CommandSource, files: Sequence[Backup],
+                       header_key: str, prefix: str) -> None:
+    """Print the plan for a bulk deletion and stage it, whatever picked the set.
+
+    Shared by ``cleanup`` and ``delete all``: they differ in *which* backups they are about, and
+    nothing else. Two copies of the rows, the truncation and the ask-for-confirmation would be
+    two chances for one of them to stop asking.
+    """
+    lines = [tr(header_key, count=len(files), size=_format_size(total_bytes(files)))]
+    lines.extend(_backup_line(item.file_name, item.size_bytes, item.age_days)
+                 for item in files[:CLEANUP_PLAN_ROWS])
+    if len(files) > CLEANUP_PLAN_ROWS:
+        lines.append(tr("command.cleanup.plan_more", count=len(files) - CLEANUP_PLAN_ROWS))
+    lines.append(tr("command.cleanup.plan_undo"))
+    lines.append(_confirm_ask(prefix))
+    _stage_batch(kind, source, [item.file_name for item in files], lines)
+
+
+def _stage_cleanup_notice(files: Sequence[str]) -> bool:
+    """Stage the cleanup plan with no command behind it — the reminder's half of the flow.
+
+    ``False`` when something is already staged. A reminder must never clobber a plan an admin
+    is halfway through confirming: it is not an instruction from a person, and the one thing
+    worse than not staging it is replacing "install these three" with "delete those two".
+
+    ``requester`` is empty, which no command source ever produces (see ``_requester``). It
+    means "whoever reads this may confirm it" — the notice is addressed to the server's admins
+    rather than to one of them.
+    """
+    global _pending_action
+    with _pending_lock:
+        if _pending_action is not None:
+            return False
+        _pending_action = {
+            "kind": _KIND_DELETE_EXPIRED,
+            "files": sorted(files),
+            "requester": "",
+            "deadline": time.monotonic() + CONFIRM_TIMEOUT_SECONDS,
+        }
+    return True
+
+
+def _announce_cleanup(server: PluginServerInterface, broadcast: bool = True) -> None:
+    """Bring the expired backups up, once per check, when the feature is on.
+
+    Not part of the summary, and not gated on ``report.updates_only``: this is housekeeping,
+    not a check result, and folding it into a report that most servers print as a single line
+    is the same as not saying it. It is gated on ``cleanup.enabled`` instead — the switch that
+    means "I want to hear about this" — and that one sits behind ``cleanup.allow_delete``:
+    a reminder whose only next step is a refused command is worse than silence, because it
+    teaches the admin that the plugin's instructions do not work.
+
+    The plan is staged when the slot is free, so that the sentence the admin reads ("type
+    ``!!muc confirm`` to delete them") is true when they read it, rather than true only in the
+    120 seconds after some unrelated event. When the slot is busy the notice says so and names
+    the command that stages the plan, which is the honest version of the same sentence.
+    """
+    if not _deletion_allowed() or not _config.cleanup.enabled:
+        return
+    expired_now = _expired_now(server)
+    if not expired_now:
+        return
+
+    days = max(0, int(_config.cleanup.max_age_days))
+    size = _format_size(total_bytes(expired_now))
+    staged = _stage_cleanup_notice([item.file_name for item in expired_now])
+
+    server.logger.info(tr("cleanup.notice", count=len(expired_now), days=days, size=size))
+    server.logger.info(
+        tr("cleanup.notice_confirm", command=ROOT_LITERALS[0] + " confirm")
+        if staged
+        else tr("cleanup.notice_stage", command=ROOT_LITERALS[0] + " cleanup")
+    )
+
+    if not broadcast or not (_server_running(server) and _online_players):
+        return
+    notice = [
+        Notice(tr("cleanup.notice", count=len(expired_now), days=days, size=size), "action"),
+        Notice(
+            tr("cleanup.notice_confirm", command=ROOT_LITERALS[0] + " confirm")
+            if staged
+            else tr("cleanup.notice_stage", command=ROOT_LITERALS[0] + " cleanup"),
+            "hint",
+        ),
+    ]
+    for name in _permitted_players(
+        server, sorted(_online_players), _config.report.in_game_permission
+    ):
+        _tell_player(server, name, notice)
+
+
+def _confirmed_delete(source: CommandSource, entry: UpdateEntry) -> None:
+    """Remove the one backup ``delete`` staged, if it is still there."""
+    server = _server
+    if server is None:
+        return
+    folder = _mods_folder(server, _config)
+    backups = list_backups(folder) if folder is not None else []
+    target = next((item for item in backups if item.file_name == entry.file_name), None)
+    if target is None:
+        # Deleted by hand between the two commands. Not an error, and not worth inventing a
+        # failure for.
+        source.reply(tr("command.cleanup.gone", file=entry.file_name))
+        return
+
+    results = remove_backups(folder, [target])
+    for result in results:
+        source.reply(
+            tr("command.cleanup.deleted_one", file=result.file_name,
+               size=_format_size(target.size_bytes))
+            if result.removed
+            else tr("command.cleanup.failed_one", file=result.file_name, detail=result.detail)
+        )
+    _forget_backups([result.file_name for result in results if result.removed])
+
+
+def _confirm_cleanup(source: CommandSource, pending: Dict[str, Any], prefix: str) -> None:
+    """Carry out a staged cleanup, after re-deriving the set from the folder.
+
+    Re-derived rather than reused, and compared as a set rather than counted — the rule the two
+    bulk commands follow, for the same reason: a backup added or removed between the notice and
+    the confirmation means the admin agreed to a different set than the one about to be acted
+    on, and running the intersection would report success over work that was not done.
+    """
+    server = _server
+    if server is None:
+        return
+    folder = _mods_folder(server, _config)
+    doomed = _backups_for(pending["kind"], folder)
+    if sorted(item.file_name for item in doomed) != pending["files"]:
+        _clear_pending()
+        source.reply(tr("command.action.stale_cleanup",
+                        command="{} {}".format(prefix,
+                                               _BULK_DELETE_RETRY[pending["kind"]])))
+        return
+
+    _clear_pending()
+    removed_names = set()
+    freed = 0
+    failures: List[str] = []
+    for result in remove_backups(folder, doomed):
+        if result.removed:
+            removed_names.add(result.file_name)
+        else:
+            failures.append(result.file_name)
+    freed = sum(item.size_bytes for item in doomed if item.file_name in removed_names)
+    _forget_backups(removed_names)
+
+    source.reply(tr("command.cleanup.done", count=len(removed_names),
+                    size=_format_size(freed)))
+    if failures:
+        source.reply(tr("command.cleanup.failed", count=len(failures),
+                        names=", ".join(sorted(failures)[:AMBIGUOUS_NAMES])))
+
+
+# --------------------------------------------------------------------------------------
 # Fetching and installing one mod, on demand
 #
 # The same two steps the automatic path takes, but for a single mod the admin names, and
@@ -2067,6 +2729,36 @@ def _clear_pending() -> None:
     global _pending_action
     with _pending_lock:
         _pending_action = None
+
+
+def _confirm_ask(prefix: str) -> RTextList:
+    """The ``type !!muc confirm`` line of every staged plan: the command is a red button.
+
+    Red is the plugin's "needs you" colour, and this command really is the one thing standing
+    between the plan and the irreversible part. It is clickable as a **fill**, not a run:
+    ``confirm`` executes a deletion or an install, and a single stray click in a chat window
+    should not be able to do that — filling the box still asks for the enter key, which is the
+    same deliberate step the two-command design exists to force.
+
+    The sentence stays **one template** in the catalogue, command included, and the code splits
+    the finished string around the command to draw that word red. Two half-sentences would have
+    been the other way, but then each language would hold the deadline in a different half —
+    and a translation that drops a placeholder prints the template unformatted, which is exactly
+    what the catalogue invariant refuses to allow. Here nothing can be dropped: if the command
+    is not in the rendered sentence at all, the line falls back to plain text.
+
+    The console gets the same line (``str()`` drops the colour and the click, not the words).
+    """
+    command = "{} confirm".format(prefix)
+    sentence = tr("command.action.ask", seconds=CONFIRM_TIMEOUT_SECONDS, command=command)
+    before, marker, after = sentence.partition(command)
+    if not marker:
+        return RTextList(RText(sentence, RColor.gray))
+    return RTextList(
+        RText(before, RColor.gray),
+        RText(command, RColor.red).set_click_event(RAction.suggest_command, command),
+        RText(after, RColor.gray),
+    )
 
 
 def _stage_action(
@@ -2139,7 +2831,9 @@ def _pending_action_for(source: CommandSource) -> Optional[Dict[str, Any]]:
         _clear_pending()
         source.reply(tr("command.action.expired", seconds=CONFIRM_TIMEOUT_SECONDS))
         return None
-    if pending["requester"] != _requester(source):
+    # 空字符串是「提醒替所有人准备的」——没有任何命令来源会产生它（见 _requester），
+    # 所以它专门表示「读到这条的任一管理员都可以确认」。
+    if pending["requester"] and pending["requester"] != _requester(source):
         source.reply(tr("command.action.other_player", player=pending["requester"]))
         return None
     return pending
@@ -2177,14 +2871,12 @@ def _manual_download(source: CommandSource, handle: str, prefix: str) -> None:
         "download", source, report, entry,
         [
             tr("command.download.plan_header", count=1),
-            tr("line.update", name=entry.name, local=entry.local_version or "?",
-               latest=entry.latest_version or "?"),
+            entry_line_text(entry, tr),
             tr("command.download.plan_file",
                file=safe_jar_name(entry.download_filename, entry.fallback_file_name()),
                size=_format_size(entry.download_size) if entry.download_size
                else tr("command.download.size_unknown")),
-            tr("command.action.ask", seconds=CONFIRM_TIMEOUT_SECONDS,
-               command=prefix + " confirm"),
+            _confirm_ask(prefix),
         ],
     )
 
@@ -2232,14 +2924,12 @@ def _manual_download_all(source: CommandSource, prefix: str) -> None:
                 size=_format_size(known))
     ]
     for entry in candidates[:BULK_PLAN_ROWS]:
-        lines.append(tr("line.update", name=entry.name, local=entry.local_version or "?",
-                        latest=entry.latest_version or "?"))
+        lines.append(entry_line_text(entry, tr))
     if len(candidates) > BULK_PLAN_ROWS:
         lines.append(tr("report.and_more", count=len(candidates) - BULK_PLAN_ROWS))
     if blocked:
         lines.append(tr("command.download.all_skipped", count=len(blocked)))
-    lines.append(tr("command.action.ask", seconds=CONFIRM_TIMEOUT_SECONDS,
-                    command=prefix + " confirm"))
+    lines.append(_confirm_ask(prefix))
 
     _stage_batch("download_all", source, [entry.file_name for entry in candidates], lines)
 
@@ -2261,7 +2951,7 @@ def _download_blocker(entry: UpdateEntry, prefix: str, number: Optional[int]) ->
         return None
     if entry.status == STATUS_NO_COMPATIBLE_BUILD:
         return tr("command.download.no_build", name=entry.name)
-    if entry.status == STATUS_UP_TO_DATE or entry.status == STATUS_LOCAL_AHEAD:
+    if entry.status in (STATUS_UP_TO_DATE, STATUS_LOCAL_AHEAD):
         return tr("command.download.current", name=entry.name,
                   version=entry.local_version or "?")
     return tr("command.download.unresolvable", name=entry.name,
@@ -2311,8 +3001,7 @@ def _manual_install(source: CommandSource, handle: str, prefix: str) -> None:
         # anyway this command changes nothing, and an admin who did not know that would think
         # they had just narrowed the next stop to one mod.
         lines.append(tr("command.install.plan_already_automatic"))
-    lines.append(tr("command.action.ask", seconds=CONFIRM_TIMEOUT_SECONDS,
-                    command=prefix + " confirm"))
+    lines.append(_confirm_ask(prefix))
     _stage_action("install", source, report, entry, lines)
 
 
@@ -2337,18 +3026,30 @@ def _manual_install_all(source: CommandSource, prefix: str) -> None:
         lines.append(tr("report.and_more", count=len(pending) - BULK_PLAN_ROWS))
     if _config.download.install_on_stop:
         lines.append(tr("command.install.plan_already_automatic"))
-    lines.append(tr("command.action.ask", seconds=CONFIRM_TIMEOUT_SECONDS,
-                    command=prefix + " confirm"))
+    lines.append(_confirm_ask(prefix))
 
     _stage_batch("install_all", source, [entry.file_name for entry in pending], lines)
 
 
 def _manual_confirm(source: CommandSource, prefix: str) -> None:
-    """``confirm`` — carry out whatever ``download`` or ``install`` staged."""
+    """``confirm`` — carry out whatever ``download`` / ``install`` / ``delete`` staged."""
     pending = _pending_action_for(source)
     if pending is None:
         return
 
+    if pending["kind"] in _DELETE_KINDS and not _deletion_allowed():
+        # The option was switched off between the two commands (``reload`` does not touch the
+        # slot). The plan has lost the thing that authorised it, so it is dropped rather than
+        # carried out — a gate on the command but not here would let a staged plan walk past
+        # the switch, which is the one thing it exists to stop.
+        _clear_pending()
+        _refuse_deletion(source)
+        return
+
+    if pending["kind"] in _BULK_DELETE_KINDS:
+        # 直接从磁盘重新推导集合，而不是从报告里挑：这个命令删的是文件，报告只是快照。
+        _confirm_cleanup(source, pending, prefix)
+        return
     if pending["kind"] in ("download_all", "install_all"):
         _confirm_batch(source, pending, prefix)
         return
@@ -2366,6 +3067,9 @@ def _manual_confirm(source: CommandSource, prefix: str) -> None:
     if pending["kind"] == "download":
         _clear_pending()
         _confirmed_download(source, entry, number, prefix)
+    elif pending["kind"] == "delete":
+        _clear_pending()
+        _confirmed_delete(source, entry)
     else:
         _confirmed_install(source, entry, prefix)
 
@@ -2434,10 +3138,7 @@ def _confirmed_download_all(
                 # the same trace in the console as one the schedule started.
                 _log_download_outcomes(server, _last_report, outcomes, folder)
 
-        counts = {status: 0 for status in (STATUS_DOWNLOADED, STATUS_ALREADY_PRESENT,
-                                           STATUS_SKIPPED, STATUS_FAILED)}
-        for outcome in outcomes:
-            counts[outcome.status] = counts.get(outcome.status, 0) + 1
+        counts = _download_tally(outcomes)
         _reply_to(source, tr("command.download.batch_done",
                              downloaded=counts[STATUS_DOWNLOADED],
                              existing=counts[STATUS_ALREADY_PRESENT],
@@ -2679,6 +3380,31 @@ def _manual_map_state(server: PluginServerInterface) -> str:
     )
 
 
+def _backup_state(directory: Any) -> str:
+    """The ``旧版备份`` line: how many, how big, how many are past the threshold.
+
+    Counted from the directory rather than from the last report, so the line is true on a
+    server that has not run a check since the last install — which is exactly the server whose
+    backups the admin is asking about.
+    """
+    backups = list_backups(directory)
+    if not backups:
+        return tr("command.status.backup_none")
+    days = max(0, int(_config.cleanup.max_age_days))
+    expired_count = len(expired(backups, days))
+    value = tr("command.status.backup", count=len(backups),
+               size=_format_size(total_bytes(backups)))
+    if expired_count:
+        value += tr("command.status.backup_expired", count=expired_count, days=days)
+        # Only when there is something to delete: on a server with nothing expired, "deletion is
+        # off" is not a fact anyone needs, and printing it on every status screen would turn a
+        # safety switch into wallpaper. When there is something, it is the answer to the
+        # question the line just raised — why nothing has offered to clean these up.
+        if not _deletion_allowed():
+            value += tr("command.status.backup_locked")
+    return value
+
+
 def _show_status(source: CommandSource) -> None:
     """What the plugin currently thinks the server is, and what it is configured to do.
 
@@ -2755,6 +3481,16 @@ def _show_status(source: CommandSource) -> None:
             install_colour,
         ),
     )
+    # 备份这一类东西以前完全没有出现在任何界面上：管理员装了半年插件，mods/ 里堆着多少
+    # 个 .old 只有他自己 ls 才知道。这一行是它在状态屏上的位置，list 里则是完整的行。
+    parts.append("\n")
+    parts.append(
+        _field(
+            tr("command.status.backup_label"),
+            _backup_state(scan.directory),
+            RColor.white,
+        )
+    )
     if _config.check.ignored_mods:
         parts.append("\n")
         parts.append(
@@ -2789,6 +3525,9 @@ def _show_status(source: CommandSource) -> None:
             RColor.white,
         )
     )
+    # 这一屏没有可点可悬的东西，底栏就是一条闭合线——它把这块输出和后面别的输出分开。
+    parts.append("\n")
+    parts.append(_rule_line())
     source.reply(parts)
 
 
@@ -2846,7 +3585,61 @@ def _title_line(server: Optional[PluginServerInterface] = None) -> RTextList:
     return line
 
 
-def _help_line(description: str, command: str, action: Any, width: int) -> RTextList:
+def _rule_line(caption: str = "") -> RTextList:
+    """``========  caption  ========`` — the plain rule every screen now closes with.
+
+    Sized to the **title bar's own total width** (computed from the same name and version, not
+    from ``_TITLE_WIDTH`` — the two differ by a space when the bar's arithmetic leaves a
+    remainder), so the top and bottom edges of a screen line up.
+
+    With no caption it is a plain run of ``=``; with one it carries the reminder that belongs
+    at the bottom of that screen — the listing says which of its parts can be hovered and which
+    can be clicked. Callers pass a caption only where the reader has a mouse: on the console
+    the same sentence would be describing things a terminal cannot do, so the rule stays plain.
+    """
+    name, version = _plugin_title(_server)
+    core = "{} v{}".format(name, version) if version else name
+    total = 2 * max(_TITLE_BAR_MIN, (_TITLE_WIDTH - len(core) - 4) // 2) + len(core) + 4
+    if not caption:
+        return RTextList(RText("=" * total, RColor.gold))
+    room = total - display_width(caption) - 4
+    left = max(_TITLE_BAR_MIN, room // 2)
+    right = max(_TITLE_BAR_MIN, room - left)
+    return RTextList(
+        RText("=" * left, RColor.gold), "  ",
+        RText(caption, RColor.gray), "  ",
+        RText("=" * right, RColor.gold),
+    )
+
+
+def _rows_rule_hint() -> str:
+    """The closing rule's caption for screens whose rows carry the two red/green handles.
+
+    The labels are read from the same keys the rows themselves use, so the sentence cannot
+    claim ``[版本]`` hoverable in a language where the label is spelled something else. The
+    status tag is named too: it is the one column that says nothing about itself on the row
+    (every row spells it the same), so the hint is where a reader finds out it can be hovered.
+    """
+    return tr("command.rule.hint_rows", version=tr("line.version_label"),
+              status="[{}]".format(tr("line.status_word")),
+              details=tr("command.list.detail_link"))
+
+
+#: How wide each ASCII character is for the player's help page, in **quarters of a letter**.
+#:
+#: This used to be a table of its own, fitted by ``bench/help_width_model.py`` against the
+#: shipped Minecraft font and the font in the reader's screenshot. It is now
+#: :data:`report.GLYPH_QUARTERS` — the same table the ``!!muc list`` columns are padded with,
+#: measured off that client glyph by glyph (``bench/read_band_runs.py`` prints the advance of
+#: every run of pixels). Two tables would have drifted apart the first time either was tuned,
+#: and they are answering the same question: how wide does the game draw this?
+#:
+#: No model can be exact everywhere — a font whose space is a whole letter can only be aligned
+#: in whole-letter steps — so the aim is "as straight as the font allows", not for perfection.
+
+
+def _help_line(description: str, command: str, action: Any, width: int,
+               monospaced: bool, hover: str = "") -> RTextList:
     """One ``!!muc <subcommand>  -- description`` row, left column padded to ``width``.
 
     The separator carries its own leading space, so the column is exactly as wide as the longest
@@ -2855,16 +3648,56 @@ def _help_line(description: str, command: str, action: Any, width: int) -> RText
     is one more thing to remember when a command is added, and getting it wrong pushes the
     longest row out of alignment rather than failing visibly.
 
-    The click event goes on the command only: the padding that makes the column straight is not
-    part of what gets typed when the row is clicked.
+    ``monospaced`` picks the unit: the console's font is fixed-width, so character count *is*
+    the width there and the padding is exact; the game's font is proportional, so the padding
+    comes from ``text_quarters``' model — as close as a server can get without seeing the
+    client's font.
+
+    ``hover`` is the tooltip: the parts of a command's story that do not belong on a list line
+    (which statuses ``list`` accepts, what ``install`` steps do). It is attached to every piece
+    of the row rather than to the row as a whole: a list's own style lives on an empty header
+    and whether the client passes it down is the client's business — per piece, hovering
+    anywhere on the row works.
+
+    The click is two-sided, and that is on purpose. The **command** keeps its own action (run
+    for a command that works bare, fill for one that needs an argument); the **description**
+    (and the padding between them) always *fills the command in* — the reader asked for that
+    after clicking a description and getting nothing, and filling is the harmless half: worst
+    case the command is sitting in the input box, ready, and nothing has run.
     """
-    padding = " " * max(0, width - len(command))
+    if monospaced:
+        padding = " " * max(0, width - len(command))
+    else:
+        padding = " " * max(
+            0, int((width - text_quarters(command)) / QUARTERS_PER_LETTER + 0.5)
+        )
     click = command + (" " if action is RAction.suggest_command else "")
-    return RTextList(
+    fill = command + (" " if action is RAction.suggest_command else "")
+    pieces = [
         RText(command, RColor.aqua).set_click_event(action, click),
-        RText(padding + " -- ", RColor.gray),
-        RText(description, RColor.white),
+        RText(padding + " -- ", RColor.gray).set_click_event(RAction.suggest_command, fill),
+        RText(description, RColor.white).set_click_event(RAction.suggest_command, fill),
+    ]
+    if hover:
+        for piece in pieces:
+            piece.set_hover_text(hover)
+    return RTextList(*pieces)
+
+
+def _list_filter_hover() -> str:
+    """``list`` 那一行的浮窗：能填在后面的状态，一行一个。
+
+    从 ``ALL_STATUSES`` 现算而不是抄一份写死的清单：加一个状态时，这份提示跟着长——而它
+    正是筛选参数唯一会被读到的地方（筛选只认这些名字）。**一行一个**，不是逗号连成一长串：
+    客户端只在空格处断行，十个状态连排会溢出整个屏幕（用户截图里的第一件事）；排版交给
+    ``command.help.hover_status_line``（一行格式：名字 + 键）。
+    """
+    options = "\n".join(
+        tr("command.help.hover_status_line", name=tr("status." + name),
+           status_key=name)
+        for name in ALL_STATUSES
     )
+    return tr("command.help.hover_list", options=options)
 
 
 def _show_help(source: CommandSource, prefix: str = ROOT_LITERALS[0]) -> None:
@@ -2887,19 +3720,46 @@ def _show_help(source: CommandSource, prefix: str = ROOT_LITERALS[0]) -> None:
     # Built with explicit ``tr`` calls rather than by looping over a tuple of keys: the
     # catalogue invariant collects key literals from their call sites, so a key reached through
     # a variable would look unused and be reported as a stale entry.
+    #
+    # Each row is ``(description, command, action, hover)``: the description is the short line
+    # the reader scans, and everything that would have been a parenthetical — what the argument
+    # accepts, what the step does — moved into the hover. The page is a table of contents; the
+    # footnotes belong on the entries.
     entries = (
-        (tr("command.help.entry_check"), prefix + " check", RAction.run_command),
-        (tr("command.help.entry_list"), prefix + " list", RAction.run_command),
-        (tr("command.help.entry_summary"), prefix + " summary", RAction.run_command),
-        (tr("command.help.entry_info"), prefix + " info", RAction.suggest_command),
-        (tr("command.help.entry_download"), prefix + " download", RAction.suggest_command),
-        (tr("command.help.entry_install"), prefix + " install", RAction.suggest_command),
-        (tr("command.help.entry_confirm"), prefix + " confirm", RAction.run_command),
-        (tr("command.help.entry_status"), prefix + " status", RAction.run_command),
-        (tr("command.help.entry_reload"), prefix + " reload", RAction.run_command),
-        (tr("command.help.entry_help"), prefix + " help", RAction.run_command),
+        (tr("command.help.entry_check"), prefix + " check", RAction.run_command,
+         tr("command.help.hover_check")),
+        (tr("command.help.entry_list"), prefix + " list", RAction.run_command,
+         _list_filter_hover()),
+        (tr("command.help.entry_summary"), prefix + " summary", RAction.run_command,
+         tr("command.help.hover_summary")),
+        (tr("command.help.entry_info"), prefix + " info", RAction.suggest_command,
+         tr("command.help.hover_info")),
+        (tr("command.help.entry_download"), prefix + " download", RAction.suggest_command,
+         tr("command.help.hover_download")),
+        (tr("command.help.entry_install"), prefix + " install", RAction.suggest_command,
+         tr("command.help.hover_install")),
+        (tr("command.help.entry_delete"), prefix + " delete", RAction.suggest_command,
+         tr("command.help.hover_delete")),
+        (tr("command.help.entry_cleanup"), prefix + " cleanup", RAction.run_command,
+         tr("command.help.hover_cleanup")),
+        (tr("command.help.entry_confirm"), prefix + " confirm", RAction.run_command,
+         tr("command.help.hover_confirm")),
+        (tr("command.help.entry_status"), prefix + " status", RAction.run_command,
+         tr("command.help.hover_status")),
+        (tr("command.help.entry_reload"), prefix + " reload", RAction.run_command,
+         tr("command.help.hover_reload")),
+        (tr("command.help.entry_help"), prefix + " help", RAction.run_command,
+         tr("command.help.hover_help")),
     )
-    width = max(len(command) for _description, command, _action in entries)
+    # The console is a fixed-width font, so character count is the width there; the game's
+    # font is proportional, so the width comes from the model above. Same rows either way.
+    is_player = getattr(source, "is_player", False)
+    monospaced = not is_player
+    if monospaced:
+        width = max(len(command) for _description, command, _action, _hover in entries)
+    else:
+        width = max(text_quarters(command)
+                    for _description, command, _action, _hover in entries)
 
     rows = RTextList()
     rows.append(_title_line(_server))
@@ -2908,9 +3768,11 @@ def _show_help(source: CommandSource, prefix: str = ROOT_LITERALS[0]) -> None:
     rows.append("\n")
     rows.append(RText(tr("command.help.permission", level=_config.command_permission_level),
                       RColor.yellow))
-    for description, command, action in entries:
+    for description, command, action, hover in entries:
         rows.append("\n")
-        rows.append(_help_line(description, command, action, width))
+        rows.append(_help_line(description, command, action, width, monospaced, hover))
+    rows.append("\n")
+    rows.append(_rule_line(tr("command.rule.hint_help") if is_player else ""))
     source.reply(rows)
 
 
@@ -3023,6 +3885,20 @@ def _command_tree(prefix: str):
                 )
             )
         )
+        .then(
+            Literal("delete")
+            # 裸 delete 给用法，和 info / download / install 一致：只说 "delete" 没说删什么，
+            # 唯一能确定的事就是他还需要知道语法。
+            .runs(lambda source: source.reply(tr("command.delete.usage", command=prefix)))
+            .then(
+                GreedyText("target").suggests(
+                    _suggest_handles(lambda report: report.backups, include_all=True)
+                ).runs(
+                    lambda source, context: _manual_delete(source, context["target"], prefix)
+                )
+            )
+        )
+        .then(Literal("cleanup").runs(lambda source: _manual_cleanup(source, prefix)))
         .then(Literal("confirm").runs(lambda source: _manual_confirm(source, prefix)))
     )
 
@@ -3135,13 +4011,14 @@ def _log_cache_summary(server: PluginServerInterface, config: Config) -> None:
     path = os.path.join(server.get_data_folder(), CACHE_FILE_NAME)
     if not os.path.isfile(path):
         return
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            payload = json.load(handle)
-        records = payload.get("records") or {}
-    except (OSError, ValueError):
-        return
-    if records:
+    # ``isinstance`` rather than a bare ``.get``: the file is written by this plugin, but it is
+    # also a file in the plugin's folder that anything can edit, and a stray ``[]`` in it used
+    # to raise ``AttributeError`` straight out of ``on_load`` — a cache that was hand-edited
+    # into nonsense taking the whole plugin down at startup. A log line may never be able to do
+    # that, so it checks instead.
+    payload = read_json(path)
+    records = payload.get("records") if isinstance(payload, dict) else None
+    if isinstance(records, dict) and records:
         server.logger.info(tr("console.cache_summary", records=len(records), path=path))
 
 

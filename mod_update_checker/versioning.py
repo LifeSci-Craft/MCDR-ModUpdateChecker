@@ -136,7 +136,7 @@ def _compare_tokens(left: Sequence[Token], right: Sequence[Token]) -> int:
     if len(left) == len(right):
         return 0
 
-    longer, shorter = (left, right) if len(left) > len(right) else (right, left)
+    longer = left if len(left) > len(right) else right
     extra = longer[min(len(left), len(right)):]
     # A trailing segment that *starts* with a pre-release marker makes a version older, not
     # newer: ``1.0.0`` beats ``1.0.0-rc.1``. Only the first extra token is consulted, since

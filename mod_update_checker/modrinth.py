@@ -365,11 +365,10 @@ class ModrinthClient:
         payload = self.http.get_json("{}/tag/game_version".format(self.base_url))
         if not isinstance(payload, list):
             return []
-        releases = [
+        return [
             str(item.get("version"))
             for item in payload
             if isinstance(item, dict)
             and item.get("version_type") == "release"
             and item.get("version")
         ]
-        return releases

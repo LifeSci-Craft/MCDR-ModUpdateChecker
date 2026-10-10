@@ -34,9 +34,7 @@ request for the entire folder, so remembering it would save a request that costs
 while a stale positive would be a claim about bytes that may have been replaced since.
 """
 
-import json
 import logging
-import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -45,6 +43,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
+from .cleanup import list_backups
+from .jsonfile import read_json, write_json
 from .modrinth import ModrinthClient, ModrinthProject, ModrinthVersion
 from .projectmap import ProjectMap
 from .report import (
@@ -61,6 +61,7 @@ from .report import (
     STATUS_UPDATE_AVAILABLE,
     Report,
     UpdateEntry,
+    entry_from_backup,
     entry_from_scan,
     mc_mismatch_note,
 )
@@ -169,11 +170,7 @@ class ResolveCache:
     def _load(self) -> Dict[str, Any]:
         if not self.enabled or not self.path or not self.path.is_file():
             return {}
-        try:
-            with open(self.path, "r", encoding="utf-8") as handle:
-                data = json.load(handle)
-        except (OSError, ValueError):
-            return {}
+        data = read_json(self.path)
         if not isinstance(data, dict) or data.get("version") != self.VERSION:
             return {}
         records = data.get("records")
@@ -210,11 +207,7 @@ class ResolveCache:
         with self._lock:
             payload = {"version": self.VERSION, "records": self._data}
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = self.path.with_suffix(self.path.suffix + ".tmp")
-            with open(temporary, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle, ensure_ascii=False, indent=2)
-            os.replace(temporary, self.path)
+            write_json(self.path, payload)
         except OSError as error:
             _LOGGER.warning("could not write resolve cache %s: %s", self.path, error)
 
@@ -328,6 +321,15 @@ class Checker:
             self.close()
 
         self._collect_advisories(scan, server, report, entries)
+
+        # The ``.old`` backups an earlier install left behind. Listed after the mods rather than
+        # mixed in with them: they are files this plugin created, not jars to identify, and
+        # nothing here talks to the platform about them. They become entries so that the
+        # listing's number, the handle lookup and ``list <状态>`` cover them without a second
+        # mechanism — ``!!muc delete 7`` has to be as unambiguous as ``!!muc install 7``.
+        for backup in list_backups(scan.directory):
+            entry = entry_from_backup(backup)
+            entries[entry.file_name] = entry
 
         report.entries = list(entries.values())
         report.unidentified = [

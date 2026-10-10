@@ -69,7 +69,20 @@ MINIMUM_MCDR = (2, 13, 0)
 
 # How long to let MCDR start the server, run the delayed check and finish. Generous: a
 # cold Python start plus MCDR's own initialisation is most of it.
-RUN_SECONDS = 60
+#
+# It has to cover the boot, the delay below, the entire script and the shutdown that follows
+# the final ``stop``, so it grows whenever the script does. The kill is a safety net, not the
+# plan: a run that hits it loses whatever commands had not been typed yet, and the checks would
+# fail for a reason that has nothing to do with the plugin.
+RUN_SECONDS = 75
+
+#: How long to wait before typing at the console: the startup check has its own delay
+#: (``check.start_delay_seconds``, set to 2 in this config) plus the transfers it makes, and a
+#: command typed before it finishes would be answered against a report that does not exist yet.
+FEED_DELAY_SECONDS = 25
+
+#: Spacing between console commands. Slow enough that each one's output is written before the
+#: next arrives — which is what makes "the notice came from *this* check" a readable claim.
 COMMAND_INTERVAL = 1.2
 
 #: The player the fake server announces, so the in-game notification path has a recipient.
@@ -145,6 +158,13 @@ handler_detection: false
 write_server_output_to_log_file: false
 """
 
+#: A step in ``COMMANDS`` that is not typed at the console but done to the instance.
+#:
+#: run_one replaces it with :func:`unlock_deletion` bound to the folder it is building, so the
+#: step and the commands around it stay one ordered script.
+UNLOCK_DELETION = object()
+
+
 #: Commands fed to MCDR's console once the automatic check has had time to finish, in order.
 #:
 #: The numbering is derived from the scenario, and the three numbers used here are the ones
@@ -204,7 +224,54 @@ COMMANDS = [
     # an install, which would move the file the download assertions above are looking at.
     "!!muc install Flaky Mod",
     "!!modupdate check",
+    # --- 清理旧版备份：先被开关拒绝一次，再由管理员打开它，最后真的删掉 --------------------
+    #
+    # 这一段是一个故事，顺序就是故事本身，四步都有断言：
+    #
+    #   1. ``list old_backup`` —— 备份**看得见**，这一步不受任何开关影响；
+    #   2. ``delete <文件名>`` —— ``cleanup.allow_delete`` 还是出厂值（关），所以它必须被拒绝；
+    #   3. 场景步骤：把那个选项写开（管理员改配置文件），然后 ``reload``；
+    #   4. ``check`` → ``cleanup`` → ``confirm`` —— 提醒出现、计划列出、文件真的没了。
+    #
+    # 第 2 步的「什么都没发生」由第 4 步反证：``cleanup`` 只在 `retired.jar.old` **还在**
+    # 的时候才列得出计划（``cleanup_staged`` 锚在这个文件名上），所以那次被拒的删除若是真删了
+    # 东西，后面的计划就列不出来。这比在控制台里数文件名出现几次可靠得多。
+    "!!muc list old_backup",
+    "!!muc delete retired.jar.old",
+    UNLOCK_DELETION,
+    "!!muc reload",
+    # 解锁之后的第一次检查——提醒只有到这里才允许出现，而那正是要验证的前置关系。
+    "!!muc check",
+    # 先把计划列出来并要求确认，``confirm`` 才动手。顺序不能反：这两条命令之间如果插进别的
+    # ``confirm``，删的就是别的计划了。
+    "!!muc cleanup",
+    "!!muc confirm",
+    # 读一次实时状态：这一行数的是**磁盘**上的备份，所以它同时证明 cleanup 只拿走了过期的
+    # 那一个（还剩 1 个），而不是把两个都删了。
+    "!!muc status",
+    # 同一个锁下面的另一条路径：``delete all`` 不看天数，刚剩下的那个 3 天大的备份正是它的。
+    "!!muc delete all",
+    "!!muc confirm",
 ]
+
+def unlock_deletion(root: Path):
+    """The admin's edit: write ``cleanup.allow_delete: true`` into the instance's config.
+
+    This is what the run's story turns on — the same file an admin would open, written the same
+    way, with a ``reload`` typed right after it. Nothing else in the config is touched, so the
+    only difference between the two halves of the run is the switch under test.
+
+    MCDR has already rewritten the file with every option in it by the time this runs, so the
+    section is known to exist; ``setdefault`` is there for the case where the healing did not
+    happen, which is a thing the run checks for separately.
+    """
+    def step() -> None:
+        path = root / "config" / PLUGIN_ID / "config.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data.setdefault("cleanup", {})["allow_delete"] = True
+        write(path, json.dumps(data, indent=2))
+
+    return step
 
 #: The extra step the install run takes: confirm the staged authorisation.
 #:
@@ -222,7 +289,8 @@ COMMAND_EXPECTATIONS = {
     # ASCII colon: the separator is part of the translated label, not hardcoded.
     "status_mc": "服务端: 26.3",
     # The listing is a numbered index: one line per mod plus a clickable detail label.
-    "list_all": "点 [详细信息] 看版本变更与链接",
+    # 列表尾部那句提示（v1.6.0 起：原来那句带一个悬空的冒号，拆成了两句）。
+    "list_all": "某个 Mod 的详情",
     "list_filtered": "[详细信息]",
     # The detail view a click lands on: a version change and the two links.
     "info_detail": "版本: ",
@@ -232,6 +300,19 @@ COMMAND_EXPECTATIONS = {
     # proving anything about the alias. Only the ``!!muc`` help says ``!!muc list``.
     "alias": "!!muc list",
     "check_started": "已在后台开始检查",
+    # 清理计划的第一行，锚在文件名上：批量计划的计数会变，而这个文件名是场景种下的、
+    # 整轮只出现一次的那个。
+    "cleanup_staged": "retired.jar.old",
+    # ``delete all`` 的标题带「全部」，与 ``cleanup`` 的标题（「即将删除 N 个旧版备份」）不是同一句。
+    "delete_all_staged": "即将删除全部 1 个旧版备份",
+    # 列表行末尾的状态注释，带 ASCII 括号——状态屏那一行是「旧版备份: 」，提醒里是
+    # 「旧版备份（.old）」，只有列表会把状态写进括号，所以这个子串只可能来自一行列表。
+    "list_backups": "(旧版备份)",
+    # 提醒的开头，**连同计数**：只有 ``cleanup.notice`` 会写「有 N 个旧版备份」，列表写的是
+    # ``(旧版备份)``、状态屏写的是「旧版备份: 」。带上计数还让它同时证明「提醒的是 1 个」。
+    "cleanup_notice": "有 1 个旧版备份",
+    # 开关关着时那条命令的回绝语。它出现的位置本身就是一条证据（见 cleanup_reminded）。
+    "cleanup_locked": "删除功能未开启",
     # The staged plan, and the sentence that asks for the confirmation. The timeout itself is
     # left out of the assertion: it is a constant in the plugin, and pinning the number here
     # would make changing it fail a run for no reason.
@@ -252,7 +333,7 @@ COMMAND_EXPECTATIONS = {
     "install_refused_status": "Blocked Mod 当前状态是「无适配构建」",
     # The single-mod header, whole: the bulk header carries a count between these two words,
     # so the shorter substring would be satisfied by a batch reply with no single install in it.
-    "install_staged": "即将安排安装（下次关服时执行）",
+    "install_staged": "即将安排安装(下次关服时执行)",
     "install_authorised": "已授权",
 }
 
@@ -405,7 +486,24 @@ CONFIG_OVERRIDES = (
     # by ``--with-install``, which is a separate run because installing moves the fetched files
     # out of the download folder that the default run's assertions inspect.
     "download.install_on_stop",
+    # Off by default. Turned on because the reminder is one of the two things this section has
+    # to get right, and a message built out of a directory's worth of file names is worth reading
+    # once as a real admin would.
+    "cleanup.enabled",
 )
+
+#: ``cleanup.allow_delete`` is deliberately **absent** from everything above.
+#:
+#: It is not an oversight and not a convenience: the run starts on the shipped default (deletion
+#: off) so that the refusal path is executed, and then ``UNLOCK_DELETION`` writes it on and types
+#: ``!!muc reload`` — the same edit an admin would make, in the middle of the same run. Declaring
+#: it here would mean writing it before boot and losing the first half of the story; leaving it
+#: at the default and flipping it mid-run is what makes "the switch is what changed the answer"
+#: a fact about one run rather than a comparison between two.
+#:
+#: The flip is a *scenario* change, not a config override, which is why it is not in the tuple
+#: above — that tuple describes the file this tool writes before the instance starts, and
+#: ``tests/test_mcdr_entry.py`` asserts it still does.
 
 
 def plugin_config(upstream, install: bool = False) -> dict:
@@ -422,6 +520,14 @@ def plugin_config(upstream, install: bool = False) -> dict:
         "network": {"requests_per_minute": 0, "retries": 0},
         "report": {"in_game": True},
         "download": {"enabled": True},
+        # Off by default, and the only feature that deletes anything. Switched on here with a
+        # threshold of zero so the seeded backup below is guaranteed to be named whatever the
+        # clock says — the run then proves end to end that a real MCDR deletes it after a
+        # confirmation, and that nothing else in mods/ is touched.
+        # The threshold is left at its shipped value (30 days) on purpose: the two planted
+        # backups straddle it, which is what makes ``cleanup`` (expired only) and ``delete all``
+        # (everything) different answers in this run rather than two spellings of one.
+        "cleanup": {"enabled": True},
     }
     if install:
         # Only the install run switches this on. It has to be a separate run rather than part
@@ -440,7 +546,7 @@ def plugin_config(upstream, install: bool = False) -> dict:
 
 #: The part of the listing's tail that every listing prints, whatever it holds. Counted, not
 #: searched for: "how many listings came out" is the question the paged command turns on.
-LISTING_MARKER = "点 [详细信息] 看版本变更与链接"
+LISTING_MARKER = "某个 Mod 的详情"
 
 #: The install summary line, as the plugin writes it. Checked verbatim so a run cannot pass
 #: on an install that never announced itself.
@@ -460,6 +566,45 @@ STALE_DOWNLOAD = {
     "version": "1.0.5",
     "bytes": b"PK\x03\x04 an older build that has since been superseded",
 }
+
+
+#: Two backups, one either side of the 30-day threshold the shipped config ships with.
+#:
+#: Two rather than one, because the feature under test is the *difference* between the two bulk
+#: commands: ``cleanup`` may only take the expired one, ``delete all`` takes both. A single
+#: backup could not tell those apart.
+SEEDED_BACKUPS = (
+    {
+        "file": "retired.jar.old",
+        "bytes": b"PK\x03\x04 a jar that was replaced and kept aside",
+        "age_days": 400,
+    },
+    {
+        "file": "fresh.jar.old",
+        "bytes": b"PK\x03\x04 a jar from last week's update",
+        "age_days": 3,
+    },
+)
+
+#: The one ``cleanup`` is about, and the one only ``delete all`` may touch.
+SEEDED_BACKUP = SEEDED_BACKUPS[0]
+SEEDED_FRESH_BACKUP = SEEDED_BACKUPS[1]
+
+
+def seed_expired_backup(root: Path) -> None:
+    """Plant the backups in ``mods/``, one expired and one not.
+
+    Seeded rather than produced by an install: the install runs at *stop*, which is after every
+    command in the run, so a backup created by it could never be seen by ``!!muc cleanup``. The
+    ages are stamped well either side of the threshold so neither is ambiguous.
+    """
+    folder = root / "server" / "mods"
+    folder.mkdir(parents=True, exist_ok=True)
+    for backup in SEEDED_BACKUPS:
+        path = folder / backup["file"]
+        path.write_bytes(backup["bytes"])
+        stamp = time.time() - (backup["age_days"] * 86400)
+        os.utime(str(path), (stamp, stamp))
 
 
 def seed_stale_download(root: Path) -> None:
@@ -505,20 +650,27 @@ def build_tree(root: Path, python: str, plugin: Path, upstream, jars, install: b
     )
     write(root / "permission.yml", PERMISSION_YML)
     seed_stale_download(root)
+    seed_expired_backup(root)
 
 
-def feed_commands(process, delay: float, install: bool = False) -> None:
-    """Write console commands into MCDR's stdin, spaced out so ordering is observable."""
-    commands = list(COMMANDS)
-    if install:
-        commands.append(MANUAL_INSTALL_COMMAND)
+def feed_commands(process, delay: float, commands) -> None:
+    """Write console commands into MCDR's stdin, spaced out so ordering is observable.
 
+    An entry may be a callable instead of a string: that is a *scenario step* — a change made to
+    the instance rather than something typed at its console — and it is invoked in the same slot
+    of the same sequence. Keeping both in one ordered script is what lets this run express
+    "the switch refuses, then the admin opens it, then it works" as one story; run_one fills the
+    step in because it is the one that knows where the instance lives.
+    """
     def run() -> None:
         try:
             time.sleep(delay)
             for command in commands:
-                process.stdin.write(command + "\n")
-                process.stdin.flush()
+                if callable(command):
+                    command()
+                else:
+                    process.stdin.write(command + "\n")
+                    process.stdin.flush()
                 time.sleep(COMMAND_INTERVAL)
             process.stdin.write("stop\n")
             process.stdin.flush()
@@ -566,7 +718,17 @@ def run_one(python: str, plugin: Path, workdir: Path, scenario_builder,
             bufsize=1,
             env=_child_env(python),
         )
-        feed_commands(process, delay=RUN_SECONDS - 25, install=install)
+        # The script, with the scenario step bound to *this* instance's folder. Built here
+        # rather than inside ``feed_commands`` so that two runs of the tool at once cannot end up
+        # sharing one root — the step writes a file, and writing it in the wrong tree would look
+        # exactly like the plugin ignoring the switch.
+        sequence = [
+            unlock_deletion(root) if entry is UNLOCK_DELETION else entry
+            for entry in COMMANDS
+        ]
+        if install:
+            sequence.append(MANUAL_INSTALL_COMMAND)
+        feed_commands(process, delay=FEED_DELAY_SECONDS, commands=sequence)
 
         lines = []
         started = time.time()
@@ -602,6 +764,7 @@ def run_one(python: str, plugin: Path, workdir: Path, scenario_builder,
             flaky_downloads=set(upstream.flaky_downloads),
             unwanted_downloads=set(upstream.unwanted_downloads),
             install=install,
+            seeded_jars=len(scenario_jars),
         )
         result["root"] = str(root)
         result["upstream_requests"] = len(upstream.request_paths())
@@ -714,6 +877,7 @@ def summarise(
     install: bool = False,
     flaky_downloads: Optional[set] = None,
     unwanted_downloads: Optional[set] = None,
+    seeded_jars: int = 0,
 ) -> dict:
     plugin_folder = root / "config" / PLUGIN_ID
     report_path = plugin_folder / "last_report.json"
@@ -765,14 +929,29 @@ def summarise(
         entry["file_name"]: entry["status"] for entry in report.get("entries", [])
     }
 
+    # The seeded backup, and whether it is still there. Read off the directory rather than off
+    # the log: a message claiming a deletion is worth nothing if the file did not go, and a
+    # run that deleted something else would still print the same sentence.
+    mods_folder_early = root / "server" / "mods"
+    backup_gone = not (mods_folder_early / SEEDED_BACKUP["file"]).exists()
+    fresh_gone = not (mods_folder_early / SEEDED_FRESH_BACKUP["file"]).exists()
+    jar_count = len(list(mods_folder_early.glob("*.jar")))
+
+    # Where the two markers about the switch sit in the console. Their *order* is the argument:
+    # ``!!muc delete`` runs while the switch is still at its shipped default and the reload that
+    # opens it comes later, so a reminder printed anywhere before the refusal would mean the
+    # reminder is not gated on the switch — and one printed after it can only have come from the
+    # check that ran after the reload. A missing notice fails the reminder check, so both
+    # directions are covered by the pair below.
+    locked_at = console.find(COMMAND_EXPECTATIONS["cleanup_locked"])
+    notice_at = console.find(COMMAND_EXPECTATIONS["cleanup_notice"])
+
     tellraws, fragments, tellraw_wrapper, tellraw_errors = _collect_tellraw(console)
     joined = "\n".join(tellraws)
 
-    # The notices say *what needs doing* by colour, not by wording — a heading is white, a row
-    # somebody has to act on is yellow, a row that is already done is gray. Read off the payload
-    # because that is the only place the colours exist: the builders decide roles, and the game
-    # receives the finished thing. Before v1.5.0 every run was yellow, which is what the two
-    # assertions below are watching for.
+    # 通知里按**状态**上色：标题白、有更新的行蓝（与列表里同一个状态同一个颜色）、已完成的行灰。
+    # 颜色只在 payload 里存在（构造方给的是角色，游戏收到的是成品），所以从 payload 读。
+    # v1.5.0 之前整段都是黄的——那一条断言在看着这个。
     headings = {colour for colour, text in fragments if "尚未下载" in text}
     rows = {colour for colour, text in fragments if "->" in text}
     # The listing is counted rather than merely found. Three commands in ``COMMANDS`` end in a
@@ -859,10 +1038,9 @@ def summarise(
         "notify_wrapper": tellraw_wrapper,
         "notify_errors": tellraw_errors,
         "notify_colours": sorted({colour for colour, _ in fragments if colour}),
-        # Two colours, two jobs: the heading says what the block is, the rows are the work. A
-        # single-colour notice fails both halves, which is deliberate — the point of the change
-        # was that a finished install must not look as urgent as a pending one.
-        "notify_coloured_by_role": headings == {"white"} and rows == {"yellow"},
+        # 两种颜色，两件事：标题说这一块是什么，行说这一条是什么状态。整段一个颜色会让两半
+        # 都失败——这正是这条断言存在的理由（装完的行不该和待处理的行一样扎眼）。
+        "notify_coloured_by_role": headings == {"white"} and rows == {"blue"},
         "downloads_written": downloaded,
         "downloads_verified": verified,
         "downloads_leftovers": leftovers,
@@ -916,8 +1094,8 @@ def summarise(
         ),
         "notify_lists_both_groups": (
             ("尚未下载" in joined or "not downloaded" in joined)
-            and ("已下载待安装" in joined or "waiting to be installed" in joined
-                 or "已下载，未安装" in joined)
+            and ("已下载待安装" in joined or "to install" in joined
+                 or "已下载待安装" in joined)
         ),
         "statuses": statuses,
         "command_summary": COMMAND_EXPECTATIONS["summary"] in console,
@@ -927,6 +1105,33 @@ def summarise(
         "command_list_all": COMMAND_EXPECTATIONS["list_all"] in console,
         "command_list_filtered": COMMAND_EXPECTATIONS["list_filtered"] in console,
         "command_list_page_number": listings >= 3,
+        # 控制台的行印**版本数字**，不是 ``[版本]`` 标签——上一轮把行形态写死成聊天形态
+        # （``chat_form``），控制台因此丢掉了每一个版本号（终端里没有悬停可开）。两半都要：
+        # 箭头在（版本行还在），标签不在。这是唯一在**真实控制台 source** 上量这件事的地方。
+        "console_rows_keep_versions": "[版本]" not in console and "->" in console,
+        # 每屏底部的收尾线，控制台拿到的是一条**素线**（全 ``=``）。标题栏的 ``=`` 只出现在
+        # 插件名两侧（十几格），所以四十个连着的 ``=`` 只可能来自收尾线。
+        "closing_rule_printed": "=" * 40 in console,
+        # 默认配置下删除是关着的：那条命令必须被拒绝，且回绝要说清去改哪个选项。
+        "cleanup_refused_while_locked": locked_at != -1,
+        # 提醒**且**它只能出现在解锁之后——前置关系的证据。见上面 notice_at 的注释。
+        "cleanup_reminded": notice_at != -1 and notice_at > locked_at,
+        # 计划里那个文件名同时反证了「被拒的那次没有删掉任何东西」：文件不在了的话，这一行
+        # 根本列不出来（``command.cleanup.none`` 会顶掉它）。
+        "cleanup_staged": COMMAND_EXPECTATIONS["cleanup_staged"] in console,
+        # 确认之后文件真的没了，而且 mods/ 里别的 jar 一个没少。两条缺一不可——只断言
+        # 「文件不见了」的话，一个把整个目录删空的实现也能过。
+        "cleanup_deleted": backup_gone,
+        # ``cleanup`` must not have taken the young one: the status line it printed in between
+        # counts the folder, so on a real run "1 of the 2 survived" is a fact about the disk.
+        "cleanup_spared_the_fresh_backup": "旧版备份: 1 个" in console,
+        "cleanup_left_the_jars_alone": jar_count == seeded_jars,
+        # ``delete all`` is the same two steps, and the only thing that sets it apart from
+        # ``cleanup`` is that it does not look at the age — so the proof is that a backup three
+        # days old was still offered, and is now gone.
+        "delete_all_staged": COMMAND_EXPECTATIONS["delete_all_staged"] in console,
+        "delete_all_deleted": fresh_gone,
+        "command_list_backups": COMMAND_EXPECTATIONS["list_backups"] in console,
         "command_info": COMMAND_EXPECTATIONS["info_detail"] in console,
         "command_reload": COMMAND_EXPECTATIONS["reload"] in console,
         "command_alias": COMMAND_EXPECTATIONS["alias"] in console,
@@ -972,6 +1177,17 @@ CHECK_KEYS = [
     "command_list_all",
     "command_list_filtered",
     "command_list_page_number",
+    "console_rows_keep_versions",
+    "closing_rule_printed",
+    "cleanup_refused_while_locked",
+    "cleanup_reminded",
+    "cleanup_staged",
+    "cleanup_deleted",
+    "cleanup_spared_the_fresh_backup",
+    "cleanup_left_the_jars_alone",
+    "delete_all_staged",
+    "delete_all_deleted",
+    "command_list_backups",
     "command_info",
     "command_reload",
     "command_alias",
