@@ -16,6 +16,25 @@
 > **想了解它为什么这么判断、每条结论怎么核验，或者想改代码？** 见 [`README-dev.md`](README-dev.md)。
 > 本页只讲**怎么用**：装、命令、配置、结果怎么读。
 
+## 目录
+
+- [为什么需要它](#为什么需要它)
+- [它做什么](#它做什么)
+- [安装](#安装)
+- [命令](#命令)
+  - [手动下载与安装：两步确认](#手动下载与安装两步确认)
+  - [列表与详情是分开的](#列表与详情是分开的)
+- [报告的读法](#报告的读法)
+- [排除某些 Mod 不检查](#排除某些-mod-不检查)
+- [自己编译的 Mod 查不到怎么办](#自己编译的-mod-查不到怎么办)
+- [网络与镜像](#网络与镜像)
+- [配置](#配置)
+  - [`server`](#server--扫描对象) · [`check`](#check--更新检测) · [`report`](#report--结果送到哪里) · [`sources`](#sources--去哪里查)
+  - [`download`](#download--下载与关服安装默认关闭) · [`cleanup`](#cleanup--清理旧版备份默认关闭) · [`network`](#network--超时与限速) · [关服后自动安装](#关服后自动安装默认关闭唯一会动-mods-的功能)
+- [可信度与已知限制](#可信度与已知限制)
+- [常见问题](#常见问题)
+- [License](#license)
+
 ## 为什么需要它
 
 Fabric 服务端**没有任何原生手段**能发现 Mod 过期——加载器把 `mods/` 读进去、启动、然后就不过问了。
@@ -313,13 +332,19 @@ Modrinth 在中国大陆的访问质量不稳定。如果报告出现「上游�
 
 ### 顶层
 
+<details><summary>展开选项与说明</summary>
+
 | 选项 | 默认 | 说明 |
 |---|---|---|
 | `enabled` | `true` | 总开关。关掉后只保留命令，不做任何自动检查 |
 | `language` | `"auto"` | `auto` 跟随 MCDR；也可写 `zh_cn` / `en_us` |
 | `command_permission_level` | `3` | 执行 `!!modupdate` 所需的最低 MCDR 权限等级 |
 
+</details>
+
 ### `server` —— 扫描对象
+
+<details><summary>展开选项与说明</summary>
 
 | 选项 | 默认 | 说明 |
 |---|---|---|
@@ -327,7 +352,11 @@ Modrinth 在中国大陆的访问质量不稳定。如果报告出现「上游�
 | `server.loader` | `"fabric"` | `fabric` / `quilt` / `neoforge` / `forge` |
 | `server.mc_version` | `"auto"` | `auto` = 依次从 MCDR 输出、`logs/latest.log`、Mod 元数据推断。**推断不准时请显式填写** |
 
+</details>
+
 ### `check` —— 更新检测
+
+<details><summary>展开选项与说明</summary>
 
 | 选项 | 默认 | 说明 |
 |---|---|---|
@@ -338,7 +367,11 @@ Modrinth 在中国大陆的访问质量不稳定。如果报告出现「上游�
 | `check.include_alpha` | `false` | 把 alpha 也算作「可用更新」 |
 | `check.ignored_mods` | `[]` | **完全不做更新检测**的 Mod，见[上一节](#排除某些-mod-不检查) |
 
+</details>
+
 ### `report` —— 结果送到哪里
+
+<details><summary>展开选项与说明</summary>
 
 | 选项 | 默认 | 说明 |
 |---|---|---|
@@ -363,7 +396,11 @@ Modrinth 在中国大陆的访问质量不稳定。如果报告出现「上游�
 - **每次检查还会和上一次比一比**，在「有更新」那一节末尾多写一行「其中 N 项是上次检查之后新出现的」，
   否则每次开服都把同一份清单原样再念一遍，你分不清某个更新是**刚刚发布**还是**已经等你一周了**。
 
+</details>
+
 ### `sources` —— 去哪里查
+
+<details><summary>展开选项与说明</summary>
 
 | 选项 | 默认 | 说明 |
 |---|---|---|
@@ -371,7 +408,11 @@ Modrinth 在中国大陆的访问质量不稳定。如果报告出现「上游�
 | `sources.modrinth.api_base` | `""` | 留空 = 官方 `https://api.modrinth.com/v2`；可改成镜像 |
 | `sources.manual_map` | `"project-map.json"` | 你自己写的「哪个 jar 对应哪个项目」清单。填**文件名，不是路径**，放在插件数据文件夹里；填 `""` 即关闭 |
 
+</details>
+
 ### `download` —— 下载与关服安装（默认关闭）
+
+<details><summary>展开选项与说明</summary>
 
 这个章节管两件事：**要不要去抓新的**，以及**抓下来的要不要装**。它们刻意分开，因为「想装一个已经
 下好的文件」不该逼你先允许它去抓更多。
@@ -395,7 +436,11 @@ Modrinth 在中国大陆的访问质量不稳定。如果报告出现「上游�
 | 发现更新就全都抓 | `download.enabled: true` | 是 |
 | 抓到的全都装 | `download.install_on_stop: true` | 是 |
 
+</details>
+
 ### `cleanup` —— 清理旧版备份（默认关闭）
+
+<details><summary>展开选项与说明</summary>
 
 安装更新时**旧 jar 不会被删除，只会改名成 `<原名>.old`**——那是你的回退路径。留着有用，但不必留
 一辈子：一台按月更新的服务器一年下来会攒下一年的旧 jar。这一节管**能不能删、要不要提醒你、
@@ -440,7 +485,11 @@ Modrinth 在中国大陆的访问质量不稳定。如果报告出现「上游�
 「输入 `!!modupdate confirm` 删除」——你读完直接确认即可。若当时恰好有别的操作等待确认（比如一个
 还没确认的 `download`），它不会顶掉那条，改为提示你敲 `!!modupdate cleanup` 自己列一遍。
 
+</details>
+
 ### `network` —— 超时与限速
+
+<details><summary>展开选项与说明</summary>
 
 | 选项 | 默认 | 说明 |
 |---|---|---|
@@ -455,7 +504,11 @@ Modrinth 在中国大陆的访问质量不稳定。如果报告出现「上游�
 > 还有那些旧名字，**它们不会被读取**——MCDR 对认不出的键不报错也不提示，只会静默忽略并重写文件。
 > 插件会为此打一行警告，把每个旧名字对应的新路径列出来，照着重填即可。
 
+</details>
+
 ### 关服后自动安装（默认关闭，唯一会动 `mods/` 的功能）
+
+<details><summary>展开安装流程与规则</summary>
 
 两种方式都会**在服务端停止后**把已下载的新版本装进 `mods/`，并把被替换的旧 jar 改名为
 `<原名>.old` 保留下来：`download.install_on_stop: true` 装**所有**已下载的；`!!modupdate install <编号>`
@@ -487,6 +540,8 @@ Modrinth 在中国大陆的访问质量不稳定。如果报告出现「上游�
 `[锂-性能优化]Lithium.jar` → `[锂-性能优化]lithium-fabric-0.15.0.jar`。`[...]` 与 `【...】` 都认，
 可以连着写（`[A][B]x.jar`）。
 
+</details>
+
 ## 可信度与已知限制
 
 - **哈希匹配是精确的**，可以放心采信。**名称匹配是猜测**：只接受完全一致的 slug，但作者改了项目名
@@ -508,44 +563,79 @@ Modrinth 在中国大陆的访问质量不稳定。如果报告出现「上游�
 
 ## 常见问题
 
-**Q：为什么大部分 Mod 都能查到，有几个查不到？**
+<details><summary><b>Q：为什么大部分 Mod 都能查到，有几个查不到？</b></summary>
+
 A：那些多半不在 Modrinth 上，或者是你自己编译 / 重新打包过的。想让它别再被检查，用
 `check.ignored_mods`；想知道它到底是什么，用 `project-map.json`。
 
-**Q：每次开服都提醒同一批更新，有没有办法只看新的？**
+</details>
+
+<details><summary><b>Q：每次开服都提醒同一批更新，有没有办法只看新的？</b></summary>
+
 A：有。报告在「有更新」那一节末尾会多写一行「其中 N 项是上次检查之后新出现的」。这份对比来自上一份
 报告文件，所以跨重启有效；用 `report.write_file: false` 关掉落盘就等于关掉这个对比。
 
-**Q：装完却什么都没发生？**
+</details>
+
+<details><summary><b>Q：装完却什么都没发生？</b></summary>
+
 A：默认要等服务端启动完成 + 60 秒（`check.start_delay_seconds`）。想立刻看到结果就
 `!!modupdate check`。如果 Mods 目录识别错了，`!!modupdate status` 会显示它实际用的路径。
 
-**Q：我升级了插件，但配置文件里没有新选项？**
+</details>
+
+<details><summary><b>Q：我升级了插件，但配置文件里没有新选项？</b></summary>
+
 A：先看控制台有没有这一行：`配置文件缺少 N 个选项，已按默认值补上：…`——有的话文件已经补好了，
 这行还会告诉你补了哪几个、文件在哪。**没有这行、文件也没变化**，说明插件没有真正重新加载：
 替换 `.mcdr` 文件后必须重启服务端（或 `!!MCDR reload plugin`），MCDR 启动时打印的
 `插件 mod_update_checker@版本 已加载` 那行就是版本证据。
 
-**Q：升级 Minecraft 大版本后满屏 `no_compatible_build`？**
+</details>
+
+<details><summary><b>Q：升级 Minecraft 大版本后满屏 `no_compatible_build`？</b></summary>
+
 A：先确认 `!!modupdate status` 里的版本号是不是对的。如果来源显示 `mods`（从 Mod 元数据猜的），
 请显式设置 `server.mc_version`。
 
-**Q：`mods/` 里那些 `.old` 越攒越多，能自动清吗？**
+</details>
+
+<details><summary><b>Q：`mods/` 里那些 `.old` 越攒越多，能自动清吗？</b></summary>
+
 A：能，但**默认不删**——那是你的回退路径。它们会出现在 `!!modupdate list`（状态 `old_backup`）和
 `!!modupdate status` 里。要删的话得先做两步配置：把 `cleanup.allow_delete` 打开（这是删除的总开关，
 默认关着时任何删除命令都会被拒绝），然后就可以按文件名或编号一个个删（`!!modupdate delete`）、
 一次清掉所有过期的（`!!modupdate cleanup`），或者把全部备份一次清掉（`!!modupdate delete all`）。想让插件在备份过期时主动提醒你，再打开
 `cleanup.enabled` 并设好 `cleanup.max_age_days`——它排在 `allow_delete` 之后。
 
-**Q：会不会很吃请求额度？**
+</details>
+
+<details><summary><b>Q：会不会很吃请求额度？</b></summary>
+
 A：不会。哈希识别是批量的：一个 100 Mod 的服务端通常是 3~5 次请求；只有「批量答不出来」和「需要按
 名称兜底」的少数 Mod 才会各自再问一次。另有 240 次/分钟的自限速，以及 429/5xx 的自动重试与退避。
 被 `check.ignored_mods` 排除的 Mod 完全不产生请求。
 
-**Q：能自动更新 Mod 吗？**
+</details>
+
+<details><summary><b>Q：会不会拖慢服务端？</b></summary>
+
+A：不会。检查在**自己的后台线程**里跑，最重的部分只是**把 `mods/` 顺序读一遍**——实测 20 个 jar
+（50 MiB）约 90 ms，100 个 jar（100 MiB）约 0.2 秒；比对与生成报告约 17 ms；网络查询是**批量**的
+（100 个 Mod 只要 3~5 次请求）。开服后的自动检查会先等 60 秒（`check.start_delay_seconds`）避开
+Mod 加载高峰；空闲时它**零 CPU**——默认配置下查完一次就结束了。它还碰不到游戏本身：插件跑在 MCDR
+进程里，游戏是另一个进程，唯一的动静是几条聊天消息。完整数字与测量方法见
+[`README-dev.md`](README-dev.md)。
+
+</details>
+
+<details><summary><b>Q：能自动更新 Mod 吗？</b></summary>
+
 A：能，但**只有在你明确要求时**，而且永远发生在服务端停止之后：开启 `download.install_on_stop`
 （装所有已下载的），或者逐个 `!!modupdate install <编号>`（只装你点名的）。两者都会先把旧 jar 改名
 成 `.old` 保留，所以不满意就改回来。默认状态是**不装**。
+
+</details>
 
 ## License
 
