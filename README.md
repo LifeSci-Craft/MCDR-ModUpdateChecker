@@ -245,7 +245,7 @@
 
 ## 贡献者
 
-- [alex3236](https://github.com/alex3236)：MCDR 插件库维护者，协助整理了本插件的 `description` 与 README（精简与改写建议）。
+- [alex3236](https://github.com/alex3236)：MCDR 插件库维护者，审阅了本插件在插件库的收录条目，并协助整理了 `description` 与 README（精简与改写建议）。
 
 ## License
 
