@@ -50,6 +50,7 @@ from mod_update_checker.report import (
     action_row,
     display_width,
     entry_detail_rows,
+    entry_from_backup,
     render_entry_lines,
     render_full,
     render_index,
@@ -58,6 +59,7 @@ from mod_update_checker.report import (
     render_summary,
     summarise,
 )
+from mod_update_checker.cleanup import Backup
 from mod_update_checker.scanner import scan_jar, scan_mods
 from mod_update_checker.serverinfo import ServerContext
 
@@ -1228,8 +1230,13 @@ def test_a_full_listing_still_says_which_status_each_row_is():
     ]
     body = "\n".join(render_entry_lines(entries, tr, verbose=True))
 
-    for label in ("可更新", "本地版本更新", "无法定位上游"):
+    for label in ("可更新", "本地比上游新", "无法定位上游"):
         assert label in body, label
+
+    # 而且每一行的状态只说一次：模板以前自带一份（``{name}  {version}（已是最新）``），
+    # 状态组再补一份，读者看到的是「（已是最新）  (已是最新)」。
+    for line in body.splitlines():
+        assert line.count("(") == 1, line
 
 
 def test_a_name_match_is_flagged_but_the_normal_case_is_not():
@@ -1241,8 +1248,10 @@ def test_a_name_match_is_flagged_but_the_normal_case_is_not():
     ]
     lines = render_entry_lines(entries, tr, verbose=True)
 
-    assert "按名称匹配" in lines[1], lines[1]
+    assert "按名称近似匹配" in lines[1], lines[1]
     assert "按文件哈希" not in lines[0], lines[0]
+    # 括号不套括号：状态组本身已经用了括号，里面的说明不能再带一对
+    assert "(近似)" not in lines[1], lines[1]
 
 
 # --------------------------------------------------------------------------------------
@@ -1282,10 +1291,11 @@ def _listing(report, tr, entries=None, budget=CHAT_PAGE_LINES, page=1):
     """Every line one page of the listing puts on screen, as plain text.
 
     ``render_index`` returns the rows, the tail and the page figures; the title bar, the server
-    context and the pager belong to the screen and are counted here, because they are lines the
-    reader scrolls past — a budget measured without them is not the budget the reader gets. The
-    pager is built with the real :func:`render_pager`, because a placeholder would let the one
-    line that was just added to the budget grow a second line without this noticing.
+    context, the pager and the closing rule belong to the screen and are counted here, because
+    they are lines the reader scrolls past — a budget measured without them is not the budget
+    the reader gets. The pager is built with the real :func:`render_pager`, because a
+    placeholder would let the one line that was just added to the budget grow a second line
+    without this noticing.
 
     The rows carry their number and no indentation any more: the colour says which of them need
     attention, so a leading pair of spaces would only spend width.
@@ -1301,6 +1311,7 @@ def _listing(report, tr, entries=None, budget=CHAT_PAGE_LINES, page=1):
             render_pager(page_info[0], page_info[1], tr,
                          lambda target: "list {}".format(target))
         )
+    lines.append("(closing rule)")
     return lines
 
 
@@ -1396,9 +1407,10 @@ def test_the_first_page_is_the_mods_that_need_attention():
     body = "\n".join(_listing(report, tr))
 
     assert "Action Mod 000" in body
-    # 11 rows fit at this budget; every one of them is an actionable mod.
-    assert "Action Mod 010" in body
-    assert "Action Mod 011" not in body
+    # 10 rows fit at this budget（v1.6.0 给每屏加了底部闭合线，行数从 11 降到 10）；
+    # every one of them is an actionable mod.
+    assert "Action Mod 009" in body
+    assert "Action Mod 010" not in body
     assert "Fresh Mod" not in body
     # And the rest is one page away, with the page count on the line.
     assert "第 1/" in body, body
@@ -1702,6 +1714,32 @@ def test_the_action_offered_matches_what_the_mod_is_ready_for():
     assert action_row(current, 3, "!!muc", tr) is None
     # No number means no command can be spelled, so there is no honest button to offer.
     assert action_row(fresh, None, "!!muc", tr) is None
+
+
+def test_a_locked_backup_gets_an_explanation_instead_of_a_button():
+    """``cleanup.allow_delete`` 关着时，那一行变成说明而不是按钮。
+
+    这是唯一一处「按钮被替换而不是消失」的分支：少一行的话，读者只会觉得详情页缺了什么；
+    点下去必然被拒的按钮，则会让这个选项看起来像 bug。
+    """
+    tr = make_translator("zh_cn")
+    backup = entry_from_backup(Backup("sodium.jar.old", 2048, 400))
+
+    unlocked = action_row(backup, 4, "!!muc", tr)
+    assert unlocked.command == "!!muc delete 4"
+
+    locked = action_row(backup, 4, "!!muc", tr, delete_allowed=False)
+    assert locked is not None
+    assert locked.command == "", "关着的时候还留着一个会执行删除的命令"
+    assert locked.url == ""
+    assert "cleanup.allow_delete" in locked.value
+
+    # 而且它出现在详情页上的位置和不锁的时候一样——替换的是内容，不是排版。
+    rows = entry_detail_rows(backup, tr, action=locked)
+    assert locked in rows
+    assert not any(row.command for row in rows), [
+        row for row in rows if row.command
+    ]
 
 
 def test_the_detail_view_does_not_draw_an_arrow_between_equal_versions():
@@ -2382,6 +2420,33 @@ def test_every_entry_field_survives_including_its_notes(report):
     assert restored.download_url == original.download_url
     assert restored.notes == original.notes
     assert restored.release_channel == original.release_channel
+    assert restored.size_bytes == original.size_bytes
+    assert restored.age_days == original.age_days
+
+
+def test_a_backup_entry_survives_the_round_trip(tmp_path, upstream):
+    """备份条目的两个新字段也得能被读回来。
+
+    它们是这一版新加的，而 ``last_report.json`` 是**跨版本存活**的：写出去时多两个键、
+    读回来时认得它们，是这个文件能继续用的前提。
+    """
+    import os
+    import time
+
+    scenario = build_scenario(tmp_path, upstream)
+    backup = scenario.directory / "alpha.jar.old"
+    backup.write_bytes(b"x" * 300)
+    stamp = time.time() - 12 * 86400
+    os.utime(str(backup), (stamp, stamp))
+    stored = run_check(upstream, scenario, tmp_path)
+    original = stored.backups[0]
+
+    restored = [entry for entry in Report.from_json(stored.to_json()).entries
+                if entry.file_name == "alpha.jar.old"][0]
+
+    assert (restored.status, restored.size_bytes, restored.age_days) == (
+        original.status, 300, 12
+    )
 
 
 @pytest.mark.parametrize(
@@ -2652,3 +2717,55 @@ def test_overlapping_the_batched_lookups_still_reports_both_kinds_of_failure(
     entry = entry_for(report, "alpha")
     assert entry.status == STATUS_UPDATE_AVAILABLE, "a missing title must not change the verdict"
     assert "note.modrinth_unavailable" in dict(report.upstream_notes)
+
+
+# --------------------------------------------------------------------------------------
+# 旧版备份作为报告里的一类条目
+# --------------------------------------------------------------------------------------
+
+
+def test_a_backup_in_the_mods_folder_becomes_an_entry(tmp_path, upstream):
+    """``.old`` 文件以前对插件完全不可见，现在是一类状态。
+
+    它不是「一个 Mod」，所以不进任何一次查询，也不该被当成待更新的一行——但它必须出现在
+    报告里，因为 ``list <状态>``、编号手柄和删除命令都靠这份报告。
+    """
+    import os
+    import time
+
+    from mod_update_checker.report import STATUS_OLD_BACKUP
+
+    scenario = build_scenario(tmp_path, upstream)
+    backup = scenario.directory / "alpha.jar.old"
+    backup.write_bytes(b"x" * 4096)
+    stamp = time.time() - 45 * 86400
+    os.utime(str(backup), (stamp, stamp))
+
+    report = run_check(upstream, scenario, tmp_path)
+
+    found = [entry for entry in report.entries if entry.status == STATUS_OLD_BACKUP]
+    assert [entry.file_name for entry in found] == ["alpha.jar.old"]
+    assert found[0].size_bytes == 4096
+    assert found[0].age_days == 45
+    # 备份不是 jar，不该走到识别那一步：上游一次都没有被问过它。
+    assert not any("jar.old" in path for path in upstream.request_paths())
+
+
+def test_a_backup_is_not_one_of_the_mods(tmp_path, upstream):
+    """它不进 ``total_jars``、不进「无法识别」，也不算一次待更新。
+
+    三个计数器说的都是「Mod」，而备份不是 Mod。把它算进去会让「共检查 N 个 jar」在一个
+    只是攒了几个 .old 的服务器上莫名其妙地变大。
+    """
+    from mod_update_checker.report import STATUS_OLD_BACKUP
+
+    scenario = build_scenario(tmp_path, upstream)
+    (scenario.directory / "alpha.jar.old").write_bytes(b"x" * 16)
+
+    report = run_check(upstream, scenario, tmp_path)
+
+    assert "alpha.jar.old" not in [name for name, _reason in report.unidentified]
+    assert report.total_jars == len(scenario.scan().mods)
+    assert report.counts()[STATUS_OLD_BACKUP] == 1
+    assert report.updates == [entry for entry in report.updates], "备份混进了待更新列表"
+    assert all(entry.status != STATUS_OLD_BACKUP for entry in report.updates)

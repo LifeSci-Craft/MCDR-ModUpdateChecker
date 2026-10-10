@@ -580,6 +580,10 @@ def test_the_end_to_end_run_uses_the_shipped_defaults():
         "download.max_size_mb",
         # And so must the retry budget, so the matrix keeps exercising the number a user gets.
         "download.retries",
+        # 清理的阈值同理，而且这一次不只是「别关掉代码路径」：矩阵种下的两个备份正好跨在这条线
+        # 两侧（400 天 / 3 天），``cleanup`` 只拿过期的那个、``delete all`` 两个都拿——两条命令
+        # 的区别**只**在于这条线。把它改成 0，整个区别就消失了。
+        "cleanup.max_age_days",
     ):
         assert key not in overridden, (
             "{} must stay at its shipped default in the end-to-end run, otherwise the "
@@ -595,6 +599,12 @@ def test_the_end_to_end_run_uses_the_shipped_defaults():
     # ``download.enabled`` is off by default for the same reason, and switched on here because
     # it is the only feature that writes files — the last one to leave to unit tests alone.
     assert overridden["download.enabled"] is True
+
+    # ``cleanup.allow_delete`` 则**故意**留在出厂值（关）：这一次运行的前半段就是「默认配置
+    # 下什么都不许删」，后半段由场景把配置文件改开再 reload。把它写进上面那份配置，就等于
+    # 永远走不到拒绝那条路。矩阵工具里有一段注释专门说明这件事。
+    assert "cleanup.allow_delete" not in overridden
+    assert "cleanup.allow_delete" not in flatten_options(with_install)
 
     # And every override has to name an option the plugin actually has, so a typo cannot
     # silently become a no-op. Walked off the class structure rather than a hand-kept list, so a
@@ -1145,15 +1155,75 @@ def test_colour_survives_the_reply_path_and_only_there():
     assert "\x1b[" in title.to_colored_text()        # but the reply path does colour it
     assert str(title).startswith("=") and "Mod Update Checker" in str(title)
 
-    # A row is coloured by what it *means*, not by what it contains. The heuristic this
-    # replaced read ``"->" in line``, which coloured by coincidence of text and made the same
-    # mod one colour in the listing and another in the summary.
-    needs_work = UpdateEntry(mod_id="a", name="A -> B", file_name="a.jar",
-                             status=plugin.STATUS_UP_TO_DATE)
-    done = UpdateEntry(mod_id="b", name="B", file_name="b.jar",
-                       status=plugin.STATUS_UPDATE_AVAILABLE)
-    assert plugin._row_colour(needs_work) != plugin._row_colour(done)
-    assert plugin._row_colour(done) == plugin.RColor.yellow
+    # 一行的每一块按**它是什么**上色，而颜色表是唯一的：号码永远黄、名称永远白、状态查状态表。
+    # 这条替换掉了「整行一个颜色」的旧规则——它让**号码**的颜色随行而变（1 号黄、其余灰），
+    # 读者就是这么报上来的。
+    fresh = UpdateEntry(mod_id="a", name="Alpha", file_name="a.jar",
+                        local_version="1.0.0", latest_version="1.1.0",
+                        status=plugin.STATUS_UPDATE_AVAILABLE)
+    current = UpdateEntry(mod_id="b", name="Beta", file_name="b.jar",
+                          local_version="1.0.0", status=plugin.STATUS_UP_TO_DATE)
+    older = UpdateEntry(mod_id="c", name="Gamma", file_name="c.jar",
+                        local_version="1.0.0", latest_version="2.0.0",
+                        status=plugin.STATUS_NO_COMPATIBLE_BUILD)
+
+    assert plugin._row_field_colour(fresh, plugin.ROW_FIELD_NUMBER) == plugin.RColor.yellow
+    assert plugin._row_field_colour(current, plugin.ROW_FIELD_NUMBER) == plugin.RColor.yellow
+    assert plugin._row_field_colour(fresh, plugin.ROW_FIELD_NAME) == plugin.RColor.white
+    assert plugin._row_field_colour(current, plugin.ROW_FIELD_NAME) == plugin.RColor.white
+    # 状态那一格现在是**每一行都一样的** ``[状态: ✔]``（用户点名），所以它永远是黄的；
+    # 状态本身由图标说、由浮窗的第一行说（下一条测试钉住那里才是状态色）。
+    assert plugin._row_field_colour(fresh, plugin.ROW_FIELD_NOTE) == plugin.RColor.yellow
+    assert plugin._row_field_colour(older, plugin.ROW_FIELD_NOTE) == plugin.RColor.yellow
+    assert plugin._row_field_colour(current, plugin.ROW_FIELD_NOTE) == plugin.RColor.yellow
+
+    # 一行拆出来的四段：号码、名称、版本/事实、状态——顺序与补白都钉住。
+    # 语言自己钉住（``make_translator``），不依赖前面某个测试留下的语言——这个坑记在
+    # tests/README 里，单个测试被挑出来跑时会踩到。
+    from mod_update_checker.i18n import make_translator
+    from mod_update_checker.report import (
+        CHAT_PREFIX_QUARTERS,
+        QUARTERS_PER_LETTER,
+        chat_cell_widths,
+        chat_row_fields,
+        text_quarters,
+    )
+
+    chinese = make_translator("zh_cn")
+    body_width, status_width = chat_cell_widths(chinese)
+
+    def pieces_of(entry):
+        # 聊天那一份：名称补成固定列，版本/事实收进 ``[版本]`` 之类的把手，状态是 ``[状态: ✔]``。
+        # 控制台那一份（``index_row_fields``）把版本数字和整句状态印在行上，见 ``_entry_row``。
+        fields = chat_row_fields(1, entry, chinese)
+        return ([text for _role, text in fields],
+                [plugin._row_field_colour(entry, role) for role, _text in fields])
+
+    texts, colours = pieces_of(fresh)
+    assert texts[0] == "[1] "
+    # 号码 + 名称补到 ``CHAT_PREFIX_QUARTERS``：后面的列因此在所有行上对齐。补的是**整格空格**，
+    # 而文字宽度不总是四分之一字母的整数倍，所以落点最多差半个空格——这就是这个字体的上限。
+    assert abs(text_quarters(texts[0] + texts[1]) - CHAT_PREFIX_QUARTERS) \
+        <= QUARTERS_PER_LETTER // 2, texts[1]
+    assert texts[1].startswith("Alpha"), texts[1]
+    assert texts[2] == "  [版本]"
+    # 状态格是三块：文字、图标、收尾的括号 + 补白——图标单独一块，好让它带自己的颜色。
+    assert texts[3] == "  [状态: ", texts[3]
+    assert texts[4] == "↑", texts[4]
+    assert (text_quarters("".join(texts[3:]))
+            - 2 * QUARTERS_PER_LETTER - status_width) <= QUARTERS_PER_LETTER // 2, texts[3:]
+    assert colours == [plugin.RColor.yellow, plugin.RColor.white, plugin.RColor.green,
+                       plugin.RColor.yellow, plugin.RColor.blue, plugin.RColor.yellow], colours
+
+    # 同一句话画在每一行上，文字永远黄、**图标跟状态走**（用户点名）。
+    for entry, icon in ((current, "✔"), (older, "❌")):
+        texts, colours = pieces_of(entry)
+        assert texts[2] == "  [版本]"
+        assert texts[3] == "  [状态: ", texts[3]
+        assert texts[4] == icon, texts[4]
+        assert colours[3] == plugin.RColor.yellow, colours
+        assert colours[4] == plugin._status_colour(entry.status), colours
+        assert colours[5] == plugin.RColor.yellow, colours
 
 
 def test_the_console_path_logs_plain_strings():
@@ -1235,6 +1305,20 @@ def _render_help(prefix, language="zh_cn"):
         plugin._config = previous
 
 
+def _render_help_for_player(prefix, language="zh_cn"):
+    """The same screen as a player sees it — which is the version the padding model changes."""
+    import mod_update_checker as plugin
+
+    previous = plugin._config
+    plugin._apply_language(None, _config_with({"language": language}))
+    try:
+        source = _PlayerSource("Admin")
+        plugin._show_help(source, prefix)
+        return source
+    finally:
+        plugin._config = previous
+
+
 def test_help_is_one_rich_message_rather_than_a_line_per_reply():
     """One ``RTextList``, not a stack of separate replies.
 
@@ -1289,10 +1373,12 @@ def test_help_lists_every_registered_subcommand():
 
 
 def test_help_columns_line_up_for_both_aliases():
-    """The description column starts at the same place on every row.
+    """The description column starts at the same place on every row — the console's form.
 
     The padding is computed from the longest command, so the row that *is* the longest is the
-    one this fails on when the separator forgets its leading space.
+    one this fails on when the separator forgets its leading space. A terminal is a fixed-width
+    font, so here character count is the width — the player's page is a different question and
+    has its own test below.
     """
     for prefix in ("!!muc", "!!modupdate"):
         body = str(_render_help(prefix)[0])
@@ -1300,6 +1386,162 @@ def test_help_columns_line_up_for_both_aliases():
 
         assert columns, body
         assert len(set(columns)) == 1, (prefix, columns)
+
+
+def test_the_player_help_page_pads_by_the_width_model():
+    """游戏里的帮助页按字宽模型补齐，不是按字符数——比例字体里后者是歪的。
+
+    这是用户带着截图报上来的：``--`` 参差不齐，最宽差到一个字母。玩家的字体是比例字体，
+    服务器看不见它，所以按一个模型补（``_HELP_GLYPH_QUARTERS``，在两种字体上拟合出来，
+    见 ``bench/help_width_model.py``）。这里钉两件事：
+
+    * 每一行「命令 + 补白」按模型量出来的宽度落在同一列上（误差不超过半个空格）；
+    * 模型确实在用——``list`` 与 ``install`` 各比字符数补齐多一格（模型给这两行修正的地方）。
+      退回成按字符数补齐时，这两条会立刻失败。
+    """
+    import mod_update_checker as plugin
+
+    for prefix in ("!!muc", "!!modupdate"):
+        source = _render_help_for_player(prefix)
+        leaves = list(_segments(source.raw[-1]))
+
+        pads = {}
+        columns = []
+        for index, item in enumerate(leaves):
+            text = item.get("text", "")
+            if item.get("color") != "aqua" or not text.startswith(prefix + " "):
+                continue
+            separator = leaves[index + 1].get("text", "")
+            assert separator.endswith(" -- "), separator
+            pad = len(separator) - len(" -- ")
+            pads[text.split()[-1]] = pad
+            columns.append(plugin.text_quarters(text) + 4 * pad)
+
+        assert len(columns) >= 10, columns
+        assert max(columns) - min(columns) <= 4, (prefix, columns)
+        assert pads["list"] == 5, pads
+        assert pads["install"] == 2, pads
+
+
+def test_help_rows_are_short_and_the_details_live_on_hover():
+    """帮助页：行上是短句，细节全在浮窗里——用户拿着截图点名的第一条。
+
+    上一版的每行末尾都挂着一对长括号（``list`` 那行光括号就有半个屏宽），页面读起来像
+    说明书。规则换成「行上说它做什么，浮窗里说怎么用」。两条断言：
+
+    * 可见文案里没有括号——半角全角都不许（这一版刚把全角换成半角，行上索性一个不留）；
+    * 每一行都挂着浮窗，``list`` 的浮窗**列出全部能筛的状态**。那个清单是从
+      ``ALL_STATUSES`` 现算的：将来加了状态却忘了改文案，第一类断言看不见，这条看得见。
+    """
+    import json as _json
+
+    from mod_update_checker.i18n import make_translator
+    from mod_update_checker.report import ALL_STATUSES
+
+    for language in ("zh_cn", "en_us"):
+        source = _render_help_for_player("!!muc", language=language)
+        leaves = list(_segments(source.raw[-1]))
+        translator = make_translator(language)
+
+        descriptions = []
+        hovers = {}
+        for index, item in enumerate(leaves):
+            text = item.get("text", "")
+            if item.get("color") != "aqua" or not text.startswith("!!muc "):
+                continue
+            separator = leaves[index + 1]
+            description = leaves[index + 2]
+            assert description.get("color") == "white", description
+            descriptions.append(description["text"])
+            # 三块都挂了浮窗：悬停在行的哪儿都出得来（列表自身的样式只落在空 header 上，
+            # 会不会下发到子节点是客户端的事——按块挂就不赌这件事）。
+            for piece in (item, separator, description):
+                assert "hoverEvent" in piece, (language, text, piece)
+            hovers[text] = _json.dumps(description["hoverEvent"], ensure_ascii=False)
+
+        assert len(descriptions) == 12, descriptions
+        for text in descriptions:
+            assert "(" not in text and "（" not in text, text
+
+        listing = hovers["!!muc list"]
+        for name in ALL_STATUSES:
+            assert name in listing, (language, name)
+            assert translator("status." + name) in listing, (language, name)
+
+
+#: One line of a tooltip may not exceed this many display columns (CJK counts as two). The
+#: client only breaks lines **at spaces**, so a Chinese sentence with no spaces in it is drawn
+#: as one overflowing line — which is exactly what the user's screenshot showed, the second
+#: line running off the screen edge. Fixing it means breaking every tooltip by hand, and this
+#: is the number that keeps those hand-made lines safe: vanilla fits 20 CJK glyphs (200px) or
+#: about 33 ASCII glyphs per line, and the reader's client — CJK ≈ 2.25 letters, space ≈ one
+#: letter — lands in the same range. 32 columns sits under both.
+TOOLTIP_LINE_LIMIT = 32
+
+
+def test_every_tooltip_line_fits_within_a_tooltip():
+    """浮窗的每一行都短到放得下——**手工断行**是这条规则的一半，另一半是这个上限。
+
+    客户端只在空格处断行：中文句子没有空格，写成一长条就会被画成一行、直接跑出屏幕（用户
+    截图里 ``check`` 的浮窗第二行就是这样）。所以浮窗文案里每一行都是我们自己断的，而这条
+    测试保证断得够短——两种语言的每一条都查，加长任何一条都会在这里失败。
+    """
+    import json as _json
+    import pathlib
+
+    import mod_update_checker as plugin
+    from mod_update_checker.report import display_width
+
+    previous = plugin._config
+    try:
+        for language in ("zh_cn", "en_us"):
+            plugin._apply_language(None, _config_with({"language": language}))
+            lang_file = (pathlib.Path(plugin.__file__).resolve().parent
+                         / "lang" / (language + ".json"))
+            catalogue = _json.loads(lang_file.read_text(encoding="utf-8"))
+            values = [(key, text) for key, text in catalogue.items()
+                      if "hover" in key or key.startswith("explain.")]
+            # ``list`` 的浮窗是现算的（一行一个状态），要按生成结果查，不能只看模板。
+            values.append(("command.help.hover_list (generated)", plugin._list_filter_hover()))
+            assert any(key == "command.help.hover_list" for key, _ in values)
+
+            for key, template in values:
+                for line in template.replace("{command}", "!!muc info Example").split("\n"):
+                    width = display_width(line)
+                    assert width <= TOOLTIP_LINE_LIMIT, (
+                        "{} [{}]: {:d} columns: {!r}".format(key, language, width, line))
+    finally:
+        plugin._config = previous
+
+
+def test_clicking_a_help_description_fills_the_command_in():
+    """帮助页的行上，**说明文字**点一下也能把命令填进输入框（用户点名）。
+
+    「也能」正是关键：命令那一段保持它自己的动作（能裸跑的跑、要参数的填），说明与中间那段
+    空白则一律 ``suggest_command``——读者点描述时想要的是「这条命令长什么样」，最坏的结果也
+    只是输入框里躺着一行还没按回车的命令。
+    """
+    source = _render_help_for_player("!!muc")
+    leaves = list(_segments(source.raw[-1]))
+    rows = {}
+    for index, item in enumerate(leaves):
+        text = item.get("text", "")
+        if item.get("color") == "aqua" and text.startswith("!!muc "):
+            rows[text] = (item, leaves[index + 1], leaves[index + 2])
+
+    # ``list``：命令是 run_command，说明段是「填进输入框」，不带尾随空格（它不需要参数）。
+    command, separator, description = rows["!!muc list"]
+    assert command["clickEvent"]["action"] == "run_command"
+    for piece in (separator, description):
+        assert piece["clickEvent"]["action"] == "suggest_command", piece
+        assert piece["clickEvent"]["value"] == "!!muc list", piece
+
+    # ``info``：命令本身就要参数（suggest + 尾随空格），说明段给的是同一份拼写。
+    command, separator, description = rows["!!muc info"]
+    assert command["clickEvent"]["action"] == "suggest_command"
+    for piece in (separator, description):
+        assert piece["clickEvent"]["action"] == "suggest_command", piece
+        assert piece["clickEvent"]["value"] == "!!muc info ", piece
 
 
 def test_every_help_row_is_clickable_and_describes_its_command():
@@ -1334,8 +1576,9 @@ def test_only_the_row_that_needs_an_argument_suggests_instead_of_running():
 
     ``list`` runs: it is a read-only listing and the useful thing to see. ``info`` does not —
     it needs a mod, so clicking it fills the input box rather than firing an error, which is
-    what makes the number in the listing worth copying. ``download`` and ``install`` follow the
-    same rule for the same reason; ``confirm`` takes nothing, so it runs.
+    what makes the number in the listing worth copying. ``download``, ``install`` and ``delete``
+    follow the same rule for the same reason; ``confirm`` and ``cleanup`` take nothing, so they
+    run.
     """
     segments = list(_segments(_render_help("!!muc")[0]))
     rows = {
@@ -1345,10 +1588,10 @@ def test_only_the_row_that_needs_an_argument_suggests_instead_of_running():
     }
 
     for command in ("!!muc list", "!!muc check", "!!muc status", "!!muc reload",
-                    "!!muc confirm"):
+                    "!!muc confirm", "!!muc cleanup"):
         assert rows[command]["clickEvent"]["action"] == "run_command", command
 
-    for command in ("!!muc info", "!!muc download", "!!muc install"):
+    for command in ("!!muc info", "!!muc download", "!!muc install", "!!muc delete"):
         assert rows[command]["clickEvent"]["action"] == "suggest_command", command
         # A trailing space, so the number is typed straight after the command.
         assert rows[command]["clickEvent"]["value"].endswith(" "), command
@@ -1360,7 +1603,8 @@ def test_only_the_row_that_needs_an_argument_suggests_instead_of_running():
     # for the screen the reader is already looking at.
     assert set(rows) == {
         "!!muc check", "!!muc list", "!!muc summary", "!!muc info", "!!muc download",
-        "!!muc install", "!!muc confirm", "!!muc status", "!!muc reload", "!!muc help",
+        "!!muc install", "!!muc delete", "!!muc cleanup", "!!muc confirm", "!!muc status",
+        "!!muc reload", "!!muc help",
     }
 
 
@@ -1482,12 +1726,75 @@ def test_every_screen_opens_with_the_same_title_bar(tmp_path, monkeypatch):
         source = _ReplyRecorder()
         call(source)
         assert source.replies, "{} replied with nothing".format(name)
-        gold = [item["text"] for item in _segments(source.replies[0])
-                if item.get("color") == "gold"]
+        # 只取第一条回复里**第一个换行之前**的金色段：整块屏幕作为一条消息的屏（help、
+        # status）末尾还有一条金色的闭合线，它不是标题栏。
+        gold = []
+        for item in _segments(source.replies[0]):
+            if item.get("text") == "\n":
+                break
+            if item.get("color") == "gold":
+                gold.append(item["text"])
         assert gold, "{} does not open with the title bar".format(name)
         bars[name] = gold
 
     assert len({tuple(value) for value in bars.values()}) == 1, bars
+
+
+def test_every_screen_closes_with_a_rule_as_wide_as_its_title(tmp_path, monkeypatch):
+    """每屏底部一条 ``====`` 分割线，宽度与顶部标题栏一致——用户点名的第二条。
+
+    对齐查的是**显示宽度**而不是字符数（标题栏本身也是量出来的宽度），而且比对的是插件
+    真画出来的那两条，不是写死的 53——那是插件恰好叫这个名字、装这个版本时才成立的数字。
+
+    玩家版的 ``help`` / ``list`` / ``summary`` 顺带用它捎一句提醒（哪块能悬停、哪块能点）；
+    控制台没有鼠标，同一屏给的是一条素线；``info`` / ``status`` 没有可点可悬的东西，也是素线。
+    最后一条断言在钉「提示说的是行里那两个标签」：文案里的 ``{version}`` / ``{details}``
+    就是从行自己那两个键里取的。
+    """
+    from mod_update_checker.report import display_width
+
+    entry = _entry_for_screens()
+    plugin, _server = _one_screen_setup(tmp_path, monkeypatch, [entry])
+    report = plugin._last_report
+
+    screens = {
+        "summary": lambda source: plugin._reply_summary(source, report),
+        "list": lambda source: plugin._reply_index(source, report),
+        "info": lambda source: plugin._reply_detail(source, entry),
+        "status": plugin._show_status,
+        "help": plugin._show_help,
+    }
+
+    hint_rows = plugin.tr(
+        "command.rule.hint_rows",
+        version=plugin.tr("line.version_label"),
+        status="[{}]".format(plugin.tr("line.status_word")),
+        details=plugin.tr("command.list.detail_link"),
+    )
+    hint_help = plugin.tr("command.rule.hint_help")
+
+    for name, call in screens.items():
+        source = _PlayerSource("Admin")
+        call(source)
+        title = str(source.raw[0]).split("\n")[0]
+        closing = str(source.raw[-1]).split("\n")[-1]
+
+        assert closing.startswith("=") and closing.endswith("="), (name, closing)
+        assert display_width(closing) == display_width(title), (name, closing, title)
+
+        if name in ("list", "summary"):
+            assert hint_rows in closing, (name, closing)
+        elif name == "help":
+            assert hint_help in closing, (name, closing)
+        else:
+            assert closing == "=" * display_width(closing), (name, closing)
+
+    # 控制台：同一条闭合线，但没有那句描述悬停/点击的话——终端两样都做不到。
+    for name in ("list", "summary", "help"):
+        console = _ReplyRecorder()
+        screens[name](console)
+        closing = str(console.replies[-1]).split("\n")[-1]
+        assert closing == "=" * len(closing), (name, closing)
 
 
 def test_the_chat_summary_offers_a_button_where_the_log_offers_a_url(tmp_path, monkeypatch):
@@ -1537,19 +1844,33 @@ def _listing_entries(count, status="up_to_date"):
 
 
 def _pager_clicks(source):
-    """玩家看到的翻页按钮（run_command 的点击目标），按出现顺序。"""
-    return [
-        item["clickEvent"]
-        for item in _segments(source.raw[-1])
-        if "clickEvent" in item
-    ]
+    """玩家看到的翻页按钮（run_command 的点击目标），按出现顺序。
+
+    翻页条**不是**最后一条回复了：每屏末尾还有一条底部闭合线（v1.6.0 起）。所以这里按内容
+    找——含 ``[上一页]`` / ``[下一页]`` 的那条，而不是按位置取最后一条。
+    """
+    strip = next(
+        reply for reply in reversed(source.raw)
+        if any(item.get("text") in ("[上一页]", "[下一页]") for item in _segments(reply))
+    )
+    return [item["clickEvent"] for item in _segments(strip) if "clickEvent" in item]
+
+
+def _last_reply_with(source, marker):
+    """最后一条含 ``marker`` 的回复——同上，位置不再可依赖。
+
+    ``_PlayerSource`` 存原始对象（``raw``），``_ReplyRecorder`` 只存字符串；两种都认。
+    """
+    replies = getattr(source, "raw", None) or source.replies
+    return next(reply for reply in reversed(replies) if marker in str(reply))
 
 
 def test_the_listing_pages_with_clickable_buttons(tmp_path, monkeypatch):
-    """一页装不下的列表翻页看，而不是被截断。
+    """一页装不下的列表翻页看，而不是被截断；翻页条做成标题栏的形状。
 
-    14 个 Mod、每页 11 行，所以有两页：第一页只有 [下一页]，第二页只有 [上一页]，而回到
-    第一页的命令**不带页码**——``!!muc list`` 就是第一页，命令短一点更值得。
+    14 个 Mod、每页 10 行（底部闭合线占掉一行之后），所以有两页：两页的翻页条都是完整的
+    （金 ``=``、aqua 按钮、黄页码），走到头的那一侧变成灰的、点不动——条的形状不随页码变。
+    而回到第一页的命令**不带页码**——``!!muc list`` 就是第一页，命令短一点更值得。
     """
     plugin, _server = _one_screen_setup(tmp_path, monkeypatch, _listing_entries(14))
     source = _PlayerSource("Admin")
@@ -1557,18 +1878,27 @@ def test_the_listing_pages_with_clickable_buttons(tmp_path, monkeypatch):
     plugin._show_list(source, "", "!!muc")
 
     assert "Mod 00" in source.body and "Mod 13" not in source.body
-    segments = list(_segments(source.raw[-1]))
-    assert "第 1/2 页" in "".join(item.get("text", "") for item in segments)
+    segments = list(_segments(_last_reply_with(source, "[上一页]")))
+    text = "".join(item.get("text", "") for item in segments)
+    assert text.startswith("=") and text.endswith("="), text
+    assert "1/2" in text
     clicks = _pager_clicks(source)
     assert [click["value"] for click in clicks] == ["!!muc list 2"]
     assert clicks[0]["action"] == "run_command"
-    assert "上一页" not in "".join(item.get("text", "") for item in segments)
+    # 上一页在条上，但走到头了：灰的、没有点击事件。
+    previous = next(item for item in segments if item.get("text") == "[上一页]")
+    assert previous["color"] == "dark_gray" and "clickEvent" not in previous
 
     second = _PlayerSource("Admin")
     plugin._show_list(second, "2", "!!muc")
 
     assert "Mod 13" in second.body and "Mod 00" not in second.body
     assert [click["value"] for click in _pager_clicks(second)] == ["!!muc list"]
+    following = next(
+        item for item in _segments(_last_reply_with(second, "[下一页]"))
+        if item.get("text") == "[下一页]"
+    )
+    assert following["color"] == "dark_gray" and "clickEvent" not in following
 
 
 def test_turning_the_page_does_not_widen_a_filtered_listing(tmp_path, monkeypatch):
@@ -1607,10 +1937,361 @@ def test_the_console_gets_the_pager_as_a_command_not_a_button(tmp_path, monkeypa
 
     plugin._show_list(source, "", "!!muc")
 
-    pager = str(source.replies[-1])
+    pager = str(_last_reply_with(source, "第 1/2 页"))
     assert "第 1/2 页" in pager
     assert "下一页：!!muc list 2" in pager
     assert "上一页" not in pager
+    # 底栏对控制台是**素的一条线**：那句「悬停/点击」在终端里描述的事情做不到。
+    # 宽度对的是标题栏那一条（不是写死的 53——那是插件真正叫这个名字时才成立）。
+    closing = str(source.replies[-1])
+    title = str(source.replies[0])
+    assert closing == "=" * len(title), (closing, title)
+
+
+def test_the_console_listing_keeps_the_version_numbers_on_the_row(tmp_path, monkeypatch):
+    """控制台的列表行印**版本数字**，不是 ``[版本]`` 标签——终端里没有悬停。
+
+    这是把上一轮的管道接上：``_entry_row`` 当初把行形态写死成聊天形态（那个旋钮现在叫
+    ``chat_form``），于是聊天**和**控制台都换成了标签——可控制台的读者悬停不了，那些版本号
+    就这么从他们眼前消失了（模块自己的 docstring 却写着「the console keeps the numbers」）。
+    现在由调用方按 source 决定：玩家给标签（悬停看），控制台给数字。
+    """
+    plugin, _server = _one_screen_setup(tmp_path, monkeypatch, _listing_entries(2))
+
+    console = _ReplyRecorder()
+    plugin._show_list(console, "", "!!muc")
+    body = "\n".join(str(reply) for reply in console.replies)
+    assert "[版本]" not in body, body
+    assert "1.0.0" in body, body
+
+    player = _PlayerSource("Admin")
+    plugin._show_list(player, "", "!!muc")
+    assert "[版本]" in player.body
+    # 玩家看到的行上没有版本数字——数字在标签的浮窗里（另一条测试钉着浮窗的内容）。
+    assert "1.0.0" not in player.body, player.body
+
+
+def test_the_versions_and_the_detail_link_explain_themselves_on_hover():
+    """``[版本]`` 与 ``[详细信息]`` 的浮窗：用户点名要的两处。
+
+    - ``[版本]``（绿）悬停：更新的行是「旧(红) >>> 新(绿)」，已是最新就是一个黄版本；
+    - ``[详细信息]``（aqua）悬停：说明它会执行 ``!!muc info <Mod 名>``。
+      点击仍然按编号跑（编号是最稳的手柄），但浮窗里给的是人能读、能照着敲的那条命令。
+
+    控制台保留印在行上的数字：日志行悬停不了——和 URL 只留在控制台是同一个理由。
+    """
+    import json as _json
+
+    import mod_update_checker as plugin
+    from mod_update_checker.report import (
+        VERSION_ARROW,
+        VERSION_CURRENT,
+        VERSION_NEW,
+        VERSION_OLD,
+        UpdateEntry,
+        render_index_row,
+        version_summary,
+    )
+
+    previous = plugin._config
+    plugin._apply_language(None, _config_with({"language": "zh_cn"}))
+    try:
+        fresh = UpdateEntry(mod_id="a", name="Alpha", file_name="a.jar",
+                            local_version="1.0.0", latest_version="1.1.0",
+                            status=plugin.STATUS_UPDATE_AVAILABLE)
+        current = UpdateEntry(mod_id="b", name="Beta", file_name="b.jar",
+                              local_version="1.0.0", status=plugin.STATUS_UP_TO_DATE)
+
+        assert version_summary(fresh, plugin.tr) == [
+            (VERSION_OLD, "1.0.0"), (VERSION_ARROW, " >>> "), (VERSION_NEW, "1.1.0"),
+        ]
+        assert version_summary(current, plugin.tr) == [(VERSION_CURRENT, "1.0.0")]
+
+        segments = list(_segments(plugin._entry_row(1, fresh, "!!muc")))
+        label = next(item for item in segments if item.get("text", "").endswith("[版本]"))
+        assert label["color"] == "green"
+        tooltip = _json.dumps(label["hoverEvent"], ensure_ascii=False)
+        assert '"1.0.0", "color": "red"' in tooltip, tooltip
+        assert '"1.1.0", "color": "green"' in tooltip, tooltip
+
+        link = next(item for item in segments if item.get("text") == "[详细信息]")
+        assert link["clickEvent"]["value"] == "!!muc info 1"
+        assert "!!muc info Alpha" in _json.dumps(link["hoverEvent"], ensure_ascii=False)
+
+        console = str(render_index_row(1, fresh, plugin.tr))
+        assert "1.0.0 -> 1.1.0" in console and "[版本]" not in console
+    finally:
+        plugin._config = previous
+
+
+def test_the_font_model_is_the_one_measured_off_the_screenshots():
+    """字宽表钉在**截图里量出来的数字**上——它是量出来的，不是数出来的。
+
+    这条不能靠 ``test_the_chat_listing_lines_up_in_columns``：那条用的是同一张表去量，
+    表整体错了它也不知道（自证）。这里的期望值全部来自玩家客户端的截图，
+    ``bench/read_band_runs.py`` 逐字形量出步进、``bench/measure_list_columns.py`` 量出每格的
+    起始列——单位是 1/4 个普通字母（那份字体里一个字母 24 像素）。
+
+    改这张表就必须来改这里的数字，而改之前得先有一张新截图。
+    """
+    from mod_update_checker.report import (
+        CJK_QUARTERS,
+        QUARTERS_PER_LETTER,
+        char_quarters,
+        text_quarters,
+    )
+
+    assert QUARTERS_PER_LETTER == 4
+    # 普通字母、数字、空格：一个字母
+    assert char_quarters("A") == 4 and char_quarters(" ") == 4 and char_quarters("7") == 4
+    # 窄的：四分之三
+    for narrow in "ijltfI1":
+        assert char_quarters(narrow) == 3, narrow
+    # 点与方括号：一半
+    for half in ".[]":
+        assert char_quarters(half) == 2, half
+    # 汉字：2¼（``display_width`` 说的是 2）
+    assert CJK_QUARTERS == 9 and char_quarters("版") == 9
+
+    # 整行：``[1] QuickShulker`` 在截图里从 x=9 走到 x=351，342 像素 ÷ 6 = 57
+    assert text_quarters("[1] QuickShulker") == 57
+    assert text_quarters("[2] Ledger") == 36
+    assert text_quarters("[10] Carpet TIS Addition") == 86
+    # 两格固定标签：``[版本]`` 22、``[状态: ✔]`` 34
+    assert text_quarters("[版本]") == 22
+    assert text_quarters("[状态: ✔]") == 34
+
+
+def test_the_cell_widths_are_cached_but_never_across_languages():
+    """格宽按语言缓存，而**不**是全局缓存一个值。
+
+    那两个宽度是每行都要的（原来每行现算 13 次取词），所以缓存是对的；但中英两套标签长度
+    差得多（`[status: ✔]` 对 `[状态: ✔]`），缓存串了语言就是整列歪掉，而且不会有任何报错。
+    这条同时钉住「缓存命中」与「换语言会算新的」。
+    """
+    from mod_update_checker.i18n import make_translator
+    from mod_update_checker.report import chat_cell_widths
+
+    chinese = make_translator("zh_cn")
+    english = make_translator("en_us")
+
+    first = chat_cell_widths(chinese)
+    assert chat_cell_widths(chinese) == first, "第二次调用应当命中缓存"
+    assert first != chat_cell_widths(english), "两种语言的格宽不可能一样"
+    assert chat_cell_widths(chinese) == first, "英文那次不能污染中文的缓存"
+
+    # 不认识语言属性的翻译器（测试里的替身、lambda）：照旧现算，不做缓存。
+    assert chat_cell_widths(lambda key, **kwargs: "x") == (4, 4)
+
+
+def test_the_chat_listing_lines_up_in_columns(tmp_path, monkeypatch):
+    """聊天的列表行是**分列**的：名称一格、``[版本]`` 一格、``[状态: ✔]`` 一格、按钮一格（用户点名）。
+
+    名字长短不齐的时候，列就参差——现在名称（含编号）补到 ``CHAT_PREFIX_QUARTERS``，
+    ``[版本]`` 与 ``[状态: ✔]`` 也各自补到固定宽度，于是三列都落在同一个落点上。
+
+    对齐量的**不是** ``display_width``：游戏里那套字宽是量出来的（``report.GLYPH_QUARTERS``），
+    汉字 2¼ 个字母、``i``/``l`` 之类只有四分之三——按「东亚字符算两个」去补，正是列歪掉的
+    原因。量的是 ``text_quarters``。
+
+    而这个字体给不出「一模一样」：补白只能是**整格空格**，文字宽度却不总是四分之一字母的
+    整数倍，所以每一格的落点与目标最多差半个空格。测试断言的是这个上界——写死成「相等」
+    会是一条永远没人能通过的断言。
+    """
+    from mod_update_checker.report import (
+        QUARTERS_PER_LETTER,
+        ROW_FIELD_BODY,
+        ROW_FIELD_NOTE,
+        chat_row_fields,
+        text_quarters,
+    )
+
+    names = ["Ledger", "Just Enough Items", "A Very Long Mod Name Indeed",
+             "Carpet TIS Addition", "Sodium", "MCDRCommand", "Simple Voice Chat",
+             "AppleSkin", "Lithium", "Better Hanging Signs", "Iris"]
+    entries = [_bulk_entry("m{:02d}".format(i), name, "m{:02d}.jar".format(i),
+                           status="up_to_date")
+               for i, name in enumerate(names)]
+    plugin, _server = _one_screen_setup(tmp_path, monkeypatch, entries)
+
+    starts = {ROW_FIELD_BODY: set(), ROW_FIELD_NOTE: set(), "link": set()}
+    for number, entry in enumerate(entries, start=1):
+        column = 0
+        seen = set()
+        for role, text in chat_row_fields(number, entry, plugin.tr):
+            # 状态格是三块（文字 / 图标 / 括号+补白），一列只算它**开始**的那一块。
+            if role in starts and role not in seen:
+                starts[role].add(column)
+                seen.add(role)
+            column += text_quarters(text)
+
+        row = plugin._entry_row(number, entry, "!!muc")
+        text = "".join(str(piece) for piece in row.children)
+        starts["link"].add(text_quarters(text[:text.index("[详细信息]")]))
+
+    for name, columns in starts.items():
+        assert max(columns) - min(columns) <= QUARTERS_PER_LETTER - 1, (name, sorted(columns))
+    # 一列都没对齐的话上面也会「通过」（只有一个值）——顺带钉住它确实在往右走。
+    assert starts["body"] != starts["note"] != starts["link"], starts
+
+
+def test_a_long_mod_name_is_cut_and_its_full_form_is_on_hover(tmp_path, monkeypatch):
+    """名字超宽就截成 ``...``，全名在浮窗里——每一行的名称都有这个浮窗，不只是被截的那些。
+
+    编号也是这一格的一部分：``[10] `` 比 ``[1] `` 宽，截断按**当前行**真正剩下的宽度算，
+    所以两行的名称格都落在同一个落点上（补白是整格空格，最多差半个空格）。
+    """
+    import json as _json
+
+    from mod_update_checker.report import (
+        CHAT_PREFIX_QUARTERS,
+        QUARTERS_PER_LETTER,
+        text_quarters,
+    )
+
+    long_name = "A Very Long Mod Name Indeed"
+    entry = _bulk_entry("long", long_name, "long.jar", status="up_to_date")
+    plugin, _server = _one_screen_setup(tmp_path, monkeypatch, [entry])
+
+    for number in (1, 10):
+        row = plugin._entry_row(number, entry, "!!muc")
+        pieces = [piece for piece in row.children if str(piece)]
+        prefix, name_piece = pieces[0], pieces[1]
+        assert str(prefix) == "[{}] ".format(number)
+        assert str(name_piece).rstrip().endswith("..."), str(name_piece)
+        assert abs(text_quarters(str(prefix) + str(name_piece))
+                   - CHAT_PREFIX_QUARTERS) <= QUARTERS_PER_LETTER // 2, str(name_piece)
+        assert _json.dumps(name_piece.to_json_object(), ensure_ascii=False).count(long_name), (
+            "全名没有挂在这块上")
+        # 名字那一段的浮窗就是全名本身。
+        hover = name_piece.to_json_object()["hoverEvent"]
+        assert _json.dumps(hover, ensure_ascii=False).count(long_name) == 1
+
+    short = _bulk_entry("short", "Iris", "iris.jar", status="up_to_date")
+    row = plugin._entry_row(1, short, "!!muc")
+    name_piece = [piece for piece in row.children if str(piece)][1]
+    assert str(name_piece).startswith("Iris")
+    assert "..." not in str(name_piece)
+    # 不截断的名字也带全名浮窗：规则是「任何名称都解释自己」，不是「只有截断的才解释」。
+    assert "hoverEvent" in name_piece.to_json_object()
+
+
+def test_the_status_tag_explains_itself_on_hover(tmp_path, monkeypatch):
+    """``[状态: ❌]``：每一行都是同一句话，图标说状态，**浮窗第一行用状态色说出这个状态**。
+
+    读者看到的是 ``[状态: ❌]``；「上游没有适配当前加载器或游戏版本的构建」、识别方式
+    （``按名称近似匹配``），以及顶在最前面的那个**亮红色的状态名**都在浮窗里——状态色原来
+    贴在行上，现在那一格每一行都长一样，颜色就搬到浮窗的第一行（用户点的名）。
+    控制台那一份没有浮窗，所以整句照旧印在行上。
+    """
+    import json as _json
+
+    import mod_update_checker as plugin
+    from mod_update_checker.report import UpdateEntry
+
+    previous = plugin._config
+    plugin._apply_language(None, _config_with({"language": "zh_cn"}))
+    try:
+        blocked = UpdateEntry(mod_id="q", name="QuickShulker", file_name="q.jar",
+                              local_version="1.0.0", latest_version="1.1.0",
+                              status=plugin.STATUS_NO_COMPATIBLE_BUILD,
+                              matched_by="name")
+
+        segments = list(_segments(plugin._entry_row(1, blocked, "!!muc")))
+        # 那一格的文字永远黄（每一行都是同一句话），**图标带状态自己的颜色**（用户点名：
+        # 打叉红、打勾绿、有更新与待安装蓝），浮窗挂在两块上——鼠标落在哪一块都能展开。
+        words = next(item for item in segments
+                     if item.get("text", "").startswith("  [状态: "))
+        assert words["color"] == "yellow", words
+        mark = next(item for item in segments if item.get("text") == "❌")
+        assert mark["color"] == "red", mark
+        for piece in (words, mark):
+            assert "hoverEvent" in piece, piece
+
+        tooltip = plugin._status_hover(blocked)
+        first = tooltip.children[0]
+        assert str(first) == "无适配构建", str(first)
+        assert first.to_json_object()["color"] == "red", first.to_json_object()
+        flat = _json.dumps(tooltip.to_json_object(), ensure_ascii=False)
+        assert "上游没有适配当前" in flat, flat
+        assert "按名称近似匹配" in flat, flat
+
+        # 同一个状态，控制台那一份：整句 + 识别方式都印在行上（那里没有浮窗）。
+        console = str(plugin._entry_row(1, blocked, "!!muc", chat_form=False))
+        assert "(无适配构建，按名称近似匹配)" in console, console
+    finally:
+        plugin._config = previous
+
+
+def test_the_facts_of_a_backup_or_a_jar_row_live_in_their_tooltips(tmp_path, monkeypatch):
+    """没有版本可藏的两类行：中格是 ``[备份]`` / ``[文件]``，事实（大小、天数、文件名）在浮窗里。
+
+    控制台那一份没有任何悬停可言，所以它照旧把事实印在行上——同一个 ``_facts_hover`` 里的
+    文本，正是从这里（或从 ``line.old_backup``）取的。
+    """
+    import json as _json
+
+    from mod_update_checker.cleanup import Backup
+    from mod_update_checker.report import STATUS_UNRESOLVED, UpdateEntry, entry_from_backup
+
+    plugin, _server = _one_screen_setup(tmp_path, monkeypatch, [])
+
+    previous = plugin._config
+    plugin._apply_language(None, _config_with({"language": "zh_cn"}))
+    try:
+        backup = entry_from_backup(Backup("retired.jar.old", 1258291, 412))
+        segments = list(_segments(plugin._entry_row(2, backup, "!!muc")))
+        cell = next(item for item in segments if item.get("text", "").strip() == "[备份]")
+        tooltip = _json.dumps(cell["hoverEvent"], ensure_ascii=False)
+        assert "1.2 MB" in tooltip and "412" in tooltip, tooltip
+        mark = next(item for item in segments if item.get("text") == "⏪")
+        assert "插件留下的旧版备份" in _json.dumps(mark["hoverEvent"], ensure_ascii=False)
+
+        unresolved = UpdateEntry(mod_id="x", name="MCDRCommand",
+                                 file_name="MCDRcommandFabric-26.3-v1.3.0.jar",
+                                 status=STATUS_UNRESOLVED)
+        segments = list(_segments(plugin._entry_row(6, unresolved, "!!muc")))
+        cell = next(item for item in segments if item.get("text", "").strip() == "[文件]")
+        assert "MCDRcommandFabric-26.3-v1.3.0.jar" in _json.dumps(
+            cell["hoverEvent"], ensure_ascii=False)
+
+        console = str(plugin._entry_row(6, unresolved, "!!muc", chat_form=False))
+        assert "MCDRcommandFabric-26.3-v1.3.0.jar" in console, console
+    finally:
+        plugin._config = previous
+
+
+def test_the_staged_plans_confirm_line_is_a_red_fillable_button(tmp_path, monkeypatch):
+    """计划末尾那句「输入 ``!!muc confirm``」：命令是**亮红色**的，点一下填进输入框。
+
+    填而不是跑是有意的：``confirm`` 一按下去就真的删/装了，聊天框里手滑点一下不该能造成那种
+    事——填进输入框仍然要再按一次回车，和「两步确认」要的正是同一个动作。控制台拿到的是同一
+    句话（``str()`` 只掉颜色和点击，不掉字）。
+    """
+    plugin, _server, mods = _cleanup_setup(
+        tmp_path, monkeypatch, backups=[("ancient.jar.old", 512, 400)],
+    )
+    source = _PlayerSource("Admin")
+
+    plugin._manual_delete(source, "ancient.jar.old", "!!muc")
+
+    ask = str(source.raw[-1])
+    assert "!!muc confirm" in ask and "120" in ask
+    pieces = [piece for piece in source.raw[-1].children]
+    button = next(piece for piece in pieces if str(piece) == "!!muc confirm")
+    assert button.to_json_object()["color"] == "red", button.to_json_object()
+    assert button.to_json_object()["clickEvent"] == {
+        "action": "suggest_command", "value": "!!muc confirm",
+    }, button.to_json_object()
+
+    # 控制台形态：同一句话，一个字的差别都没有。
+    console = _ReplyRecorder()
+    plugin._manual_delete(console, "ancient.jar.old", "!!muc")
+    expected = plugin.tr("command.action.ask", seconds=120, command="!!muc confirm")
+    assert str(console.replies[-1]) == expected, console.replies[-1]
+    assert (mods / "ancient.jar.old").is_file(), "这条命令不该真的做什么"
+    # 计划还摆在槽位里——收掉它，别让下一条测试撞见（槽位是模块级的）。
+    plugin._clear_pending()
 
 
 def _run_bare(tree, source, command):
@@ -1742,7 +2423,7 @@ class _TextRecorder:
 
 
 def test_an_install_notice_is_coloured_by_role_not_painted_one_colour(tmp_path, monkeypatch):
-    """「已替换 N 个 Mod」不再整段同色：头部白、替换行灰、装不上的行黄。
+    """「已替换 N 个 Mod」不再整段同色：头部白、替换行灰、装不上的行红。
 
     颜色由行的**角色**决定，而角色在构造句子的地方就定了——不是投递层读文本猜出来的
     （v1.3.0 的教训）。所以这里断言的是 segment 的 color 字段。
@@ -1772,7 +2453,7 @@ def test_an_install_notice_is_coloured_by_role_not_painted_one_colour(tmp_path, 
 
     assert header == ["white"], coloured
     assert rows == ["gray"], coloured
-    assert skipped == ["yellow"], coloured
+    assert skipped == ["red"], coloured
     assert len(set(coloured.values())) > 1, "还是一整片同色"
 
 
@@ -1792,8 +2473,11 @@ def test_the_update_notice_gives_each_kind_of_line_its_role(tmp_path, monkeypatc
     lines = plugin._notification_lines(plugin._last_report)
 
     assert lines[0].role == "heading"
-    assert any(notice.role == "action" for notice in lines)
+    # 有更新的行是 ``update``（蓝）——和列表里同一个状态用同一个颜色，而不是「要处理就黄」。
+    assert any(notice.role == "update" for notice in lines)
     assert lines[-1].role == "hint"
+    # 行文本不带状态：小节的标题已经说了「更新尚未下载」，行里再写一遍就是重复。
+    assert not any("（" in notice.text or "(" in notice.text for notice in lines)
 
 
 # --------------------------------------------------------------------------------------
@@ -3040,3 +3724,719 @@ def test_a_config_file_missing_an_option_is_filled_in_and_rewritten(tmp_path):
     assert rewritten["download"]["install_on_stop"] is False
     assert rewritten["sources"]["manual_map"] == "project-map.json"
     assert rewritten["download"]["folder_name"] == "jars", "the admin's own value was lost"
+
+
+# --------------------------------------------------------------------------------------
+# !!muc delete / !!muc cleanup —— 旧版备份
+#
+# 这是插件里唯一会从 mods/ 里删东西的两条路径，所以断言的重点全是「什么不许发生」：
+# 不是备份的东西不许删，集合变了不许按旧计划删，开关关着不许主动开口。
+# --------------------------------------------------------------------------------------
+
+
+def _cleanup_setup(tmp_path, monkeypatch, *, allow_delete=True, enabled=True, max_age_days=30,
+                   backups=(), entries=()):
+    """The plugin wired to a mods folder holding the given backups.
+
+    ``allow_delete`` defaults to *on* here, unlike the shipped default: these tests are about
+    what the commands do, and the switch that lets them run is either the thing under test (the
+    locked tests below pass ``allow_delete=False``) or an uninteresting precondition.
+    """
+    import os
+    import time
+
+    import mod_update_checker as plugin
+    from mod_update_checker.report import UpdateEntry
+
+    mods = tmp_path / "mods"
+    mods.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    for name, size, age_days in backups:
+        path = mods / name
+        path.write_bytes(b"x" * size)
+        stamp = now - age_days * 86400
+        os.utime(str(path), (stamp, stamp))
+
+    def entry(file_name, status, **kwargs):
+        return UpdateEntry(mod_id=file_name, name=file_name, file_name=file_name,
+                           status=status, **kwargs)
+
+    holders = list(entries) + [entry(name, "old_backup", size_bytes=size, age_days=age_days)
+                               for name, size, age_days in backups]
+    server = _FakeServer(tmp_path)
+    monkeypatch.setattr(plugin, "_server", server, raising=False)
+    monkeypatch.setattr(plugin, "_last_report", _report_with(holders), raising=False)
+    monkeypatch.setattr(
+        plugin, "_config",
+        _config_with({"language": "zh_cn", "cleanup.allow_delete": allow_delete,
+                      "cleanup.enabled": enabled, "cleanup.max_age_days": max_age_days}),
+        raising=False,
+    )
+    monkeypatch.setattr(plugin, "_mods_folder", lambda *_a, **_k: mods, raising=False)
+    plugin._clear_pending()
+    plugin._apply_language(server, plugin._config)
+    return plugin, server, mods
+
+
+def test_the_default_is_off_and_nothing_is_said(tmp_path, monkeypatch):
+    """默认关闭：备份照样在报告里，但插件不会自己开口。"""
+    plugin, server, _mods = _cleanup_setup(
+        tmp_path, monkeypatch, enabled=False, backups=[("ancient.jar.old", 10, 400)],
+    )
+
+    plugin._announce_cleanup(server)
+
+    assert "旧版备份" not in "\n".join(server.logger.messages)
+    assert plugin._pending_action is None, "关着开关却摆好了计划"
+
+
+def test_an_expired_backup_is_announced_and_the_plan_is_ready(tmp_path, monkeypatch):
+    """打开开关后，提醒里那句「输入 confirm 删除」必须是真的。
+
+    这是用户描述的那条路：提醒 → 同意 → ``!!muc confirm``。所以提醒必须**顺手把计划摆好**，
+    否则那句话只有在前 120 秒里成立，而管理员可能是五分钟后才读到控制台的。
+    """
+    plugin, server, _mods = _cleanup_setup(
+        tmp_path, monkeypatch, backups=[("ancient.jar.old", 2048, 400)],
+    )
+
+    plugin._announce_cleanup(server)
+
+    logged = "\n".join(server.logger.messages)
+    assert "已超过 30 天" in logged
+    assert "confirm" in logged
+    assert plugin._pending_action is not None
+    assert plugin._pending_action["files"] == ["ancient.jar.old"]
+    # 空 requester = 读到这条的任一管理员都能确认，因为这条提醒是对全服管理员说的。
+    assert plugin._pending_action["requester"] == ""
+
+
+def test_a_fresh_backup_is_left_alone(tmp_path, monkeypatch):
+    plugin, server, _mods = _cleanup_setup(
+        tmp_path, monkeypatch, backups=[("fresh.jar.old", 10, 3)],
+    )
+
+    plugin._announce_cleanup(server)
+
+    assert "旧版备份" not in "\n".join(server.logger.messages)
+    assert plugin._pending_action is None
+
+
+def test_a_reminder_never_clobbers_a_plan_that_is_already_staged(tmp_path, monkeypatch):
+    """提醒不是人的指令，它不能顶掉管理员正在确认的那一条。
+
+    把「install 这三个」换成「删掉那两个」，比不提醒糟得多。
+    """
+    plugin, server, _mods = _cleanup_setup(
+        tmp_path, monkeypatch, backups=[("ancient.jar.old", 10, 400)],
+    )
+    plugin._stage_batch("install_all", _PlayerSource("Admin"), ["a.jar"],
+                        ["计划已列好"])
+
+    plugin._announce_cleanup(server)
+
+    assert plugin._pending_action["kind"] == "install_all"
+    assert plugin._pending_action["files"] == ["a.jar"]
+    logged = "\n".join(server.logger.messages)
+    assert "cleanup" in logged, "顶不掉却又不说怎么办"
+
+
+def test_deleting_one_backup_takes_two_steps_and_really_deletes_it(tmp_path, monkeypatch):
+    plugin, _server, mods = _cleanup_setup(
+        tmp_path, monkeypatch, backups=[("ancient.jar.old", 512, 400)],
+    )
+    source = _PlayerSource("Admin")
+
+    plugin._manual_delete(source, "ancient.jar.old", "!!muc")
+    assert (mods / "ancient.jar.old").is_file(), "还没确认就删了"
+    assert "即将删除" in source.body
+    assert plugin._pending_action["kind"] == "delete"
+
+    plugin._manual_confirm(source, "!!muc")
+
+    assert not (mods / "ancient.jar.old").exists()
+    assert "已删除" in source.body
+
+
+def test_a_number_that_points_at_a_mod_is_refused(tmp_path, monkeypatch):
+    """编号是真的、文件是真的，但它不是插件留下的备份——那就一个字节都不许动。"""
+    from mod_update_checker.report import UpdateEntry
+
+    plugin, _server, mods = _cleanup_setup(
+        tmp_path, monkeypatch, backups=[("ancient.jar.old", 512, 400)],
+        entries=[UpdateEntry(mod_id="sodium", name="Sodium", file_name="sodium.jar",
+                             status="up_to_date")],
+    )
+    (mods / "sodium.jar").write_bytes(b"a live mod")
+    source = _PlayerSource("Admin")
+
+    plugin._manual_delete(source, "sodium.jar", "!!muc")
+
+    assert "不会删除" in source.body
+    assert plugin._pending_action is None, "拒绝之后不该留下待确认的东西"
+    assert (mods / "sodium.jar").is_file()
+
+
+def test_cleanup_only_takes_the_expired_ones(tmp_path, monkeypatch):
+    plugin, _server, mods = _cleanup_setup(
+        tmp_path, monkeypatch, max_age_days=30,
+        backups=[("ancient.jar.old", 128, 400), ("fresh.jar.old", 64, 2)],
+    )
+    source = _PlayerSource("Admin")
+
+    plugin._manual_cleanup(source, "!!muc")
+    assert "即将删除 1 个" in source.body
+    assert plugin._pending_action["files"] == ["ancient.jar.old"]
+
+    plugin._manual_confirm(source, "!!muc")
+
+    assert not (mods / "ancient.jar.old").exists()
+    assert (mods / "fresh.jar.old").is_file(), "没过期的也被删了"
+
+
+def test_a_cleanup_is_dropped_whole_when_the_set_changed(tmp_path, monkeypatch):
+    """集合变了就整条作废，而不是只删还对得上的那几个。"""
+    plugin, _server, mods = _cleanup_setup(
+        tmp_path, monkeypatch, backups=[("ancient.jar.old", 128, 400)],
+    )
+    source = _PlayerSource("Admin")
+    plugin._manual_cleanup(source, "!!muc")
+
+    # 两条命令之间，mods/ 里多了一个**已过期**的备份。刚创建的文件不算——它没到期限，
+    # 集合其实没变，而这条测试要证的正是「集合变了就整条作废」。
+    import os
+    import time
+
+    added = mods / "another.jar.old"
+    added.write_bytes(b"y" * 16)
+    stamp = time.time() - 400 * 86400
+    os.utime(str(added), (stamp, stamp))
+
+    plugin._manual_confirm(source, "!!muc")
+
+    assert (mods / "ancient.jar.old").is_file()
+    assert "作废" in source.body
+
+
+def test_the_status_screen_names_the_backups(tmp_path, monkeypatch):
+    plugin, _server, _mods = _cleanup_setup(
+        tmp_path, monkeypatch, backups=[("ancient.jar.old", 1048576, 400)],
+    )
+    source = _PlayerSource("Admin")
+
+    plugin._show_status(source)
+
+    body = source.body
+    assert "旧版备份" in body
+    assert "1.0 MB" in body
+    assert "已超过 30 天" in body
+
+
+def test_the_listing_shows_a_backup_and_can_be_filtered_to_it(tmp_path, monkeypatch):
+    plugin, _server, _mods = _cleanup_setup(
+        tmp_path, monkeypatch, backups=[("ancient.jar.old", 2048, 400)],
+    )
+    source = _PlayerSource("Admin")
+
+    plugin._show_list(source, "", "!!muc")
+    assert "ancient.jar.old" in source.body
+    # 行上的状态格现在只说 ``[状态: ⏪]``（每一行都一样）；「旧版备份」那句解释搬进了浮窗，
+    # 所以正文里不再出现它（浮窗的内容由事实那条测试钉住）。
+    assert "[状态: ⏪]" in source.body
+    assert "旧版备份" not in source.body
+
+    filtered = _PlayerSource("Admin")
+    plugin._show_list(filtered, "old_backup", "!!muc")
+    assert "ancient.jar.old" in filtered.body
+
+
+def test_the_detail_view_offers_the_delete_button(tmp_path, monkeypatch):
+    plugin, _server, _mods = _cleanup_setup(
+        tmp_path, monkeypatch, backups=[("ancient.jar.old", 2048, 400)],
+    )
+    source = _PlayerSource("Admin")
+    entry = plugin._last_report.backups[0]
+
+    plugin._reply_detail(source, entry, prefix="!!muc")
+
+    assert "删除此备份" in source.body
+    assert "ancient.jar.old" in source.body
+    assert "12.4" not in source.body  # 2048 B -> KB，不是乱写的数字
+
+
+def test_installing_stamps_the_backup_with_the_moment_it_was_made(tmp_path):
+    """改名会保留原 jar 的时间戳，所以安装完必须把它刷成「现在」。
+
+    不刷的话，``sodium.jar.old`` 带的是那个 jar 当初放进 mods/ 的日期——可能是一年前——
+    而清理功能正是按这个时间戳算年龄的：升级之后第一次运行就会把服务器上**每一个**备份
+    都当成早就过期。
+    """
+    import os
+    import time
+
+    from mod_update_checker import installer
+
+    mods = tmp_path / "mods"
+    downloads = tmp_path / "downloads"
+    mods.mkdir()
+    downloads.mkdir()
+    old = mods / "sodium.jar"
+    old.write_bytes(b"old")
+    stamp = time.time() - 500 * 86400
+    os.utime(str(old), (stamp, stamp))
+
+    fresh = downloads / "sodium-1.1.0.jar"
+    fresh.write_bytes(b"new")
+    import hashlib
+
+    record = {
+        "file": "sodium-1.1.0.jar",
+        "name": "Sodium",
+        "local": "sodium.jar",
+        "version": "1.1.0",
+        "sha1": hashlib.sha1(b"new").hexdigest(),
+    }
+
+    result = installer._install_one(record, installer.InstallOptions(mods, downloads))
+
+    assert result.status == installer.STATUS_INSTALLED
+    backup = mods / result.backup_file
+    assert backup.is_file()
+    age_days = (time.time() - backup.stat().st_mtime) / 86400
+    assert age_days < 1, "备份的时间戳还是那个旧 jar 的"
+
+
+# --------------------------------------------------------------------------------------
+# cleanup.allow_delete —— 「什么都不许删」那个开关
+#
+# 这一组测的全是「不许发生什么」：默认配置下两条命令都拒绝、提醒也不出现（提醒的下一步
+# 必然被拒，说了就是废话）、连**已经在等确认的计划**在开关被关掉之后也不执行。最后一条
+# 是这一组里最重要的：门禁只拦命令、不拦确认的话，那枚计划就绕过了开关。
+# --------------------------------------------------------------------------------------
+
+
+def _clicked_commands(source):
+    """Every click target in everything this source was sent, in order.
+
+    ``suggest_command`` and ``run_command`` alike: the question these tests ask is "did the
+    reader get something to click that would delete a file", and both spellings answer yes.
+    """
+    return [
+        item["clickEvent"]["value"]
+        for reply in source.raw
+        for item in _segments(reply)
+        if "clickEvent" in item
+    ]
+
+
+def test_the_shipped_default_forbids_deletion():
+    """出厂设置里这一项是关的——整个插件的默认姿态是「一个字节都不删」。"""
+    import mod_update_checker as plugin
+
+    assert plugin.Config.get_default().cleanup.allow_delete is False
+
+
+def test_delete_is_refused_while_the_switch_is_off(tmp_path, monkeypatch):
+    """关着的时候 ``delete`` 不删东西，而且要说清在哪打开。"""
+    plugin, _server, mods = _cleanup_setup(
+        tmp_path, monkeypatch, allow_delete=False, backups=[("ancient.jar.old", 512, 400)],
+    )
+    source = _PlayerSource("Admin")
+
+    plugin._manual_delete(source, "ancient.jar.old", "!!muc")
+
+    assert (mods / "ancient.jar.old").is_file(), "开关关着却删了文件"
+    assert plugin._pending_action is None, "开关关着却摆好了计划"
+    body = source.body
+    assert "删除功能未开启" in body
+    assert "cleanup.allow_delete" in body, "没说清去改哪个选项"
+    assert plugin._config_path(plugin._server) in body, "没给出配置文件的路径"
+
+
+def test_cleanup_is_refused_while_the_switch_is_off(tmp_path, monkeypatch):
+    plugin, _server, mods = _cleanup_setup(
+        tmp_path, monkeypatch, allow_delete=False, backups=[("ancient.jar.old", 512, 400)],
+    )
+    source = _PlayerSource("Admin")
+
+    plugin._manual_cleanup(source, "!!muc")
+
+    assert (mods / "ancient.jar.old").is_file()
+    assert plugin._pending_action is None
+    assert "cleanup.allow_delete" in source.body
+
+
+def test_the_reminder_needs_the_delete_switch_as_well(tmp_path, monkeypatch):
+    """``enabled`` 开着也没用：``allow_delete`` 关着时提醒不出现。
+
+    这正是用户要求的「前置开关」。提醒的全部意义是「输入 confirm 删除它们」，而那种状态下
+    confirm 必然被拒——一句做不到的话会让管理员以为插件坏了。
+    """
+    plugin, server, _mods = _cleanup_setup(
+        tmp_path, monkeypatch, allow_delete=False, enabled=True,
+        backups=[("ancient.jar.old", 2048, 400)],
+    )
+
+    plugin._announce_cleanup(server)
+
+    assert "旧版备份" not in "\n".join(server.logger.messages)
+    assert plugin._pending_action is None
+
+
+def test_a_plan_staged_before_the_switch_went_off_is_not_carried_out(tmp_path, monkeypatch):
+    """开关关掉之后，连**已经在等确认**的计划也不执行。
+
+    这一条问的是一份不变量：无论配置是怎么变的，删除计划的执行都要自己再看一次开关。现实里
+    ``!!muc reload`` 会顺手清掉待确认的计划（见 ``_reload_config``），所以这条路径今天多半
+    走不到——但那正是它值得有的理由：安全性不该建立在「另一处会顺手清掉」上面。门禁只装在
+    命令上、没装在确认上的话，任何一处忘了清、或者将来加了不清的路径，这枚计划就带着一份
+    早已作废的授权把文件删了。
+
+    所以这里直接改配置对象（模拟「配置已经不是原来那份了」），而不是走 reload 那条会自己
+    清空槽位的路。
+    """
+    plugin, _server, mods = _cleanup_setup(
+        tmp_path, monkeypatch, backups=[("ancient.jar.old", 512, 400)],
+    )
+    source = _PlayerSource("Admin")
+    plugin._manual_delete(source, "ancient.jar.old", "!!muc")
+    assert plugin._pending_action is not None, "（前提：计划已经摆好）"
+
+    # 配置变了。刻意不调 ``_reload_config``：它自己会清空槽位，那样就测不到这条门禁了。
+    plugin._config.cleanup.allow_delete = False
+
+    plugin._manual_confirm(source, "!!muc")
+
+    assert (mods / "ancient.jar.old").is_file(), "开关关掉之后，计划的删除还是执行了"
+    assert plugin._pending_action is None, "被拒之后计划还留着"
+    assert "cleanup.allow_delete" in source.body
+
+
+def test_the_detail_view_explains_itself_instead_of_offering_a_locked_button(
+    tmp_path, monkeypatch,
+):
+    """关着的时候详情页不给按钮，给一行说明——点了必然报错的按钮比没有按钮更差。"""
+    plugin, _server, _mods = _cleanup_setup(
+        tmp_path, monkeypatch, allow_delete=False, backups=[("ancient.jar.old", 2048, 400)],
+    )
+    source = _PlayerSource("Admin")
+    entry = plugin._last_report.backups[0]
+
+    plugin._reply_detail(source, entry, prefix="!!muc")
+
+    assert "cleanup.allow_delete" in source.body
+    assert "删除此备份" not in source.body, "开关关着却还给了删除按钮"
+    # 这一行说的是「说明文字」，不是「灰掉的按钮」：整条回复里不能有任何点击目标。
+    assert not _clicked_commands(source), _clicked_commands(source)
+
+
+def test_the_status_line_says_why_nothing_is_cleaning_up(tmp_path, monkeypatch):
+    """状态屏那一行在「有过期备份 + 删除关着」时要给出原因。"""
+    plugin, _server, _mods = _cleanup_setup(
+        tmp_path, monkeypatch, allow_delete=False, backups=[("ancient.jar.old", 1048576, 400)],
+    )
+    source = _PlayerSource("Admin")
+
+    plugin._show_status(source)
+
+    assert "旧版备份" in source.body
+    assert "删除功能未开启" in source.body
+
+
+def test_the_status_line_is_quiet_about_the_switch_when_there_is_nothing_to_delete(
+    tmp_path, monkeypatch,
+):
+    """没有过期备份时不提这个开关——否则它会变成每一屏都在的背景噪音。"""
+    plugin, _server, _mods = _cleanup_setup(
+        tmp_path, monkeypatch, allow_delete=False, backups=[("fresh.jar.old", 1024, 1)],
+    )
+    source = _PlayerSource("Admin")
+
+    plugin._show_status(source)
+
+    assert "旧版备份" in source.body
+    assert "删除功能未开启" not in source.body
+
+
+def test_a_cache_file_that_is_not_an_object_cannot_break_the_load(tmp_path, monkeypatch):
+    """``resolve-cache.json`` 里装着 ``[]`` 时，插件必须照常加载。
+
+    这是这一轮代码审查揪出来的：``_log_cache_summary`` 直接对解析结果调 ``.get``，而它被
+    ``on_load`` 不设防地调用——一份被手工改坏的缓存文件（或者任何把 ``null`` / ``[]`` 写进去
+    的东西）会让**插件加载失败**。一行日志没有资格造成这种后果，on_load 里其它每一步都包了
+    try/except，只有它没有，因为它假设「这文件是我们自己写的」。它确实是——但插件文件夹里
+    的文件不归我们独占。
+    """
+    import json
+    import pathlib
+
+    import mod_update_checker as plugin
+
+    for body in ("[]", "null", '"text"', "{}", '{"version": 1, "records": {}}'):
+        root = tmp_path / body.replace('"', "").replace(" ", "")[:8]
+        server = _FakeServer(root)
+        folder = pathlib.Path(server.get_data_folder())
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / plugin.CACHE_FILE_NAME).write_text(body, encoding="utf-8")
+        monkeypatch.setattr(plugin, "_server", server, raising=False)
+        # 语言在这里自己钉住：单个测试被挑出来跑时，前面没有任何测试设过中文，断言会因语言
+        # 残留而失败（这个坑 tests/README 里记着）。
+        monkeypatch.setattr(
+            plugin, "_config",
+            _config_with({"language": "zh_cn", "network.cache.enabled": True}),
+            raising=False,
+        )
+        plugin._apply_language(server, plugin._config)
+
+        plugin._log_cache_summary(server, plugin._config)   # 不许抛
+
+    # 而且好的那份仍然会被念出来——把崩溃挡掉不等于把功能关掉。
+    server = _FakeServer(tmp_path / "good")
+    folder = pathlib.Path(server.get_data_folder())
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / plugin.CACHE_FILE_NAME).write_text(
+        json.dumps({"version": 1, "records": {"a" * 40: {"mod_id": "sodium"}}}),
+        encoding="utf-8",
+    )
+    plugin._log_cache_summary(server, plugin._config)
+
+    logged = "\n".join(server.logger.messages)
+    assert "识别缓存：1 条记录" in logged, logged
+
+
+def test_cleanup_says_how_to_proceed_when_nothing_is_expired_yet(tmp_path, monkeypatch):
+    """默认阈值下第一次敲 ``cleanup`` 必然是这个结果（备份都是新的），所以它必须给出下一步。
+
+    这条来自用户的真实一问：「我输入 !!muc cleanup 之后为何没有删除旧的文件？」——他的六个备份
+    21–22 天，阈值 30 天。回答「没有超过 30 天的」是对的，但停在那里等于把「阈值是个可以改的
+    数字」和「点名删除不看天数」两件事留给读者自己发现。
+    """
+    plugin, _server, _mods = _cleanup_setup(
+        tmp_path, monkeypatch, max_age_days=30, backups=[("fresh.jar.old", 2048, 21)],
+    )
+    source = _PlayerSource("Admin")
+
+    plugin._manual_cleanup(source, "!!muc")
+
+    body = source.body
+    assert "没有超过 30 天的旧版备份(当前共 1 个，最老的 21 天)" in body, body
+    assert "delete" in body and "max_age_days" in body, body
+    assert plugin._pending_action is None, "没东西可删却摆了计划"
+
+
+def test_cleanup_on_a_folder_with_no_backups_at_all_says_so(tmp_path, monkeypatch):
+    """一个备份都没有时，说「共 0 个，最老的 ? 天」是废话——那句话只为「有备份但都没到期」写。"""
+    plugin, _server, _mods = _cleanup_setup(tmp_path, monkeypatch, backups=[])
+    source = _PlayerSource("Admin")
+
+    plugin._manual_cleanup(source, "!!muc")
+
+    body = source.body
+    assert "没有旧版备份" in body, body
+    assert "最老的" not in body and "max_age_days" not in body, body
+
+
+def test_delete_all_covers_the_backups_that_are_not_expired_yet(tmp_path, monkeypatch):
+    """``delete all`` 与 ``cleanup`` 只差一件事：不看天数。
+
+    这是用户点名要的（`download all` / `install all` 的对称形式）。动机很实际：堆在 mods/ 里的
+    备份**大多数都还没到期**，而「清理」这件事的出发点通常就是「把这一堆清掉」——``cleanup``
+    在这种时候只会回答「没有超过 N 天的」，一句都不删。
+    """
+    plugin, _server, mods = _cleanup_setup(
+        tmp_path, monkeypatch, max_age_days=30,
+        backups=[("fresh.jar.old", 2048, 21), ("ancient.jar.old", 1024, 400)],
+    )
+
+    # 前提：同样的两个文件，cleanup 的计划里**只有**过期的那一个。
+    first = _PlayerSource("Admin")
+    plugin._manual_cleanup(first, "!!muc")
+    assert plugin._pending_action["files"] == ["ancient.jar.old"], "（前提：cleanup 只认过期的）"
+    assert "fresh.jar.old" not in first.body
+    plugin._clear_pending()
+
+    source = _PlayerSource("Admin")
+    plugin._manual_delete(source, "all", "!!muc")
+
+    body = source.body
+    assert "即将删除全部 2 个旧版备份" in body, body
+    assert "fresh.jar.old" in body and "ancient.jar.old" in body, body
+    assert plugin._pending_action["files"] == ["ancient.jar.old", "fresh.jar.old"], "集合不对"
+
+    plugin._manual_confirm(source, "!!muc")
+
+    assert not (mods / "fresh.jar.old").exists(), "没到期的那个被漏掉了"
+    assert not (mods / "ancient.jar.old").exists()
+
+
+def test_delete_all_is_dropped_when_the_set_changed(tmp_path, monkeypatch):
+    """集合变了整条作废——而且提示语要指回 ``delete all``，不是 ``cleanup``。
+
+    指错了命令，管理员照着敲就会得到一个**完全不同**的计划（只删过期的），而他以为自己是在
+    重列刚才那条。
+    """
+    plugin, _server, mods = _cleanup_setup(
+        tmp_path, monkeypatch, max_age_days=30, backups=[("fresh.jar.old", 512, 21)],
+    )
+    source = _PlayerSource("Admin")
+    plugin._manual_delete(source, "all", "!!muc")
+    assert plugin._pending_action is not None
+
+    (mods / "another.jar.old").write_bytes(b"y" * 8)
+
+    plugin._manual_confirm(source, "!!muc")
+
+    assert (mods / "fresh.jar.old").is_file()
+    assert "作废" in source.body
+    assert "!!muc delete all" in source.body, source.body
+
+
+def test_delete_all_needs_the_switch_like_everything_else(tmp_path, monkeypatch):
+    """总开关关着时，``delete all`` 与单条那条一样被拒绝。"""
+    plugin, _server, mods = _cleanup_setup(
+        tmp_path, monkeypatch, allow_delete=False, backups=[("ancient.jar.old", 512, 400)],
+    )
+    source = _PlayerSource("Admin")
+
+    plugin._manual_delete(source, "all", "!!muc")
+
+    assert "删除功能未开启" in source.body
+    assert plugin._pending_action is None
+    assert (mods / "ancient.jar.old").is_file()
+
+
+def test_delete_all_with_nothing_to_delete_says_so(tmp_path, monkeypatch):
+    plugin, _server, _mods = _cleanup_setup(tmp_path, monkeypatch, backups=[])
+    source = _PlayerSource("Admin")
+
+    plugin._manual_delete(source, "all", "!!muc")
+
+    assert "没有旧版备份" in source.body
+    assert plugin._pending_action is None
+
+
+def test_a_deleted_backup_leaves_the_listing_at_once(tmp_path, monkeypatch):
+    """删掉之后立刻从列表里消失——这条来自用户实测。
+
+    列表、详情、汇总渲染的都是「上次检查的报告」，而它是一份快照：删完文件之后报告里还留着那条，
+    于是列表照旧显示它（编号、大小、天数一个不少），再敲一次 delete 还能列出一个「即将删除」的
+    计划，直到 confirm 才说「已经不在了」。用户的日志里连着出现了三次——他的结论是「删除要等到
+    关服才生效」，而真相是删除当场就完成了，只是**列表没有跟着变**。
+    """
+    plugin, _server, mods = _cleanup_setup(
+        tmp_path, monkeypatch, backups=[("ancient.jar.old", 512, 400)],
+    )
+    source = _PlayerSource("Admin")
+
+    plugin._manual_delete(source, "ancient.jar.old", "!!muc")
+    plugin._manual_confirm(source, "!!muc")
+
+    assert not (mods / "ancient.jar.old").exists()
+    assert [entry.file_name for entry in plugin._last_report.backups] == [], "报告里还留着幽灵"
+    assert "已删除" in source.body
+
+    listing = _PlayerSource("Admin")
+    plugin._show_list(listing, "", "!!muc")
+    assert "ancient.jar.old" not in listing.body, listing.body
+
+    # 再删一次：它已经不在手柄里了，所以是「找不到」而不是一个删空气的计划。
+    again = _PlayerSource("Admin")
+    plugin._manual_delete(again, "ancient.jar.old", "!!muc")
+    assert plugin._pending_action is None
+    assert "已经不在了" not in again.body, "又列出了一个删空气的计划"
+
+
+def test_a_batch_deletion_takes_every_row_out_of_the_listing(tmp_path, monkeypatch):
+    """批量那条同样要跟着更新——否则一次 cleanup 之后留下六行幽灵。"""
+    plugin, _server, mods = _cleanup_setup(
+        tmp_path, monkeypatch, max_age_days=0,
+        backups=[("a.jar.old", 128, 400), ("b.jar.old", 256, 300)],
+    )
+    source = _PlayerSource("Admin")
+
+    plugin._manual_cleanup(source, "!!muc")
+    plugin._manual_confirm(source, "!!muc")
+
+    assert not (mods / "a.jar.old").exists() and not (mods / "b.jar.old").exists()
+    assert plugin._last_report.backups == []
+
+
+def test_the_stored_report_is_rewritten_so_the_ghost_cannot_come_back(tmp_path, monkeypatch):
+    """``last_report.json`` 也要改：不然重启一次，那份快照又把删掉的文件读回来。"""
+    import json
+    from pathlib import Path
+
+    plugin, server, _mods = _cleanup_setup(
+        tmp_path, monkeypatch, backups=[("ancient.jar.old", 512, 400)],
+    )
+    stored = Path(server.get_data_folder()) / "last_report.json"
+    plugin._write_report_files(server, plugin._last_report)   # 快照先落盘，才有「幽灵回来」可言
+    assert "ancient.jar.old" in stored.read_text(encoding="utf-8"), "（前提：快照里有它）"
+
+    source = _PlayerSource("Admin")
+    plugin._manual_delete(source, "ancient.jar.old", "!!muc")
+    plugin._manual_confirm(source, "!!muc")
+
+    saved = json.loads(stored.read_text(encoding="utf-8"))
+    names = [entry.get("file_name") for entry in saved.get("entries", [])]
+    assert "ancient.jar.old" not in names, names
+    assert saved.get("counts", {}).get("old_backup") == 0, saved.get("counts")
+
+
+def test_every_status_gets_the_colour_the_rule_says(tmp_path, monkeypatch):
+    """配色的规则逐个状态钉住——加一个新状态而不来这张表登记，这条就失败。
+
+    规则（用户定的）：绿 = 已是最新，蓝 = 有得更新（含待安装），红 = 有问题，其余灰；
+    编号与状态格永远黄、名称永远白。颜色只在 ``_STATUS_COLOURS`` / ``_ROW_FIELD_COLOURS``
+    两份表里，界面各处查它们。
+
+    状态格现在是每一行都一样的 ``[状态: ✔]``：**文字永远黄、图标查状态表**（打叉红、打勾绿、
+    有更新与待安装蓝——用户点名要图标分色），浮窗第一行用的是同一个 ``_status_colour``，所以行上
+    的图标与浮窗的标题不会各说各话。
+    """
+    import mod_update_checker as plugin
+    from mod_update_checker.i18n import make_translator
+    from mod_update_checker.report import (
+        ALL_STATUSES,
+        ROW_FIELD_MARK,
+        ROW_FIELD_NOTE,
+        UpdateEntry,
+        has_version_label,
+        index_row_fields,
+    )
+
+    expected = {
+        "update_available": plugin.RColor.blue,
+        "awaiting_install": plugin.RColor.blue,
+        "no_compatible_build": plugin.RColor.red,
+        "error": plugin.RColor.red,
+        "up_to_date": plugin.RColor.green,
+        # 信息类：不是「要做什么」
+        "local_ahead": plugin.RColor.gray,
+        "unresolved": plugin.RColor.gray,
+        "not_a_mod": plugin.RColor.gray,
+        "ignored": plugin.RColor.gray,
+        "old_backup": plugin.RColor.gray,
+    }
+    assert set(expected) == set(ALL_STATUSES), "有新状态没在这张表里登记"
+
+    chinese = make_translator("zh_cn")
+    for status, colour in expected.items():
+        entry = UpdateEntry(mod_id="x", name="Alpha", file_name="alpha.jar",
+                            local_version="1.0.0", latest_version="2.0.0", status=status)
+        assert plugin._status_colour(status) == colour, status
+        fields = index_row_fields(1, entry, chinese)
+        assert plugin._row_field_colour(entry, plugin.ROW_FIELD_NUMBER) == plugin.RColor.yellow
+        assert plugin._row_field_colour(entry, plugin.ROW_FIELD_NAME) == plugin.RColor.white
+        # 状态格：文字一句话、永远黄；**图标查状态表**（打叉红、打勾绿、有更新与待安装蓝）。
+        assert plugin._row_field_colour(entry, ROW_FIELD_NOTE) == plugin.RColor.yellow, status
+        assert plugin._row_field_colour(entry, ROW_FIELD_MARK) == colour, status
+        # ``[版本]`` 那一块：有版本可藏的状态是绿的（把手色），其余保持白。
+        expected_body = (plugin.RColor.green if has_version_label(entry)
+                         else plugin.RColor.white)
+        assert plugin._row_field_colour(entry, plugin.ROW_FIELD_BODY) == expected_body, status
+
+        # 而且状态**只说一次**：模板里不再夹带一份（那条重复是用户报上来的）
+        words = chinese("status." + status)
+        body = "".join(text for role, text in fields if role != ROW_FIELD_NOTE)
+        assert words not in body, (status, body)

@@ -247,6 +247,18 @@ def _install_one(record: Dict[str, Any], options: InstallOptions) -> InstallResu
         return InstallResult(name=name, status=STATUS_FAILED, version=version,
                              detail="could not set the old jar aside: {}".format(error))
 
+    # Stamp the backup with the moment it became a backup. A rename keeps the timestamp of the
+    # file being renamed, so without this ``sodium.jar.old`` would carry the date ``sodium.jar``
+    # was put in the folder — possibly years earlier — and the cleanup feature, which ages
+    # backups by exactly this timestamp, would read every backup on the server as long expired
+    # on the first run after upgrading. The file appeared under *this* name now; that is what
+    # its timestamp should say. A failure here is not worth aborting an install over, and the
+    # worst case is a backup that reads as older than it is.
+    try:
+        os.utime(str(backup), None)
+    except OSError:
+        pass
+
     try:
         # ``shutil.move`` rather than ``os.replace``: the download folder is configurable and
         # may be on another volume, where a rename across devices fails. A copy is not atomic,

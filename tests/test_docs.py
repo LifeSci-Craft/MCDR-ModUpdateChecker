@@ -410,6 +410,46 @@ def test_the_readme_sample_screens_start_with_the_bar_the_plugin_draws():
     )
 
 
+def test_the_readme_backup_row_is_the_row_the_listing_draws():
+    """README 里那句「一行长这样」必须是列表真画出来的那一行。
+
+    与标题栏那条守卫同一个理由：样例是「文本形式的截图」，凭印象写出来的样例会展示一个插件
+    并不产生的界面。踩过两次了——先是全角括号和逗号（``retired.jar.old（1.2 MB，已存在 412 天）``），
+    后是行改成分列之后（``[备份]`` 中格、各格补白），所以现在比的是**聊天形态的整行**，
+    连补白一起——那正是读者在游戏里看到的东西。
+    """
+    import mod_update_checker as plugin
+    from mod_update_checker.cleanup import Backup
+    from mod_update_checker.i18n import make_translator
+    from mod_update_checker.report import entry_from_backup
+
+    previous = plugin._config
+    try:
+        # 语言自己钉住：这条比的是 README 里那份中文样例，不靠「上一个测试碰巧设过」。
+        config = plugin.Config.get_default()
+        config.language = "zh_cn"
+        plugin._apply_language(None, config)
+        entry = entry_from_backup(Backup("retired.jar.old", 1258291, 412))
+        row = plugin._entry_row(2, entry, "!!modupdate")
+        drawn = "".join(str(piece) for piece in row.children)
+    finally:
+        plugin._config = previous
+        plugin._apply_language(None, previous)
+    assert "retired.jar.old" in drawn  # 前提：这一行画出来是对的
+    assert make_translator("zh_cn")("line.backup_label") in drawn
+
+    line = next(
+        (
+            text.strip().strip("`").split("`")[0]
+            for text in _doc(USER_DOC).splitlines()
+            if "retired.jar.old" in text and text.startswith("`[")
+        ),
+        None,
+    )
+    assert line is not None, "README 里那行备份样例不见了"
+    assert line == drawn, "样例是 {!r}，插件画的是 {!r}".format(line, drawn)
+
+
 def test_the_changelog_leads_with_the_shipped_version():
     """``tools/release.py`` builds the release body from the top ``## `` section.
 
@@ -457,13 +497,44 @@ def test_every_option_the_config_has_is_written_down_somewhere():
     assert unexplained == [], "options nobody documents: {}".format(unexplained)
 
 
+#: The marker the injection-verification scripts leave in the source while they prove a test can
+#: fail. See :func:`test_no_source_file_is_left_in_an_injected_state`.
+INJECTION_MARKER = "# injection:"
+
+
+def test_no_source_file_is_left_in_an_injected_state():
+    """注入验证是「把一处守卫改坏、看对应测试是否失败」，所以被中断时源码会**留在坏掉的状态**。
+
+    这不是假想：一次超时把 ``installer.py`` 里刷新备份时间戳的那三行换成了 ``pass``，
+    于是「备份的年龄」这条测试开始报 500 天——**看起来像一个真的回归**，而真相是上一轮工具
+    没跑完。当时没有人喊一声，是我在下一轮跑全量时才撞见。
+
+    所以这个标记必须被扫出来：留在树里就失败，并指出是哪个文件。修复方式见那两个脚本里的
+    ``.inject-backup`` 自愈逻辑，或 ``git restore <路径>``。
+    """
+    offenders = []
+    for path in sorted((REPO / "mod_update_checker").rglob("*.py")):
+        try:
+            if INJECTION_MARKER in path.read_text(encoding="utf-8"):
+                offenders.append(str(path.relative_to(REPO)))
+        except OSError:
+            continue
+
+    assert offenders == [], (
+        "these files are still injected, so their guards are disabled: {}".format(offenders)
+    )
+
+
 #: Extensions that are not text and therefore not expected to be LF. ``.mcdr`` is a zip with a
 #: different name; the rest are assets.
 _BINARY_SUFFIXES = frozenset({".mcdr", ".jar", ".png", ".zip", ".pyc", ".pyo"})
 
 #: Directories that are not part of the source: the object store, the unpacked test
-#: dependencies, and the caches.
-_NOT_SOURCE = frozenset({".git", ".testlibs", "__pycache__", ".pytest_cache"})
+#: dependencies, and the caches. ``.ruff_cache`` holds **binary** entries with no file suffix,
+#: and ruff rewrites them as it sees fit — one of them happened to contain the two bytes
+#: ``\r\n`` inside a hash, which this test read as a line ending. Cache directories are not
+#: source, so they are skipped rather than policed.
+_NOT_SOURCE = frozenset({".git", ".testlibs", "__pycache__", ".pytest_cache", ".ruff_cache"})
 
 
 def test_no_source_file_carries_windows_line_endings():

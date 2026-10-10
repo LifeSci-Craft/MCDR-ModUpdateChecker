@@ -30,6 +30,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple
 
+from .cleanup import Backup, restored_name
+from .jsonfile import json_text
 from .serverinfo import ServerContext
 
 __all__ = [
@@ -62,6 +64,32 @@ __all__ = [
     "render_full",
     "render_entry_lines",
     "render_index_row",
+    "index_row_fields",
+    "entry_row_fields",
+    "chat_row_fields",
+    "chat_cell_widths",
+    "status_tag",
+    "STATUS_ICONS",
+    "text_quarters",
+    "char_quarters",
+    "GLYPH_QUARTERS",
+    "QUARTERS_PER_LETTER",
+    "CJK_QUARTERS",
+    "ELLIPSIS",
+    "CHAT_PREFIX_QUARTERS",
+    "ROW_FIELD_NUMBER",
+    "ROW_FIELD_NAME",
+    "ROW_FIELD_BODY",
+    "ROW_FIELD_NOTE",
+    "ROW_FIELD_MARK",
+    "has_version_label",
+    "version_summary",
+    "VERSION_OLD",
+    "VERSION_ARROW",
+    "VERSION_NEW",
+    "VERSION_CURRENT",
+    "VERSION_UPSTREAM",
+    "VERSION_PLAIN",
     "render_index",
     "render_pager",
     "render_tally",
@@ -70,6 +98,9 @@ __all__ = [
     "index_page",
     "CHAT_PAGE_LINES",
     "entry_from_scan",
+    "entry_from_backup",
+    "format_size",
+    "STATUS_OLD_BACKUP",
     "mc_mismatch_note",
 ]
 
@@ -86,6 +117,11 @@ STATUS_UNRESOLVED = "unresolved"
 STATUS_ERROR = "error"
 STATUS_NOT_A_MOD = "not_a_mod"
 STATUS_IGNORED = "ignored"
+#: A ``.old`` backup left in ``mods/`` by an install. Not a mod and not a check result: it is
+#: a file this plugin created and has not cleaned up. It is a status rather than a side list
+#: so that one mechanism — numbering, handle lookup, ``list <状态>``, the detail view — covers
+#: it, and because ``!!muc delete 7`` has to be as unambiguous as ``!!muc install 7``.
+STATUS_OLD_BACKUP = "old_backup"
 
 ALL_STATUSES: Tuple[str, ...] = (
     STATUS_UPDATE_AVAILABLE,
@@ -95,6 +131,7 @@ ALL_STATUSES: Tuple[str, ...] = (
     STATUS_UNRESOLVED,
     STATUS_ERROR,
     STATUS_NOT_A_MOD,
+    STATUS_OLD_BACKUP,
     STATUS_UP_TO_DATE,
     STATUS_IGNORED,
 )
@@ -132,8 +169,12 @@ UPDATE_ENTRY_ORDER: Dict[str, int] = {
     STATUS_UNRESOLVED: 3,
     STATUS_ERROR: 4,
     STATUS_NOT_A_MOD: 5,
-    STATUS_UP_TO_DATE: 6,
-    STATUS_IGNORED: 7,
+    # Backups sit above the two "nothing to do" groups and below everything that is about a
+    # mod's own state. They are not a problem with the server; they are the only rows in the
+    # listing that the reader may decide to act on without touching a mod at all.
+    STATUS_OLD_BACKUP: 6,
+    STATUS_UP_TO_DATE: 7,
+    STATUS_IGNORED: 8,
 }
 
 #: Statuses whose next step is on the project page, and only those. An update to fetch, or a
@@ -298,6 +339,11 @@ class UpdateEntry:
     download_sha1: str = ""
     download_sha512: str = ""
     download_size: int = 0
+    #: Size on disk and age of a ``.old`` backup. Only ``old_backup`` entries carry them, and
+    #: the age is a snapshot taken when the check ran — every decision about *deleting* one is
+    #: made from the directory itself, never from a report that may be a day old.
+    size_bytes: int = 0
+    age_days: int = 0
     released_at: str = ""
     release_channel: str = ""
     #: ``(translation key, format args)`` pairs, rendered only when the report is printed.
@@ -363,7 +409,7 @@ class UpdateEntry:
             return None
 
         status = _text(data.get("status"))
-        entry = cls(
+        return cls(
             mod_id=_text(data.get("mod_id")),
             name=_text(data.get("name")) or file_name,
             file_name=file_name,
@@ -378,12 +424,13 @@ class UpdateEntry:
             download_sha1=_text(data.get("download_sha1")),
             download_sha512=_text(data.get("download_sha512")),
             download_size=_integer(data.get("download_size")),
+            size_bytes=_integer(data.get("size_bytes")),
+            age_days=_integer(data.get("age_days")),
             released_at=_text(data.get("released_at")),
             release_channel=_text(data.get("release_channel")),
             error=_text(data.get("error")),
             notes=_keyed_args(data.get("notes")),
         )
-        return entry
 
 
 @dataclass
@@ -453,6 +500,17 @@ class Report:
     @property
     def blocked(self) -> List[UpdateEntry]:
         return self.by_status(STATUS_NO_COMPATIBLE_BUILD)
+
+    @property
+    def backups(self) -> List[UpdateEntry]:
+        """The ``.old`` files in ``mods/``, as of this report.
+
+        A group query like the others so that ``list <状态>``, the completion candidates and
+        the cleanup plan all read the same set. What they must **not** be used for is deciding
+        what to delete: that is always re-derived from the directory, because a report can be
+        up to a day old and a file listing cannot.
+        """
+        return self.by_status(STATUS_OLD_BACKUP)
 
     def counts(self) -> Dict[str, int]:
         tally = {status: 0 for status in ALL_STATUSES}
@@ -653,7 +711,8 @@ class Report:
         }
 
     def to_json(self) -> str:
-        return json.dumps(self.to_dict(), ensure_ascii=False, indent=2)
+        """The file form of a report: the same text every other stored file is written with."""
+        return json_text(self.to_dict())
 
     @classmethod
     def from_dict(cls, data: Any) -> Optional["Report"]:
@@ -737,54 +796,409 @@ def _status_key(status: str) -> str:
     return "status." + status
 
 
-def _entry_parts(entry: UpdateEntry, tr: Translator, verbose: bool) -> Tuple[str, str]:
-    """``(description, project link)`` for one entry.
+#: What each piece of a listing row *is*. A renderer colours by these roles and the console
+#: joins them, so "what a row says" cannot drift apart from "what colour it is".
+#:
+#: The roles exist because the whole row used to be one string in one colour, chosen by "does
+#: this need somebody" — which made the **number** yellow on the rows that needed action and
+#: gray on the rest, so a column of handles changed colour from row to row. A column of handles
+#: should read as a column; the part that changes colour should be the status, which is the part
+#: that means something.
+ROW_FIELD_NUMBER = "number"
+ROW_FIELD_NAME = "name"
+#: The facts about this jar: its versions, its size, or its file name.
+ROW_FIELD_BODY = "body"
+#: The ``[状态: ✔]`` tag — the words and the closing bracket, which never change colour.
+ROW_FIELD_NOTE = "note"
+#: The icon inside that tag, on its own so it can be coloured: it is the one piece of the cell
+#: that says *which* state this is, so it is the piece the status colour belongs on.
+ROW_FIELD_MARK = "mark"
 
-    The description is the mod and its versions, plus — only in a mixed listing — how it was
-    identified. In the summary the surrounding heading already says what the group means
-    ("these have updates and have not been downloaded"), so repeating the status on every row
-    is noise; in a full listing the rows are of all kinds at once and the status is the only
-    thing that tells them apart.
+#: What each piece of the ``[版本]`` tooltip *is*. Pieces rather than one string for the same
+#: reason the row roles exist: the colour is chosen per piece from this vocabulary, and nothing
+#: re-derives "which number is the old one" from the text.
+VERSION_OLD = "old"
+VERSION_ARROW = "arrow"
+VERSION_NEW = "new"
+VERSION_CURRENT = "current"
+VERSION_UPSTREAM = "upstream"
+VERSION_PLAIN = "plain"
+
+#: The statuses whose row facts *are* versions, and so move behind the ``[版本]`` label.
+#:
+#: The other two keep their facts on the row: an old backup shows a size and an age, and an
+#: unidentified jar shows its file name — neither is a version, and a label that says 版本 over
+#: either of them would be lying about what is inside.
+VERSION_LABEL_STATUSES: Tuple[str, ...] = (
+    STATUS_UPDATE_AVAILABLE,
+    STATUS_AWAITING_INSTALL,
+    STATUS_UP_TO_DATE,
+    STATUS_LOCAL_AHEAD,
+    STATUS_NO_COMPATIBLE_BUILD,
+    STATUS_IGNORED,
+    STATUS_ERROR,
+)
+
+
+def has_version_label(entry: UpdateEntry) -> bool:
+    """Whether this row's facts are versions — i.e. whether the chat shows ``[版本]``."""
+    return entry.status in VERSION_LABEL_STATUSES
+
+
+def version_summary(entry: UpdateEntry, tr: Translator) -> List[Tuple[str, str]]:
+    """The tooltip behind ``[版本]``: ``(role, text)`` pieces, in reading order.
+
+    An available update reads ``old >>> new``; a single version — the one waiting to be
+    installed — is just itself; the two-version states that are not updates read
+    ``local / upstream``. Missing numbers print as ``?``, exactly as the plain text does.
+
+    Returned as pieces because the colours differ per piece, and they are *reader* colours
+    (red old, green new) that live with the other UI colours in the entry module — this
+    function only says what each piece means.
+    """
+    local = entry.local_version or "?"
+    latest = entry.latest_version or "?"
+    if entry.status == STATUS_UPDATE_AVAILABLE:
+        return [
+            (VERSION_OLD, local),
+            (VERSION_ARROW, tr("version.arrow")),
+            (VERSION_NEW, latest),
+        ]
+    if entry.status == STATUS_AWAITING_INSTALL:
+        return [(VERSION_NEW, latest)]
+    if entry.status == STATUS_UP_TO_DATE:
+        return [(VERSION_CURRENT, local)]
+    return [
+        (VERSION_CURRENT, local),
+        (VERSION_PLAIN, tr("version.separator")),
+        (VERSION_UPSTREAM, latest),
+    ]
+
+
+def entry_status_note(entry: UpdateEntry, tr: Translator) -> str:
+    """The words that say what state this mod is in, and how sure the plugin is.
+
+    The caveat rides along only when it is *noteworthy*: saying "matched by hash" on every row
+    would bury the rows where the plugin was not certain, which are the rows that need reading.
+    """
+    note = tr(_status_key(entry.status))
+    if entry.matched_by in MATCHED_BY_NOTEWORTHY:
+        note += tr("line.note_separator") + tr("matched_by." + entry.matched_by)
+    return note
+
+
+def _entry_body(entry: UpdateEntry, tr: Translator) -> str:
+    """The facts about one jar — versions, size or file name — and **never** its status.
+
+    Two of these templates used to repeat the status (``{name}  {version}（已是最新）``), and the
+    note group added it again on the same row: a reader saw ``（已是最新）  (已是最新)`` and asked
+    why it said the same thing twice. The status has exactly one home now — the note group —
+    which is also what lets a renderer colour it.
+    """
+    if entry.status == STATUS_UPDATE_AVAILABLE:
+        return tr("line.update", local=entry.local_version or "?",
+                  latest=entry.latest_version or "?")
+    if entry.status == STATUS_AWAITING_INSTALL:
+        return tr("line.awaiting_install", latest=entry.latest_version or "?")
+    if entry.status == STATUS_OLD_BACKUP:
+        return tr("line.old_backup", size=format_size(entry.size_bytes), days=entry.age_days)
+    if entry.status == STATUS_UP_TO_DATE:
+        return tr("line.up_to_date", version=entry.local_version or "?")
+    if entry.status in (STATUS_UNRESOLVED, STATUS_NOT_A_MOD):
+        return tr("line.unidentified", file=entry.file_name)
+    return tr("line.generic", local=entry.local_version or "?",
+              latest=entry.latest_version or "?")
+
+
+def entry_row_fields(entry: UpdateEntry, tr: Translator,
+                     verbose: bool = True) -> List[Tuple[str, str]]:
+    """``(role, text)`` for one row, without its number: name, facts, and the status note.
+
+    This is the **plain** form — what the console, the log and the stored report print. The
+    chat gets :func:`chat_row_fields` instead: same roles, but the facts collapse to a label
+    and the status becomes a bracketed tag, because in the chat a hover can carry what the
+    plain form has to spell out.
+
+    ``verbose`` off leaves the note out: a summary's heading already says what the group means
+    ("these have updates and have not been downloaded"), so repeating it on every row is noise.
+    In a mixed listing the rows are of all kinds at once and the status is the only thing that
+    tells them apart.
+    """
+    fields = [(ROW_FIELD_NAME, entry.name), (ROW_FIELD_BODY, "  " + _entry_body(entry, tr))]
+    if verbose:
+        fields.append(
+            (ROW_FIELD_NOTE, tr("line.note_group", text=entry_status_note(entry, tr)))
+        )
+    return fields
+
+
+def index_row_fields(number: Optional[int], entry: UpdateEntry, tr: Translator,
+                     verbose: bool = True) -> List[Tuple[str, str]]:
+    """``(role, text)`` for one numbered row of the plain form, in printing order."""
+    fields: List[Tuple[str, str]] = []
+    if number is not None:
+        fields.append((ROW_FIELD_NUMBER, "[{}] ".format(number)))
+    return fields + entry_row_fields(entry, tr, verbose)
+
+
+# --------------------------------------------------------------------------------------
+# The game's font, measured
+# --------------------------------------------------------------------------------------
+#
+# Padding a column with spaces only lines it up if the widths are right, and the widths the game
+# draws with are not the widths ``display_width`` assumes. That function counts one column per
+# ASCII character and two per Han character; the font behind the reader's screenshot draws
+# ``i``/``j``/``l``/``t``/``f``/``I``/``1`` at three quarters of a letter, ``.`` and both brackets
+# at half, and a Han character at **2¼** — not 2. Half of the raggedness in ``!!muc list`` came
+# from that last number on its own.
+#
+# These numbers are measured, not guessed: ``bench/measure_list_columns.py`` reads the starting
+# column of every cell out of a screenshot, ``bench/read_band_runs.py`` prints the advance of
+# every glyph, and the table below is what that client actually does. It is still a *model* — a
+# space is one width and the glyphs are another, so no padding can land closer than half a space
+# to its target. ``display_width`` stays for the console and the logs, where the font really is
+# fixed-width and counting characters is exact.
+
+#: Glyphs that are not one letter wide, in quarter-letters. Everything else is
+#: :data:`QUARTERS_PER_LETTER`, except Han characters — see :data:`CJK_QUARTERS`. The ``!`` is
+#: the odd one out: it was fitted years before the rest, by the help page's model scanner, and
+#: it is in here because ``!!muc`` starts with two of them.
+GLYPH_QUARTERS: Dict[str, int] = {
+    "i": 3, "j": 3, "l": 3, "t": 3, "f": 3, "I": 3, "1": 3,
+    ".": 2, "[": 2, "]": 2,
+    "!": 1,
+}
+
+QUARTERS_PER_LETTER = 4
+
+#: A Han character in the same unit: 2¼ letters, measured. ``display_width`` says two, which is
+#: right for a terminal and wrong for the game — and a name is one of the few places a Han
+#: character shows up in an otherwise Latin row.
+CJK_QUARTERS = 9
+
+#: How wide one of :data:`STATUS_ICONS` is, in quarter-letters. A guess until the next
+#: screenshot: they come out of the font's symbol sheet, which no table of ours covers, so the
+#: number is one letter for now and ``bench/measure_list_columns.py`` is what will pin it down
+#: (the icons stand in fixed places, so one screenshot measures all ten).
+ICON_QUARTERS = 4
+
+#: What a name cut to fit ends with. Three characters, so it belongs in the table above.
+ELLIPSIS = "..."
+
+
+def char_quarters(char: str) -> int:
+    """One character's advance in the game's font, in quarter-letters.
+
+    The icons of :data:`STATUS_ICONS` are checked *before* the East Asian rule and counted as
+    one letter: they live in the font's symbol sheet, not in a Han font, but half of them carry
+    an emoji presentation — ``❌``, ``⏪`` — and ``east_asian_width`` calls those Wide, which
+    would have made the status column jump by a letter depending on the mod's state.
+    """
+    width = GLYPH_QUARTERS.get(char)
+    if width is not None:
+        return width
+    if char in _ICON_CHARS:
+        return ICON_QUARTERS
+    if unicodedata.east_asian_width(char) in ("W", "F"):
+        return CJK_QUARTERS
+    return QUARTERS_PER_LETTER
+
+
+def text_quarters(text: str) -> int:
+    """``text`` in quarter-letters, for the player's font. See :data:`GLYPH_QUARTERS`."""
+    return sum(char_quarters(char) for char in text)
+
+
+#: The icon that stands for each status inside the ``[状态: ✔]`` tag that closes every row's
+#: columns. Every one of them is a character vanilla Minecraft ships in its symbol sheet
+#: (``nonlatin_european.png``): a character the font does not have is drawn as an empty box,
+#: which is worse than no icon at all, so this stays inside that set instead of reaching for
+#: whatever reads best. ``⚠`` and ``♻`` are *not* in it — which is why the reader's suggestion
+#: became ``❌`` and ``⏪``.
+STATUS_ICONS: Dict[str, str] = {
+    STATUS_UPDATE_AVAILABLE: "↑",
+    STATUS_AWAITING_INSTALL: "↓",
+    STATUS_NO_COMPATIBLE_BUILD: "❌",
+    STATUS_LOCAL_AHEAD: "☆",
+    STATUS_UNRESOLVED: "?",
+    STATUS_ERROR: "✘",
+    STATUS_NOT_A_MOD: "○",
+    STATUS_OLD_BACKUP: "⏪",
+    STATUS_UP_TO_DATE: "✔",
+    STATUS_IGNORED: "—",
+}
+
+#: The icon characters themselves, for :func:`char_quarters` — see there for why they cannot go
+#: through the East Asian rule.
+_ICON_CHARS = frozenset(STATUS_ICONS.values())
+
+#: What is drawn for a status that has no icon of its own — one added to the enum without coming
+#: back to the table above. ``?`` doubles as ``unresolved``'s own icon, which reads correctly
+#: here too: the honest answer to "which state is this" is "I don't know".
+FALLBACK_ICON = "?"
+
+
+def status_tag(tr: Translator, status: str) -> str:
+    """The row's status cell: ``[状态: ✔]``.
+
+    The same two words on every row, plus one icon that says which state this mod is in — the
+    reader asked for exactly that after the abbreviations (``[已是最新]``, ``[旧版备份]``) turned
+    the column into a wall of prose. What the state *means* is one hover away.
+    """
+    return tr("line.status_tag", word=tr("line.status_word"),
+              icon=STATUS_ICONS.get(status, FALLBACK_ICON))
+
+
+#: The chat row's number+name cell, in **quarter-letters** — 24 letters. The name is truncated
+#: to fit and padded to the full width, so the columns after it start at the same place on every
+#: row, which is what "aligned" means here. The number itself is never padded (a rule this
+#: project has been asked for twice); instead the **cell** is, so ten-row pages do not push
+#: two-digit rows out of line.
+CHAT_PREFIX_QUARTERS = 24 * QUARTERS_PER_LETTER
+
+
+def _pad_cell(text: str, width: int) -> str:
+    """The spaces that bring ``text`` to ``width`` quarter-letters — within half a space.
+
+    Split out of :func:`_fit_cell` because the status tag is drawn as three pieces (the words,
+    the icon, the closing bracket) and only the last of them can carry the padding: the pieces
+    have to be coloured apart, and a colour needs a piece of its own.
+    """
+    spaces = int((width - text_quarters(text)) / QUARTERS_PER_LETTER + 0.5)
+    return " " * max(0, spaces)
+
+
+def _fit_cell(text: str, width: int) -> str:
+    """Truncate ``text`` to ``width`` quarter-letters, then pad it as close as the font allows.
+
+    Truncation is marked with ``...`` and always leaves the ellipsis room, so a name cut at an
+    odd half still ends mid-cell rather than overflowing it. The full text stays reachable
+    through the cell's hover — which is the trade this whole row design makes.
+
+    The padding is whole spaces, so the cell lands within half a space of ``width``. That is the
+    floor for a proportional font and it is worth saying plainly rather than claiming a
+    precision the client cannot draw.
+    """
+    if text_quarters(text) > width:
+        kept = ""
+        used = 0
+        for char in text:
+            char_width = char_quarters(char)
+            if used + char_width + text_quarters(ELLIPSIS) > width:
+                break
+            kept += char
+            used += char_width
+        text = kept + ELLIPSIS
+    return text + _pad_cell(text, width)
+
+
+def _measure_cells(tr: Translator) -> Tuple[int, int]:
+    """Measure the two fixed cells. Split out so :func:`chat_cell_widths` can cache the answer."""
+    body = max(text_quarters(tr(key))
+               for key in ("line.version_label", "line.backup_label", "line.file_label"))
+    status = max(text_quarters(status_tag(tr, name)) for name in ALL_STATUSES)
+    return body, status
+
+
+#: ``chat_cell_widths`` is called once **per row**, and what it returns depends on the catalogue
+#: rather than on the row: without this, drawing a ten-row page re-measured thirteen labels and
+#: a dozen strings eleven times. Keyed by the translator's language, and only for translators
+#: that say what they are — a stand-in (a test's lambda) is measured every time, which is the
+#: safe direction.
+_CELL_WIDTHS: Dict[str, Tuple[int, int]] = {}
+
+
+def chat_cell_widths(tr: Translator) -> Tuple[int, int]:
+    """``(body, status)`` cell widths, in quarter-letters, for the current language.
+
+    Derived from the labels themselves rather than kept as constants: the English status tags
+    are much longer than the Chinese ones, and a hardcoded width would either misalign one
+    language or waste a column in the other. A new status widens every row — visibly, and in one
+    place.
+
+    Memoised per language. The catalogue cannot change while the plugin runs, so the only way
+    to get a stale answer is for the cache key to be wrong — hence the ``language`` attribute
+    :func:`i18n.make_translator` puts on the callable it returns, and the no-cache fallback
+    above for anything that does not carry one.
+    """
+    language = getattr(tr, "language", None)
+    if language is None:
+        return _measure_cells(tr)
+    widths = _CELL_WIDTHS.get(language)
+    if widths is None:
+        widths = _CELL_WIDTHS[language] = _measure_cells(tr)
+    return widths
+
+
+def _row_body_label(entry: UpdateEntry, tr: Translator) -> str:
+    """What the middle cell of a chat row is: the version handle, or a handle for the facts.
+
+    Rows whose facts really are versions keep ``[版本]``. The other two statuses have facts
+    that are not a version, and a label that claimed otherwise would be lying about what the
+    tooltip holds — so an old backup gets ``[备份]`` (size and age inside) and an unidentified
+    jar gets ``[文件]`` (its file name inside).
+    """
+    if has_version_label(entry):
+        return tr("line.version_label")
+    if entry.status == STATUS_OLD_BACKUP:
+        return tr("line.backup_label")
+    return tr("line.file_label")
+
+
+def chat_row_fields(number: Optional[int], entry: UpdateEntry, tr: Translator,
+                    verbose: bool = True) -> List[Tuple[str, str]]:
+    """``(role, text)`` for one row as the **chat** draws it: padded columns and bracketed tags.
+
+    Three cells, each padded to a fixed width: ``[3] Sodium        [版本]  [状态: ↑]``. The long
+    facts move into the cells' tooltips (the version numbers, the backup's size and age, the
+    jar's file name) and the status becomes a tag instead of a parenthetical — the reader asked
+    for both, because the parentheticals made every row a sentence.
+
+    The console keeps :func:`index_row_fields`: a log line has no hover, so there the facts have
+    to stay on the row, and there is no mouse to aim at a tag either.
+    """
+    fields: List[Tuple[str, str]] = []
+    if number is None:
+        fields.append((ROW_FIELD_NAME, _fit_cell(entry.name, CHAT_PREFIX_QUARTERS)))
+    else:
+        prefix = "[{}] ".format(number)
+        fields.append((ROW_FIELD_NUMBER, prefix))
+        fields.append((ROW_FIELD_NAME,
+                       _fit_cell(entry.name,
+                                 CHAT_PREFIX_QUARTERS - text_quarters(prefix))))
+    body_width, status_width = chat_cell_widths(tr)
+    fields.append((ROW_FIELD_BODY,
+                   "  " + _fit_cell(_row_body_label(entry, tr), body_width)))
+    if verbose:
+        # The status tag comes out as three pieces — words, icon, closing bracket — so the icon
+        # can carry the status colour while the words stay the one colour every row shares. The
+        # padding rides on the last piece, so the cell still ends where the next column starts.
+        tag = status_tag(tr, entry.status)
+        icon = STATUS_ICONS.get(entry.status, FALLBACK_ICON)
+        head, marker, tail = tag.partition(icon)
+        if not marker:  # a catalogue that dropped {icon}: say it, do not draw a wrong cell
+            fields.append((ROW_FIELD_NOTE, "  " + _fit_cell(tag, status_width)))
+        else:
+            fields.append((ROW_FIELD_NOTE, "  " + head))
+            fields.append((ROW_FIELD_MARK, icon))
+            fields.append((ROW_FIELD_NOTE, tail + _pad_cell(tag, status_width)))
+    return fields
+
+
+def entry_line_text(entry: UpdateEntry, tr: Translator) -> str:
+    """``Name  facts`` as plain text — what the console, the log and the notices print."""
+    return "".join(text for _role, text in entry_row_fields(entry, tr, verbose=False))
+
+
+def _entry_parts(entry: UpdateEntry, tr: Translator, verbose: bool) -> Tuple[str, str]:
+    """``(description, project link)`` for one entry, for the console's aligned columns.
 
     The link is empty unless visiting the project page is the next step — see
     :data:`LINKED_STATUSES`. What is *not* here any more is the download URL: it is eighty-odd
     characters of opaque ids and version strings, it made every line wrap, and it is still in
     the JSON report for anything that wants to fetch a file automatically.
     """
-    if entry.status == STATUS_UPDATE_AVAILABLE:
-        core = tr(
-            "line.update",
-            name=entry.name,
-            local=entry.local_version or "?",
-            latest=entry.latest_version or "?",
-        )
-    elif entry.status == STATUS_AWAITING_INSTALL:
-        core = tr(
-            "line.awaiting_install",
-            name=entry.name,
-            latest=entry.latest_version or "?",
-        )
-    elif entry.status == STATUS_UP_TO_DATE:
-        core = tr("line.up_to_date", name=entry.name, version=entry.local_version or "?")
-    elif entry.status in (STATUS_UNRESOLVED, STATUS_NOT_A_MOD):
-        core = tr("line.unidentified", name=entry.name, file=entry.file_name)
-    else:
-        core = tr(
-            "line.generic",
-            name=entry.name,
-            local=entry.local_version or "?",
-            latest=entry.latest_version or "?",
-        )
-
-    notes: List[str] = []
-    if verbose:
-        notes.append(tr(_status_key(entry.status)))
-        # Only what the reader has to know. Saying "matched by hash" on every row would bury
-        # the rows where the plugin was not certain, which are the rows that need reading.
-        if entry.matched_by in MATCHED_BY_NOTEWORTHY:
-            notes.append(tr("matched_by." + entry.matched_by))
-
-    description = core if not notes else "{}  ({})".format(core, ", ".join(notes))
+    description = "".join(text for _role, text in entry_row_fields(entry, tr, verbose=verbose))
     link = entry.project_url if entry.status in LINKED_STATUSES else ""
     return description, link
 
@@ -862,6 +1276,11 @@ class SummarySection:
     heading: str
     entries: List[UpdateEntry]
     trailing: List[str] = field(default_factory=list)
+    #: What state every entry in this group is in — the group *is* "the mods in this state", so a
+    #: renderer colours the heading by it. It is the counterpart of the note group on a listing
+    #: row: a grouped screen has no per-row status text, so the status colour goes on the
+    #: smallest thing that still says what the state is, which is the heading above the rows.
+    status: str = ""
 
 
 def summarise(report: Report, tr: Translator, max_updates: int = 12):
@@ -880,7 +1299,7 @@ def summarise(report: Report, tr: Translator, max_updates: int = 12):
                  source=report.server.mc_version_source)
     blocks: List[Any] = []
 
-    def add_section(entries, header_key, extra=None):
+    def add_section(entries, header_key, extra=None, status=""):
         if not entries:
             return
         # Sorted exactly as the listing sorts them. The sections are cut out of the same set of
@@ -898,7 +1317,7 @@ def summarise(report: Report, tr: Translator, max_updates: int = 12):
         if extra:
             trailing.append(extra)
         blocks.append(SummarySection(tr(header_key, count=len(ordered)),
-                                     ordered[:max_updates], trailing))
+                                     ordered[:max_updates], trailing, status))
 
     updates = report.updates
     pending = report.awaiting_install
@@ -913,6 +1332,7 @@ def summarise(report: Report, tr: Translator, max_updates: int = 12):
            names=", ".join(report.new_since_last[:6]))
         if report.new_since_last
         else None,
+        STATUS_UPDATE_AVAILABLE,
     )
     add_section(
         pending,
@@ -920,11 +1340,13 @@ def summarise(report: Report, tr: Translator, max_updates: int = 12):
         tr("report.awaiting_install_hint", folder=report.download_folder)
         if report.download_folder
         else None,
+        STATUS_AWAITING_INSTALL,
     )
     if not updates and not pending:
         blocks.append(tr("report.no_updates"))
 
-    add_section(report.blocked, "report.blocked_found")
+    add_section(report.blocked, "report.blocked_found",
+                status=STATUS_NO_COMPATIBLE_BUILD)
 
     closing = [render_tally(report, tr)]
     for key, args in report.upstream_notes:
@@ -1015,11 +1437,12 @@ def render_index_row(number: Optional[int], entry: UpdateEntry, tr: Translator,
 
     ``verbose`` adds the status in parentheses, for a listing that mixes statuses. A summary
     section does not pass it: the heading above the rows already says what the group means.
+
+    The pieces come from :func:`index_row_fields`, and joining them here is what keeps the
+    console and the chat showing the same row: the chat colours those same pieces instead of
+    joining them.
     """
-    description = _entry_parts(entry, tr, verbose=verbose)[0]
-    if number is None:
-        return description
-    return "[{}] {}".format(number, description)
+    return "".join(text for _role, text in index_row_fields(number, entry, tr, verbose))
 
 
 def index_page(indexed, page: int, size: int):
@@ -1040,15 +1463,16 @@ def index_page(indexed, page: int, size: int):
 
 
 #: Lines a listing spends on something other than a row, reserved before the rows are chosen:
-#: the title bar, the server context, the section title, the tally, the hint, and the pager.
+#: the title bar, the server context, the section title, the tally, the hint, the pager, and
+#: the closing rule.
 #:
 #: The arithmetic lives here, with the listing, rather than at the call site. An earlier version
 #: kept it in the chat renderer and reserved three lines instead of five; the listing then came
 #: out two lines past the budget, which is exactly the failure this whole change exists to fix.
-#: It went to six when every screen gained the title bar, and to seven when the listing gained
-#: a pager — the constant has to be raised by whatever the screen adds, or the budget silently
-#: stops being a budget.
-_INDEX_FIXED_LINES = 7
+#: It went to six when every screen gained the title bar, to seven when the listing gained
+#: a pager, and to eight when every screen gained the closing rule — the constant has to be
+#: raised by whatever the screen adds, or the budget silently stops being a budget.
+_INDEX_FIXED_LINES = 8
 
 
 def render_index(
@@ -1115,7 +1539,11 @@ def render_pager(page: int, pages: int, tr: Translator, command_for: Callable[[i
 
 
 def action_row(
-    entry: UpdateEntry, number: Optional[int], prefix: str, tr: Translator
+    entry: UpdateEntry,
+    number: Optional[int],
+    prefix: str,
+    tr: Translator,
+    delete_allowed: bool = True,
 ) -> Optional[DetailRow]:
     """The one action this mod affords right now, as a clickable row, or ``None``.
 
@@ -1123,6 +1551,11 @@ def action_row(
     both: the second is what the first produces, and offering a step the mod is not ready for
     is how a command comes to answer with an error. Anything else has nothing to offer, and a
     button that would only produce an error is worse than no button.
+
+    ``delete_allowed`` — ``cleanup.allow_delete``, read by the caller — is the one case where
+    the button is replaced rather than dropped: the admin learns the option exists and that it
+    is off, which a missing button cannot say. The value is the caller's to supply because this
+    module has no config; the *sentence* belongs here, next to the status it is about.
 
     The command is spelled out rather than the number alone, so it can be typed by hand if the
     chat log has scrolled past the row — and so ``prefix`` is the alias the reader actually
@@ -1144,6 +1577,19 @@ def action_row(
             tr("command.detail.install"),
             "",
             "{} install {}".format(prefix, number),
+        )
+    if entry.status == STATUS_OLD_BACKUP:
+        if not delete_allowed:
+            # No command and no url, so the row renders as plain text: an explanation rather
+            # than a button that the very next keystroke would refuse.
+            return DetailRow(
+                tr("detail.action_label"), tr("detail.delete_locked"), "", ""
+            )
+        return DetailRow(
+            tr("detail.action_label"),
+            tr("command.detail.delete"),
+            "",
+            "{} delete {}".format(prefix, number),
         )
     return None
 
@@ -1168,6 +1614,19 @@ def entry_detail_rows(
     rows: List[DetailRow] = [DetailRow("", entry.name)]
 
     rows.append(DetailRow(tr("detail.status_label"), tr(_status_key(entry.status))))
+    if entry.status == STATUS_OLD_BACKUP:
+        # No versions to compare: a backup is a file this plugin set aside, and the two facts
+        # that decide what happens to it are how big it is and how long it has been sitting
+        # there. ``restored_name`` is shown because it is the answer to "a backup of what".
+        rows.append(DetailRow(tr("detail.file_label"), entry.file_name))
+        rows.append(DetailRow(tr("detail.backup_of_label"), restored_name(entry.file_name)))
+        rows.append(DetailRow(tr("detail.size_label"), format_size(entry.size_bytes)))
+        rows.append(DetailRow(tr("detail.age_label"), tr("detail.age_days", days=entry.age_days)))
+        if action is not None:
+            rows.append(action)
+        for key, args in entry.notes:
+            rows.append(DetailRow("", tr(key, **args)))
+        return rows
     if entry.latest_version and entry.latest_version != entry.local_version:
         rows.append(DetailRow(tr("detail.version_label"),
                               tr("detail.version", local=entry.local_version or "?",
@@ -1193,6 +1652,39 @@ def entry_detail_rows(
     if entry.error:
         rows.append(DetailRow("", tr("report.error_detail", error=entry.error)))
     return rows
+
+
+def entry_from_backup(backup: Backup) -> UpdateEntry:
+    """The entry for one ``.old`` file, as the listing and the delete command see it.
+
+    ``name`` is the file name, not a mod's display name: for a backup the file name *is* the
+    identity — it is what the admin types at ``!!muc delete``, and it is the only thing about
+    the file that says which mod it came from. ``mod_id`` stays empty for the same reason: a
+    backup has no metadata to read an id out of, and inventing one from the name would put a
+    guess where a handle is expected.
+    """
+    return UpdateEntry(
+        mod_id="",
+        name=backup.file_name,
+        file_name=backup.file_name,
+        status=STATUS_OLD_BACKUP,
+        size_bytes=int(backup.size_bytes),
+        age_days=int(backup.age_days),
+    )
+
+
+def format_size(count: int) -> str:
+    """Bytes as something a human reads at a glance.
+
+    Lives here, beside the renderers that use it, rather than in the entry module: ``report``
+    is the module the pure-rendering half of the plugin lives in, and the size of a backup has
+    to be worded by the same function that words the size of a download.
+    """
+    if count >= 1024 * 1024:
+        return "{:.1f} MB".format(count / (1024.0 * 1024.0))
+    if count >= 1024:
+        return "{:.0f} KB".format(count / 1024.0)
+    return "{} B".format(count)
 
 
 def entry_from_scan(mod: Any) -> UpdateEntry:

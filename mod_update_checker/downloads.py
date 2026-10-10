@@ -26,7 +26,6 @@ directly unit-testable.
 """
 
 import hashlib
-import json
 import os
 import re
 import time
@@ -35,6 +34,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
+from .jsonfile import read_json, write_json
 from .report import STATUS_AWAITING_INSTALL, STATUS_UPDATE_AVAILABLE, UpdateEntry
 from .upstream import NotFound, Unauthorised, UpstreamError
 
@@ -268,9 +268,8 @@ class DownloadLedger:
     def _load(self) -> None:
         if self.path is None or not self.path.is_file():
             return
-        try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        data = read_json(self.path)
+        if data is None:
             self._debug("download ledger unreadable, starting empty")
             return
         if not isinstance(data, dict) or data.get("version") != self.VERSION:
@@ -386,13 +385,7 @@ class DownloadLedger:
             return
         payload = {"version": self.VERSION, "mods": self._records}
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = self.path.with_suffix(self.path.suffix + ".tmp")
-            temporary.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
-                encoding="utf-8",
-            )
-            os.replace(temporary, self.path)
+            write_json(self.path, payload, sort_keys=True)
         except OSError as error:
             self._debug("could not write the download ledger: {}".format(error))
 

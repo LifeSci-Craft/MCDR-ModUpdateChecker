@@ -26,7 +26,10 @@ PACKAGE = REPO / "mod_update_checker"
 CATALOGUES = sorted(PACKAGE.glob("lang/*.json"))
 
 #: Key families whose full name is only known at runtime.
-DYNAMIC_PREFIXES = ("status.", "matched_by.", "install.reason.", "download.reason.")
+#:
+#: ``explain.`` is the ``[状态]`` tag's tooltip — one explanation per status, looked up by the
+#: entry's own status string, so the key names never appear literally in the code either.
+DYNAMIC_PREFIXES = ("status.", "matched_by.", "install.reason.", "download.reason.", "explain.")
 
 #: Where the reason codes are written down, as named constants. ``_reason_text`` prefixes a
 #: record's short code at render time, so the catalogue keys for the two families are invisible
@@ -52,7 +55,8 @@ MATCHED_BY_VALUES = ("hash", "name", "manual")
 #: list is a deliberate allow-list of the dotted prefixes that mean something to this plugin.
 _KEY_IN_CODE = re.compile(
     r'"('
-    r'(?:line|note|advisory|report|command|console|check|help|install|language|download|detail)'
+    r'(?:line|note|advisory|report|command|console|check|help|install|language|download'
+    r'|detail|cleanup|version)'
     r'\.[a-z_0-9]+(?:\.[a-z_0-9]+)*'
     r')"'
 )
@@ -138,6 +142,11 @@ def test_the_dynamic_key_families_are_complete():
     assert {
         key for key in available if key.startswith("matched_by.")
     } == {"matched_by." + value for value in MATCHED_BY_VALUES}
+    # 状态标签的浮窗：每个状态一条解释，不多不少——加状态不加解释会在这里失败。
+    assert {"explain." + status for status in ALL_STATUSES} <= available
+    assert {
+        key for key in available if key.startswith("explain.")
+    } == {"explain." + status for status in ALL_STATUSES}
 
 
 def test_every_skip_reason_has_a_translation_and_nothing_else_does():
@@ -247,3 +256,14 @@ def test_make_translator_binds_the_language():
     tr = i18n.make_translator("zh_cn")
     assert tr("report.no_updates") == i18n.translate("report.no_updates", "zh_cn")
     assert "没有发现更新" in tr("report.no_updates")
+
+
+def test_a_translator_says_which_language_it_is():
+    """``make_translator`` 把语言挂在它返回的那个可调用对象上。
+
+    ``report.chat_cell_widths`` 拿它当缓存键——那两个格宽是**每行**都要的，而答案只跟语言
+    有关。属性要是丢了，缓存不会报错，只会**永远命中同一个槽位**：切了语言之后列宽还是旧语言的
+    宽度，屏幕上表现为整列歪掉，而没有任何一条断言在盯着它。所以这条测试钉住属性本身。
+    """
+    assert i18n.make_translator("zh_cn").language == "zh_cn"
+    assert i18n.make_translator("en_us").language == "en_us"
