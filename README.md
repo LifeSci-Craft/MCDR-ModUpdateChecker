@@ -1,10 +1,11 @@
 # Mod Update Checker
 
-> MCDR 的 Mod 更新检查插件：扫描服务端 `mods/` 里的每个 jar，与 **Modrinth** 比对，报告哪些 Mod
-> 有新版本、哪些没有适配当前加载器或游戏版本的构建、哪些查不到来源。
+> MCDR 的 Mod 更新检查插件：检查服务端 `mods/` 中的 Mod 是否有适配当前 Minecraft 版本与加载器
+> 的新版本，更新信息来自 **Modrinth**。
 
-不需要 API key，也没有额外依赖。**默认只读**：写 `mods/` 需要显式开启，见
-[下载与关服安装](#download下载与关服安装默认关闭)。
+**默认只检查和报告**：不会下载文件，也不会改动 `mods/`。下载到插件文件夹、安装到 `mods/`，
+都需要显式开启或用命令指定；安装只会在服务端停止后进行，并保留旧版备份。不需要 API key，也没有
+额外依赖。
 
 | | |
 |---|---|
@@ -22,13 +23,14 @@
 - [命令](#命令)
 - [状态](#状态)
 - [配置](#配置)
+- [注意](#注意)
 - [License](#license)
 
 ## 功能
 
 - 用文件哈希（SHA-1）识别每个 jar 并与 Modrinth 比对；哈希查不到时按项目 slug 兜底（报告中标注「近似匹配」）
 - 结果分为可更新 / 已是最新 / 无适配构建 / 查不到来源等状态（见[状态](#状态)），需要处理的问题永远排在最前
-- 顺带诊断同一个 Mod 装了两份、缺必装依赖、仅客户端 Mod 装在服务端等常见问题（宁可多报，不会漏报）
+- 顺带诊断同一个 Mod 装了两份、缺必装依赖、仅客户端 Mod 装在服务端等常见问题
 - 检查在自己的后台线程里运行，默认开服 60 秒后自动查一次，也可定时检查；哈希查询是批量的（上百个 Mod 通常只要个位数次请求）
 - 可选下载：把新版本抓到插件文件夹，并校验哈希（`download.enabled`）
 - 可选关服安装：服务端停止后装进 `mods/`，旧 jar 改名 `.old` 保留（`download.install_on_stop`）
@@ -53,7 +55,8 @@
 
 1. 把 `ModUpdateChecker-v*.mcdr` 放进 MCDR 的 `plugins/` 目录；
 2. 输入 `!!MCDR reload plugin`（或重启 MCDR）；
-3. 首次启动会生成 `config/mod_update_checker/config.json`，默认配置开箱可用。
+3. 首次启动会生成 `config/mod_update_checker/config.json`，默认配置开箱可用；
+4. 输入 `!!muc check` 立即检查，或等开服 60 秒后的自动检查。
 
 没有额外 Python 依赖：`requests` 由 MCDR 自带，其余只用标准库。
 
@@ -88,16 +91,16 @@
 
 | 图标 | 含义 |
 |---|---|
-| `✔` | 已是最新 |
-| `↑` | 有新版可下载（用 `download`） |
-| `↓` | 已下载，等关服安装（用 `install`） |
-| `❌` | 没有适配当前加载器或游戏版本的构建 |
-| `☆` | 本地版本比上游新 |
-| `?` | Modrinth 认不出（自己编译或重新打包过，见[手动对应](#sources去哪里查)） |
-| `○` | 不是 Mod（库、数据包等） |
-| `✘` | 读取失败或查询出错 |
-| `⏪` | 旧版备份（`.old`） |
-| `—` | 已在 `check.ignored_mods` 中忽略 |
+| `✔` | 已是最新（`up_to_date`） |
+| `↑` | 有新版可下载（`update_available`）——用 `!!modupdate download <编号>` |
+| `↓` | 已下载待安装（`awaiting_install`）——用 `!!modupdate install <编号>`，关服时执行 |
+| `❌` | 没有适配当前加载器或游戏版本的构建（`no_compatible_build`） |
+| `☆` | 本地版本比上游新（`local_ahead`） |
+| `?` | Modrinth 认不出（`unresolved`）——自己编译或重新打包过，见[手动对应](#sources去哪里查) |
+| `○` | 不是 Mod（`not_a_mod`，库、数据包等） |
+| `✘` | 读取失败或查询出错（`error`） |
+| `⏪` | 旧版备份（`old_backup`） |
+| `—` | 已在 `check.ignored_mods` 中忽略（`ignored`） |
 
 哈希匹配是精确的；按名称兜底是近似判断，报告中会标注。
 
@@ -191,8 +194,9 @@
 
 两个开关都关着也能用：`!!modupdate download` / `install` 可随时手动指名。
 
-打开 `install_on_stop` 后，安装始终在**服务端停止后**执行：旧 jar 改名 `<原名>.old` 保留（同名时用
-`.old.2`，绝不覆盖），安装前校验哈希、失败回滚；文件名开头的中括号备注（如 `[锂]`）会跟到新文件名上。
+打开 `install_on_stop` 后，安装始终在**服务端停止后**执行，且只处理插件自己下载过的文件：旧 jar
+改名 `<原名>.old` 保留（同名时用 `.old.2`，绝不覆盖），安装前校验哈希、失败回滚；文件名开头的中
+括号备注（如 `[锂]`）会跟到新文件名上。
 
 </details>
 
@@ -211,7 +215,8 @@
 `[2] retired.jar.old          [备份]  [状态: ⏪]  [详细信息]`
 
 删除默认关闭。先打开 `cleanup.allow_delete`，`delete` / `cleanup` 才可用（都要 `!!modupdate confirm`）；
-再打开 `cleanup.enabled` 才会有到期提醒（它排在 `allow_delete` 之后）。
+再打开 `cleanup.enabled` 才会有到期提醒（排在 `allow_delete` 之后）。默认保留期 30 天，刚产生的备份
+不会被 `cleanup` 删除。
 
 </details>
 
@@ -229,6 +234,13 @@
 | `network.cache.ttl_hours` | `24` | 该结论的有效期；`0` = 永不过期 |
 
 </details>
+
+## 注意
+
+- 重新打包过的 jar 可能认不出（哈希会变），可用 `project-map.json` 手动映射。
+- 不单独检查 jar 内嵌套的 jar；「缺少依赖」提醒可能误报（依赖打包在其他 jar 内时看不到）。
+- Modrinth 不可达时检查照常完成，报告会写明上游不可达，不会把 Mod 错报成「已是最新」；可配置镜像或系统代理。
+- 游戏版本是自动推断的；升级大版本后如大量出现 `no_compatible_build`，先用 `!!modupdate status` 确认识别到的版本。
 
 ## License
 
