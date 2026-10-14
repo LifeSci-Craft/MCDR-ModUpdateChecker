@@ -17,7 +17,10 @@ anywhere else and each one exists to make a specific mistake impossible:
 * **A name is never overwritten.** If the new jar wants a name that something else holds, the
   install is skipped and said so, rather than resolving the clash by replacing a file.
 * **A failure is rolled back.** The old jar is moved aside first; if the new one cannot be put
-  in place, the old one is moved back, so a failed install leaves the server as it was.
+  in place, the old one is moved back, so a failed install leaves the server as it was. The new
+  jar is copied to a sibling of its destination and then renamed over it, so ``mods/`` never
+  contains a half-written jar under a real mod name — not even for an instant, and not even when
+  the download folder is on another volume.
 
 Renaming: admins annotate jars (``[锂-性能优化]Lithium.jar``). That prefix is theirs, so it is
 carried onto the new file — losing it would make the folder harder to read, which is the
@@ -32,7 +35,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from .digests import digests_of_file
-from .downloads import DownloadLedger, safe_jar_name
+from .downloads import DownloadLedger, is_safe_component, safe_jar_name
 
 __all__ = [
     "STATUS_INSTALLED",
@@ -141,8 +144,16 @@ def _locate_installed(mods: Path, recorded: str) -> Optional[Path]:
     renaming it *after* the check, and accepts a match only when the de-prefixed names are
     identical **and exactly one jar matches** — choosing between several similar names is how
     the wrong file gets replaced.
+
+    A name that is not a bare file name is refused before it is joined to ``mods/``. The
+    fallback below would only ever look at ``*.jar`` inside the folder anyway, but ``mods /
+    "../../x.jar"`` is a path, not a name, and this function must not be the place where such a
+    value is taken on trust.
     """
     if not recorded:
+        return None
+    ok, _reason = is_safe_component(recorded)
+    if not ok:
         return None
     exact = mods / recorded
     if exact.is_file():
@@ -205,12 +216,72 @@ def _skip(record: Dict[str, Any], reason: str) -> InstallResult:
     )
 
 
+def _copy_into_place(source: Path, destination: Path) -> Tuple[bool, str]:
+    """Put ``source`` at ``destination`` without ever leaving a half-written file there.
+
+    The copy goes to a sibling of the destination first and is then renamed over it, so
+    ``destination`` is either the old file or the complete new one at every instant. That the
+    two are siblings is the whole point: a same-directory rename is atomic, while the
+    ``shutil.move`` this replaced fell back to a copy when the download folder was on another
+    volume — and a copy interrupted half-way (a full disk, a killed server, an antivirus
+    quarantine) left a truncated jar *under the new mod's own name*, which the next server start
+    would load. The old jar had already been moved aside by then, so the admin was left with a
+    broken mod and a repair nobody had been told about.
+
+    Returns ``(ok, detail)``. ``detail`` is empty on success, and otherwise explains the failure
+    together with the name of the temporary file when one may still be on disk.
+    """
+    temporary = destination.with_name(destination.name + ".new")
+    try:
+        shutil.copy2(str(source), str(temporary))
+    except (OSError, shutil.Error) as error:
+        residue = _remove_temporary(temporary)
+        detail = "could not copy the new jar in: {}".format(error)
+        if residue:
+            detail = "{} (a partial file may remain: {})".format(detail, temporary.name)
+        return False, detail
+    try:
+        os.replace(str(temporary), str(destination))
+    except OSError as error:
+        residue = _remove_temporary(temporary)
+        detail = "could not put the new jar in place: {}".format(error)
+        if residue:
+            detail = "{} (a partial file may remain: {})".format(detail, temporary.name)
+        return False, detail
+    return True, ""
+
+
+def _remove_temporary(temporary: Path) -> bool:
+    """Delete a copy-in-progress. ``True`` when a file is still there afterwards."""
+    try:
+        temporary.unlink()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return False
+
+
 def _install_one(record: Dict[str, Any], options: InstallOptions) -> InstallResult:
     """Install one recorded download, or explain why it was not installed."""
     name = str(record.get("name") or record.get("local") or "")
     version = str(record.get("version") or "")
-    source = options.downloads_folder / str(record.get("file") or "")
+
+    # The ledger is hand-editable, and both names below become paths inside a folder this plugin
+    # manages. A name that is a path in disguise is skipped rather than joined: otherwise a
+    # record saying ``../server.properties`` would move a file from *outside* the download
+    # folder into ``mods/``, and rename the mod it was supposedly replacing out of the way while
+    # doing it. The download stage only ever writes bare names, so nothing legitimate is lost.
+    recorded_file = str(record.get("file") or "")
+    file_ok, file_reason = is_safe_component(recorded_file)
+    if not file_ok:
+        return _skip(record, "unsafe-name: {}".format(file_reason or "file"))
     local_name = str(record.get("local") or "")
+    local_ok, local_reason = is_safe_component(local_name)
+    if not local_ok:
+        return _skip(record, "unsafe-name: {}".format(local_reason or "local"))
+
+    source = options.downloads_folder / recorded_file
 
     if not source.is_file():
         return _skip(record, REASON_NOT_DOWNLOADED)
@@ -259,12 +330,8 @@ def _install_one(record: Dict[str, Any], options: InstallOptions) -> InstallResu
     except OSError:
         pass
 
-    try:
-        # ``shutil.move`` rather than ``os.replace``: the download folder is configurable and
-        # may be on another volume, where a rename across devices fails. A copy is not atomic,
-        # which is why the old jar is already aside and rolled back below on failure.
-        shutil.move(str(source), str(destination))
-    except (OSError, shutil.Error) as error:
+    ok, detail = _copy_into_place(source, destination)
+    if not ok:
         try:
             os.replace(backup, installed)
         except OSError:
@@ -273,10 +340,10 @@ def _install_one(record: Dict[str, Any], options: InstallOptions) -> InstallResu
             return InstallResult(
                 name=name, status=STATUS_FAILED, version=version,
                 backup_file=backup.name,
-                detail="move-failed-and-rollback-failed: {}".format(error),
+                detail="move-failed-and-rollback-failed: {}".format(detail),
             )
         return InstallResult(name=name, status=STATUS_FAILED, version=version,
-                             detail="could not move the new jar in: {}".format(error))
+                             detail=detail)
 
     return InstallResult(
         name=name,

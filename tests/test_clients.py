@@ -280,3 +280,250 @@ def test_the_user_agent_header_is_sent(upstream):
         client.close()
 
     assert upstream.request_headers[-1]["User-Agent"] == "MCDR-ModUpdateChecker-test/9.9"
+
+
+# --------------------------------------------------------------------------------------
+# The bounds on a response
+#
+# The download path has always had two size limits — the declared length and the bytes that
+# arrive. The JSON path had none, and ``project_versions`` without filters can return a large
+# project's entire history, fetched up to eight at a time. These are the same two limits, for
+# the other half of the client.
+# --------------------------------------------------------------------------------------
+
+
+def test_a_declared_oversized_json_body_is_refused_before_it_is_read(upstream, http):
+    class Huge:
+        status_code = 200
+        headers = {"Content-Length": "999999999"}
+        content = b""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def iter_content(self, chunk_size=1):
+            raise AssertionError("the body was read despite the declared length")
+            yield b""  # pragma: no cover - unreachable, keeps this a generator
+
+        def close(self):
+            pass
+
+    http._thread_local.session = _StubSession(Huge())
+
+    with pytest.raises(UpstreamError) as raised:
+        http.get_json(upstream.modrinth_base + "/projects")
+
+    assert "limit" in str(raised.value)
+
+
+def test_a_json_body_that_lies_about_its_length_is_still_bounded(upstream, http):
+    """A chunked or lying response has no declared length to pre-check, so the bytes are counted."""
+    blob = b"[" + b"1," * 200000 + b"1]"
+
+    class Chunky:
+        status_code = 200
+        headers = {}
+        content = blob
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def iter_content(self, chunk_size=1):
+            for start in range(0, len(blob), 1024):
+                yield blob[start:start + 1024]
+
+        def close(self):
+            pass
+
+    http.json_max_bytes = 1024
+    http._thread_local.session = _StubSession(Chunky())
+
+    with pytest.raises(UpstreamError) as raised:
+        http.get_json(upstream.modrinth_base + "/projects")
+
+    assert "limit" in str(raised.value)
+
+
+class _StubSession:
+    """A session whose ``request`` returns a prepared response object.
+
+    Deliberately not a ``Mock``: the client touches ``status_code``, ``headers``,
+    ``iter_content`` and ``close``, and a stub that states exactly those keeps the test honest
+    about which parts of the interface the code actually depends on.
+    """
+
+    def __init__(self, response):
+        self._response = response
+        self.headers = {}
+        self.max_redirects = 30
+
+    def request(self, *_args, **_kwargs):
+        return self._response
+
+    def get(self, *_args, **_kwargs):
+        return self._response
+
+    def close(self):
+        pass
+
+
+# --------------------------------------------------------------------------------------
+# Not one session, shared
+# --------------------------------------------------------------------------------------
+
+
+def test_each_thread_gets_its_own_session(upstream):
+    """``requests`` documents ``Session`` as not thread-safe, and this client is pooled.
+
+    The sessions carry cookies, redirect history and adapter state; the connection pools under
+    them are thread-safe, which is exactly why the failure this prevents is rare and timing
+    dependent — the kind of thing that gets blamed on the network. So the structure is asserted
+    rather than the symptom: eight workers, eight sessions, none shared.
+    """
+    import threading
+
+    client = HttpClient(user_agent="test/1.0", timeout=10, retries=0)
+    seen = []
+    lock = threading.Lock()
+    barrier = threading.Barrier(8)
+    errors = []
+
+    def worker():
+        try:
+            barrier.wait(timeout=10)
+            session = client._session
+            with lock:
+                seen.append(id(session))
+            client.get_json("{}/projects".format(upstream.modrinth_base), params={"ids": "[]"})
+        except Exception as error:  # noqa: BLE001 - reported through ``errors``
+            errors.append("{}: {}".format(type(error).__name__, error))
+
+    threads = [threading.Thread(target=worker) for _index in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    client.close()
+
+    assert errors == []
+    assert len(seen) == 8
+    assert len(set(seen)) == 8, "two threads shared one Session"
+
+
+def test_a_session_carries_the_configured_redirect_budget(upstream):
+    """``requests`` defaults to 30 redirects and will follow a chain to another host.
+
+    A download URL comes out of an upstream JSON document, so the target is upstream data and
+    deserves a budget somebody chose.
+    """
+    from mod_update_checker.upstream import _MAX_REDIRECTS
+
+    client = HttpClient(user_agent="test/1.0")
+    try:
+        client.get_json("{}/projects".format(upstream.modrinth_base), params={"ids": "[]"})
+        assert client._session.max_redirects == _MAX_REDIRECTS
+        assert _MAX_REDIRECTS < 30
+    finally:
+        client.close()
+
+
+# --------------------------------------------------------------------------------------
+# The download path: rate limiting, scheme check, total deadline
+# --------------------------------------------------------------------------------------
+
+
+def _publish(upstream, name, blob):
+    upstream.serve_file(name, blob)
+    return upstream.file_url(name)
+
+
+def test_a_download_consumes_a_rate_limit_grant(upstream, http):
+    """``network.requests_per_minute`` is about every request the plugin makes, downloads too.
+
+    A download that does not count can double the real rate against the upstream — most visibly
+    when ``download.retries`` turns one failure into a burst.
+    """
+    limiter = _CountingLimiter(0)
+    http.rate_limiter = limiter
+
+    total = http.download(_publish(upstream, "one.jar", b"x" * 16), lambda chunk: None,
+                          max_bytes=1024)
+
+    assert total == 16
+    assert limiter.grants == 1
+
+
+def test_a_download_url_must_be_http(upstream, http):
+    """The URL comes from upstream JSON, so the scheme is upstream data too."""
+    with pytest.raises(UpstreamError) as raised:
+        http.download("file:///etc/passwd", lambda chunk: None, max_bytes=1024)
+
+    assert "refusing" in str(raised.value)
+
+
+def test_a_dripping_download_is_stopped_by_the_total_deadline():
+    """The ``timeout`` is a limit on one *read*, so a slow drip can hold a thread open forever.
+
+    The response below never pauses longer than the read timeout, which is exactly the shape the
+    per-read limit cannot catch: every individual read succeeds, and the transfer as a whole runs
+    on until the deadline stops it. The drip is simulated rather than socketed so the test is
+    deterministic and fast; what is being asserted is that the loop consults a clock of its own.
+    """
+    import time
+
+    class Dripping:
+        status_code = 200
+        headers = {"Content-Length": "10485760"}
+        content = b""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def iter_content(self, chunk_size=1):
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                time.sleep(0.02)
+                yield b"x"
+
+        def close(self):
+            pass
+
+    received = []
+
+    client = HttpClient(user_agent="test/1.0", timeout=0.2, retries=0)
+    client._thread_local.session = _StubSession(Dripping())
+    try:
+        with pytest.raises(UpstreamError) as raised:
+            client.download(
+                "http://example.invalid/drip.jar", received.append, max_bytes=10 * 1024 * 1024
+            )
+    finally:
+        client.close()
+
+    assert "did not finish" in str(raised.value)
+    # What arrived before the deadline was handed to the sink in order, and nothing was written
+    # after it: the caller is responsible for discarding an incomplete file, and ``_transfer_once``
+    # does exactly that.
+    assert b"".join(received) == b"x" * len(received)
+    assert 0 < len(received) < 200, len(received)
+
+
+class _CountingLimiter:
+    """A ``RateLimiter`` that only counts, so a test can assert on the grants consumed."""
+
+    def __init__(self, per_minute):
+        self._per_minute = per_minute
+        self.grants = 0
+
+    def acquire(self):
+        self.grants += 1
+

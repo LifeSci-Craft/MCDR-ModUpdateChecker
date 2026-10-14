@@ -17,10 +17,12 @@ The module deliberately does not import MCDR: it is directly unit-testable, and 
 injects the logger it wants to use.
 """
 
+import json
 import threading
 import time
 from collections import deque
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
+from urllib.parse import urlparse
 
 import requests
 
@@ -31,6 +33,7 @@ __all__ = [
     "RateLimited",
     "RateLimiter",
     "HttpClient",
+    "DEFAULT_JSON_MAX_BYTES",
 ]
 
 #: Statuses worth retrying: transient server-side problems and the explicit throttle.
@@ -38,6 +41,24 @@ _RETRY_STATUSES = frozenset((408, 425, 429, 500, 502, 503, 504))
 
 #: The HTTP verbs a JSON client needs; kept as a constant so the retry loop stays small.
 _JSON_HEADERS = {"Accept": "application/json"}
+
+#: Largest JSON body this client will read. Every response used here is a list of versions or
+#: projects — kilobytes, and never more than a few hundred — but the response is upstream data
+#: and ``project_versions`` without filters can return a large project's entire history. The
+#: download path has had a size bound from the start; this is the same bound for the other half.
+DEFAULT_JSON_MAX_BYTES = 8 * 1024 * 1024
+
+#: How long a download may take *in total*, as a multiple of the configured per-read timeout.
+#: The timeout alone cannot bound a transfer: it is a per-*read* limit, so a server that sends
+#: one byte just before each one keeps the connection alive forever. Multiplying by the declared
+#: size gives a bound that scales with the amount of data expected, and one that a stalled or
+#: dripping transfer cannot extend by staying alive.
+_DEADLINE_FRACTION = 0.25
+
+#: Redirects followed at most, per session. ``requests`` defaults to 30 and will happily follow
+#: a chain to another host; a download URL comes from an upstream JSON document, so the target is
+#: upstream data and deserves a smaller budget than "whatever the library thinks is fine".
+_MAX_REDIRECTS = 10
 
 
 class UpstreamError(Exception):
@@ -116,16 +137,72 @@ class HttpClient:
         logger: Optional[Any] = None,
         backoff_base: float = 0.6,
         session: Optional[requests.Session] = None,
+        connect_timeout: Optional[float] = None,
+        read_timeout: Optional[float] = None,
+        json_max_bytes: int = DEFAULT_JSON_MAX_BYTES,
     ) -> None:
         self.timeout = float(timeout)
+        #: ``(connect, read)``, which is what ``requests`` accepts. The two are separate because
+        #: they measure different things and a CDN is usually fast to reach and slow to stream:
+        #: one scalar for both means the slower half dictates the tolerance for the faster one.
+        #: ``timeout`` remains the single knob the config exposes, and the default split reads as
+        #: "allow the connection a little longer, but never more than the configured value".
+        self.connect_timeout = float(
+            self.timeout if connect_timeout is None else connect_timeout
+        )
+        self.read_timeout = float(self.timeout if read_timeout is None else read_timeout)
         self.retries = max(0, int(retries))
         self.rate_limiter = rate_limiter
         self.logger = logger
         self.backoff_base = float(backoff_base)
-        self._session = session or requests.Session()
-        self._session.headers.update({"User-Agent": user_agent})
+        self.json_max_bytes = max(1, int(json_max_bytes))
+        self.user_agent = user_agent
+        #: How a session is made. A caller may inject one — the tests do, to watch the requests
+        #: — and that injected session serves the thread that made the client; any other thread
+        #: builds its own, because a session holds mutable state and ``requests`` documents it as
+        #: not thread-safe while this client is handed to pools of up to eight workers.
+        if session is None:
+            self._session_factory: Callable[[], requests.Session] = requests.Session
+        elif callable(session) and not hasattr(session, "request"):
+            self._session_factory = session
+        else:
+            self._session_factory = lambda: session  # noqa: E731 - one injected instance
+        self._thread_local = threading.local()
+        self._sessions: Dict[int, requests.Session] = {}
+        self._sessions_lock = threading.Lock()
 
     # -- internals ---------------------------------------------------------------------
+
+    def _new_session(self) -> requests.Session:
+        """A session with this client's agent and redirect budget."""
+        session = self._session_factory()
+        session.headers["User-Agent"] = self.user_agent
+        session.max_redirects = _MAX_REDIRECTS
+        return session
+
+    @property
+    def _session(self) -> requests.Session:
+        """This thread's session, created on first use.
+
+        One session per thread rather than one per client. ``requests``' own FAQ lists ``Session``
+        as not thread-safe: it carries a cookie jar, a redirect history and adapter state that
+        concurrent requests would share. The connection pools underneath are thread-safe, so the
+        failure mode is rare and timing-dependent — the kind of bug that gets blamed on the
+        network for months. A request-per-session would be the other safe option and is
+        deliberately not taken: it loses connection reuse, which is most of what a session is for.
+        """
+        session = getattr(self._thread_local, "session", None)
+        if session is None:
+            session = self._new_session()
+            self._thread_local.session = session
+            with self._sessions_lock:
+                self._sessions[threading.get_ident()] = session
+        return session
+
+    @property
+    def timeouts(self) -> Tuple[float, float]:
+        """The ``(connect, read)`` tuple handed to ``requests``."""
+        return (self.connect_timeout, self.read_timeout)
 
     def _log(self, level: str, message: str) -> None:
         if self.logger is None:
@@ -178,7 +255,8 @@ class HttpClient:
                     params=params,
                     json=json_body,
                     headers=merged,
-                    timeout=self.timeout,
+                    timeout=self.timeouts,
+                    stream=True,
                 )
             except requests.RequestException as error:
                 last_error = error
@@ -199,17 +277,21 @@ class HttpClient:
 
             status = response.status_code
             if status == 404:
+                response.close()
                 if allow_404:
                     return None
                 raise NotFound("resource not found", status=status, url=url)
             if status in (401, 403):
+                text = self._read_body(response, url, status)
+                response.close()
                 raise Unauthorised(
-                    (response.text or "").strip()[:200] or "not authorised",
+                    (text or "").strip()[:200] or "not authorised",
                     status=status,
                     url=url,
                 )
             if status in _RETRY_STATUSES and attempt < self.retries:
                 wait = self._retry_after(response, attempt, self.backoff_base)
+                response.close()
                 self._log(
                     "debug",
                     "HTTP {} from {}, retrying in {:.1f}s".format(status, url, wait),
@@ -217,28 +299,83 @@ class HttpClient:
                 time.sleep(wait)
                 continue
             if status == 429:
+                response.close()
                 raise RateLimited("rate limited", status=status, url=url)
             if status >= 400:
+                text = self._read_body(response, url, status)
+                response.close()
                 raise UpstreamError(
-                    (response.text or "").strip()[:200] or "request failed",
+                    (text or "").strip()[:200] or "request failed",
                     status=status,
                     url=url,
                 )
 
+            # Read the body rather than letting ``response.json()`` pull it in: the declared
+            # length is checked first, and the bytes are then counted as they arrive, so an
+            # unbounded or lying response cannot become an unbounded allocation.
             try:
-                return response.json()
-            except ValueError as error:
-                raise UpstreamError(
-                    "the response was not JSON ({}: {})".format(
-                        type(error).__name__, error
-                    ),
-                    status=status,
-                    url=url,
-                ) from error
+                return self._read_json(response, url, status)
+            finally:
+                response.close()
 
         raise UpstreamError(
             "{}".format(last_error or "request failed"), url=url
         )
+
+    def _read_body(self, response: "requests.Response", url: str, status: int) -> str:
+        """An error response's text, bounded like any other body."""
+        try:
+            return response.content[: self.json_max_bytes].decode("utf-8", errors="replace")
+        except requests.RequestException:
+            return ""
+
+    def _check_declared_size(self, response: "requests.Response", url: str, status: int) -> None:
+        declared = response.headers.get("Content-Length")
+        if declared and declared.isdigit() and int(declared) > self.json_max_bytes:
+            raise UpstreamError(
+                "the response declares {} bytes, over the {} byte limit".format(
+                    declared, self.json_max_bytes
+                ),
+                status=status,
+                url=url,
+            )
+
+    def _read_json(self, response: "requests.Response", url: str, status: int) -> Any:
+        """Decode a JSON body, refusing one larger than :attr:`json_max_bytes`.
+
+        Two checks rather than one, for the same reason the download path has two: the declared
+        length catches a large response before any of it is read, and the running total catches a
+        response that declares nothing, declares a lie, or is chunked.
+        """
+        self._check_declared_size(response, url, status)
+        chunks = []
+        total = 0
+        try:
+            for chunk in response.iter_content(chunk_size=65536):
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > self.json_max_bytes:
+                    raise UpstreamError(
+                        "the response passed the {} byte limit".format(self.json_max_bytes),
+                        status=status,
+                        url=url,
+                    )
+                chunks.append(chunk)
+        except requests.RequestException as error:
+            raise UpstreamError(
+                "{}: {}".format(type(error).__name__, error), status=status, url=url
+            ) from error
+
+        raw = b"".join(chunks)
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as error:
+            raise UpstreamError(
+                "the response was not JSON ({}: {})".format(type(error).__name__, error),
+                status=status,
+                url=url,
+            ) from error
 
     # -- public ------------------------------------------------------------------------
 
@@ -271,7 +408,7 @@ class HttpClient:
     ) -> int:
         """Stream ``url`` into ``write`` (a callable taking bytes). Returns the byte count.
 
-        Two deliberate differences from :meth:`_request`:
+        Three deliberate differences from :meth:`_request`:
 
         * **No retry.** Once the first chunk has been handed to ``write`` a retry cannot be
           done correctly without asking the sink to rewind, and having this method own the
@@ -281,10 +418,29 @@ class HttpClient:
         * **The caller's size limit is enforced on the bytes that actually arrive**, not only
           against the size the API declared. The declared size is upstream data; the point of
           the limit is to bound what a hostile or broken response can do to the disk.
+        * **A total deadline as well as a per-read timeout.** The timeout is a limit on one
+          *read*, so a server that drips a byte just before each one keeps the connection alive
+          for as long as it likes — measured at three seconds for a one-second timeout. The
+          deadline is derived from the declared size, so it scales with the amount of data and
+          cannot be extended by staying alive.
         """
         limit = max(0, int(max_bytes))
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            # The URL comes out of an upstream JSON document, so it is upstream data. ``file:``
+            # or an unexpected scheme is not a download this plugin should attempt to perform.
+            raise UpstreamError(
+                "refusing a download from a {} URL".format(parsed.scheme or "schemeless"),
+                url=url,
+            )
+        if self.rate_limiter is not None:
+            # The same budget as every other request this plugin makes. ``network
+            # .requests_per_minute`` reads as "how fast this plugin talks to the upstream", and a
+            # download that does not count is a download that can double the real rate — most
+            # visibly when ``download.retries`` turns a failure into a burst.
+            self.rate_limiter.acquire()
         try:
-            response = self._session.get(url, stream=True, timeout=self.timeout)
+            response = self._session.get(url, stream=True, timeout=self.timeouts)
         except requests.RequestException as error:
             raise UpstreamError(
                 "{}: {}".format(type(error).__name__, error), url=url
@@ -301,18 +457,27 @@ class HttpClient:
             # A cheap pre-flight when the server declares a length, so an oversized body is
             # rejected before a single byte lands on disk.
             declared = response.headers.get("Content-Length")
-            if declared and declared.isdigit() and int(declared) > limit:
+            declared_size = int(declared) if declared and declared.isdigit() else 0
+            if declared_size > limit:
                 raise UpstreamError(
                     "the file is {} bytes, over the {} byte limit".format(declared, limit),
                     status=status,
                     url=url,
                 )
 
+            budget = self._deadline_for(declared_size, limit)
+            deadline = time.monotonic() + budget
             total = 0
             try:
                 for chunk in response.iter_content(chunk_size=chunk_size):
                     if not chunk:
                         continue
+                    if time.monotonic() > deadline:
+                        raise UpstreamError(
+                            "the download did not finish within {:.0f}s".format(budget),
+                            status=status,
+                            url=url,
+                        )
                     total += len(chunk)
                     if total > limit:
                         raise UpstreamError(
@@ -329,8 +494,31 @@ class HttpClient:
                 ) from error
             return total
 
+    def _deadline_for(self, declared_size: int, limit: int) -> float:
+        """How long this transfer may take in total, in seconds.
+
+        A quarter of the per-read timeout per declared mebibyte: a 4 MiB jar with the default
+        20 s timeout has 20 s of slack, and a truncated or unannounced body is budgeted by the
+        download limit instead. The floor is the read timeout itself, so a small file is never
+        held to a shorter wall clock than a single read would already have been allowed.
+        """
+        mebibyte = 1024 * 1024
+        expected = declared_size or limit
+        return max(self.read_timeout, (expected / mebibyte) * self.read_timeout * _DEADLINE_FRACTION)
+
     def close(self) -> None:
-        try:
-            self._session.close()
-        except Exception:  # noqa: BLE001 - closing must never raise into the caller
-            pass
+        """Close every session this client opened, whichever thread opened it.
+
+        Every thread's session, not only the closing thread's: the pools that matter were created
+        by the workers, and leaving them open would leave their sockets behind until the process
+        ends. Each session is closed exactly once even when one thread owns several logical
+        users of the client.
+        """
+        with self._sessions_lock:
+            sessions = list(dict.fromkeys(self._sessions.values()))
+            self._sessions.clear()
+        for session in sessions:
+            try:
+                session.close()
+            except Exception:  # noqa: BLE001 - closing must never raise into the caller
+                pass

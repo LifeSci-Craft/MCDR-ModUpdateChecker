@@ -735,6 +735,163 @@ def test_an_approval_is_written_to_disk_and_read_back(tmp_path):
 
 
 # --------------------------------------------------------------------------------------
+# Two instances at once
+#
+# The ledger is not a singleton: the check thread builds one, and each ``!!muc`` command that
+# touches a download builds another. Each starts from its own snapshot of the file, and a save
+# that wrote that whole snapshot back would erase whatever the other one had written — silently,
+# because both saves succeed.
+# --------------------------------------------------------------------------------------
+
+
+def test_a_save_does_not_drop_an_approval_written_by_another_instance(tmp_path):
+    """The deterministic form of the race: no threads, just two load/modify/save cycles.
+
+    Instance A records a download (as the check thread does). Instance B approves it (as
+    ``!!muc install`` does). A then saves the state it *observed* — and it must not take B's
+    approval away with it, or the admin is told "will be installed at the next stop" and then
+    nothing happens.
+    """
+    from mod_update_checker.downloads import DownloadLedger
+
+    path = tmp_path / "download-manifest.json"
+    first = DownloadLedger(path)
+    first.record("sodium", "sodium-1.1.0.jar", "a" * 40, "1.1.0", "now")
+    first.save()
+
+    second = DownloadLedger(path)
+    assert second.approve("sodium") is True
+    second.save()
+
+    # A saves again, as another file's ``_remember`` would.
+    first.record("lithium", "lithium-1.0.0.jar", "b" * 40, "1.0.0", "now")
+    first.save()
+
+    on_disk = DownloadLedger(path)
+    assert on_disk.approved_keys() == ["sodium"], "another instance's approval was overwritten"
+    assert on_disk.file_of("lithium") == "lithium-1.0.0.jar"
+    # The stale snapshot in ``first`` must not resurrect the record as unapproved either.
+    assert second.approved_keys() == ["sodium"]
+
+
+def test_an_unrelated_instance_does_not_delete_a_record_it_never_saw(tmp_path):
+    """A record added by another instance survives a save from a snapshot taken before it.
+
+    This is the other half of the same bug class: the ``file:`` keys that no longer exist on
+    disk are dropped by ``prune``, which is a *decision*. An instance that simply never loaded
+    the key must not make that decision by omission.
+    """
+    from mod_update_checker.downloads import DownloadLedger
+
+    path = tmp_path / "download-manifest.json"
+    early = DownloadLedger(path)  # loaded when the file did not exist yet
+    later = DownloadLedger(path)
+    later.record("sodium", "sodium-1.1.0.jar", "a" * 40, "1.1.0", "now")
+    later.save()
+
+    early.record("lithium", "lithium-1.0.0.jar", "b" * 40, "1.0.0", "now")
+    early.save()
+
+    assert set(DownloadLedger(path).records()) == {"sodium", "lithium"}
+
+
+def test_a_forget_is_applied_to_the_file_not_only_to_memory(tmp_path):
+    """A deletion is a change like any other, so it has to be written even through a merge."""
+    from mod_update_checker.downloads import DownloadLedger
+
+    path = tmp_path / "download-manifest.json"
+    seed = DownloadLedger(path)
+    seed.record("sodium", "sodium-1.1.0.jar", "a" * 40, "1.1.0", "now")
+    seed.record("lithium", "lithium-1.0.0.jar", "b" * 40, "1.0.0", "now")
+    seed.save()
+
+    ledger = DownloadLedger(path)
+    ledger.forget("sodium")
+    ledger.save()
+
+    assert DownloadLedger(path).records() == ["lithium"]
+
+
+def test_concurrent_instances_keep_every_record(tmp_path):
+    """Eight instances, all approved-and-saved at once — the shape of the original report.
+
+    Threads are used here rather than the deterministic form above because the point *is* the
+    interleaving: every writer loads, waits at the barrier so all the loads happen before any
+    save, and then writes. With whole-file writes this kept one record; with the merge it keeps
+    all of them.
+    """
+    import threading
+    from mod_update_checker.downloads import DownloadLedger
+
+    path = tmp_path / "download-manifest.json"
+    seed = DownloadLedger(path)
+    seed.record("seed", "seed.jar", "f" * 40, "1.0.0", "now")
+    seed.save()
+
+    count = 8
+    barrier = threading.Barrier(count)
+    errors = []
+
+    def writer(index):
+        key = "mod{}".format(index)
+        try:
+            ledger = DownloadLedger(path)
+            barrier.wait(timeout=10)
+            ledger.record(key, "{}.jar".format(key), "0" * 40, "1.0.0", "now")
+            ledger.approve(key)
+            ledger.save()
+        except Exception as error:  # noqa: BLE001 - reported through ``errors`` instead
+            errors.append("{}: {}".format(type(error).__name__, error))
+
+    threads = [threading.Thread(target=writer, args=(index,)) for index in range(count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    final = DownloadLedger(path)
+    assert sorted(final.records()) == ["mod{}".format(index) for index in range(count)] + ["seed"]
+    assert len(final.approved_keys()) == count
+
+
+def test_recording_a_path_is_refused_rather_than_stored(tmp_path):
+    """``file`` becomes a path inside a folder this plugin manages.
+
+    A record is only ever created from a name the download stage built, so reaching this means a
+    caller has gone wrong — and a ledger entry pointing outside the download folder is the input
+    the installer would later act on. Better refused than stored.
+    """
+    ledger = _ledger(tmp_path)
+    ledger.record("sodium", "../../server.properties", "a" * 40, "1.1.0", "now")
+
+    assert ledger.get("sodium") is None
+    ledger.save()
+    assert "sodium" not in _ledger(tmp_path).records()
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        '{"version": 1, "mods": {"sodium": {"file": "../../server.properties"}}}',
+        '{"version": 1, "mods": {"sodium": {"file": "a/b.jar"}}}',
+        '{"version": 1, "mods": {"sodium": {"file": "C:\\\\x.jar"}}}',
+        '{"version": 1, "mods": {"sodium": {"file": ""}}}',
+    ],
+)
+def test_a_recorded_path_in_the_file_is_dropped_at_load(tmp_path, content):
+    """The same rule applied to the file on disk, whose editor is an admin, not this plugin."""
+    path = tmp_path / "download-manifest.json"
+    path.write_text(content, encoding="utf-8")
+
+    from mod_update_checker.downloads import DownloadLedger
+
+    ledger = DownloadLedger(path)
+    assert ledger.records() == []
+    assert ledger.file_of("sodium") == ""
+
+
+# --------------------------------------------------------------------------------------
 # Replacing a superseded download
 # --------------------------------------------------------------------------------------
 
@@ -826,6 +983,101 @@ def test_a_record_for_a_missing_file_is_dropped_silently(tmp_path, cdn, http):
 
     assert outcomes[0].status == STATUS_DOWNLOADED
     assert not (tmp_path / "downloads" / "demo-1.0.0.jar").exists()
+
+
+def test_a_failed_download_does_not_take_the_older_build_with_it(tmp_path, cdn, http):
+    """The rollback point has to outlive a failed fetch.
+
+    The superseded file is this mod's only previous version, and deleting it *before* the new
+    one exists means a 404 leaves the admin with neither: the folder is emptier than it was, and
+    the log only says a download failed. So the removal waits for the replacement.
+    """
+    from mod_update_checker.downloads import DownloadLedger
+
+    ledger = DownloadLedger(tmp_path / "download-manifest.json")
+    older = b"PK\x03\x04" + b"version one" * 20
+    wanted = b"PK\x03\x04" + b"version two" * 20
+    entry = _entry(**_publish(cdn, "demo-1.2.0.jar", wanted))
+    _seed(tmp_path, ledger, entry, "demo-1.0.0.jar", older, version="1.0.0")
+    # The new build is declared but not published: an ordinary 404 on a stale link.
+    entry.download_url = cdn.file_url("demo-1.2.0.jar-never-published")
+
+    outcomes = _run_with_ledger(tmp_path, http, [entry], ledger)
+
+    assert outcomes[0].status == STATUS_FAILED
+    kept = tmp_path / "downloads" / "demo-1.0.0.jar"
+    assert kept.is_file(), "the rollback point was deleted before its replacement existed"
+    assert kept.read_bytes() == older
+    assert [path.name for path in (tmp_path / "downloads").iterdir()] == ["demo-1.0.0.jar"]
+    # And the folder is still the only place the record points at, so a later run retries.
+    assert DownloadLedger(tmp_path / "download-manifest.json").file_of(entry_key(entry)) == \
+        "demo-1.0.0.jar"
+
+
+def test_a_download_that_is_already_present_still_retires_the_older_one(tmp_path, cdn, http):
+    """The other success path: the file was fetched earlier, so the old one can go now.
+
+    Without this the folder would keep the superseded build forever on any server where the
+    download completed but the install did not.
+    """
+    from mod_update_checker.downloads import DownloadLedger
+
+    ledger = DownloadLedger(tmp_path / "download-manifest.json")
+    old = b"PK\x03\x04" + b"version one" * 20
+    new = b"PK\x03\x04" + b"version two" * 20
+    entry = _entry(**_publish(cdn, "demo-1.2.0.jar", new))
+    _seed(tmp_path, ledger, entry, "demo-1.0.0.jar", old, version="1.0.0")
+    # The new build is already on disk under the name the run will choose.
+    (tmp_path / "downloads" / "demo-1.2.0.jar").write_bytes(new)
+
+    outcomes = _run_with_ledger(tmp_path, http, [entry], ledger)
+
+    assert outcomes[0].status == STATUS_ALREADY_PRESENT
+    assert not (tmp_path / "downloads" / "demo-1.0.0.jar").exists()
+    assert [path.name for path in (tmp_path / "downloads").iterdir()] == ["demo-1.2.0.jar"]
+
+
+def test_classify_survives_a_file_that_cannot_be_read(tmp_path, monkeypatch):
+    """A jar held open by something else is not an update any more, but it is not a failure.
+
+    ``classify_downloaded`` runs at the end of the download phase and from ``!!muc download``;
+    letting an ``OSError`` out of it aborts the phase in one case and reports "download failed"
+    for a file that is already on disk and already verified in the other.
+    """
+    from mod_update_checker import downloads as downloads_module
+
+    folder = tmp_path / "downloads"
+    folder.mkdir()
+    blob = b"PK\x03\x04" + b"locked" * 20
+    entry = _entry(**_publish(FakeUpstream(), "demo-1.1.0.jar", blob))
+    (folder / entry.download_filename).write_bytes(blob)
+
+    def denied(_path):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(downloads_module, "_sha1_of", denied)
+
+    assert downloads_module.classify_downloaded([entry], folder, ledger=None) == []
+    assert entry.status == STATUS_UPDATE_AVAILABLE
+
+
+def test_a_404_is_not_described_as_four_attempts(tmp_path, cdn, http):
+    """``retryable=False`` means one attempt, and the message has to say so.
+
+    A 404 reported as "after 4 attempts" sends the admin to look at their network, their
+    rate limit and their proxy — for a file that simply is not there.
+    """
+    entry = _entry(
+        download_url=cdn.file_url("never-published.jar"),
+        download_filename="never-published.jar",
+        download_sha1="b" * 40,
+    )
+
+    outcomes = _run(tmp_path, http, [entry])
+
+    assert outcomes[0].status == STATUS_FAILED
+    assert _request_count(cdn, "never-published.jar") == 1
+    assert "attempt" not in outcomes[0].detail, outcomes[0].detail
 
 
 def _run_with_ledger(tmp_path, http, entries, ledger, max_bytes=10 * MEGABYTE):

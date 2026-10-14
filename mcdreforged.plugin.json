@@ -1,6 +1,6 @@
 {
   "id": "mod_update_checker",
-  "version": "1.6.0",
+  "version": "1.6.1",
   "name": "Mod Update Checker",
   "description": {
     "en_us": "Check and update server-side mods from Modrinth.",

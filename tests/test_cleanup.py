@@ -10,6 +10,8 @@ separately.
 import os
 import time
 
+import pytest
+
 from mod_update_checker.cleanup import (
     BACKUP_SUFFIX,
     Backup,
@@ -55,6 +57,40 @@ def test_only_the_names_this_plugin_creates_are_backups():
     assert not is_backup_name("old")
     assert not is_backup_name("")
     assert not is_backup_name(None)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        # ``$`` also matches just before a trailing newline, so a ``search`` with an anchor
+        # accepted this. The name cannot be created on Windows, but it can on Linux — and the
+        # predicate, not the platform, is what authorises the deletion.
+        "x.jar.old\n",
+        "x.jar.old\n\n",
+        # ``search`` is not anchored at the start at all, so a path was accepted as a name.
+        "a/b.jar.old",
+        "..\\x.jar.old",
+        "../../x.jar.old",
+        "sub/dir/x.jar.old",
+        # Nor is it anchored at the end in the way it looks: the optional number must be the
+        # very last thing.
+        "x.jar.old.2.3",
+        "x.jar.oldx",
+    ],
+)
+def test_a_name_that_is_not_a_bare_backup_name_is_refused(name):
+    """The predicate has to be narrower than "contains the suffix somewhere".
+
+    ``is_backup_name`` is the only thing standing between ``!!muc delete all`` and whatever is
+    in ``mods/``, so a value it accepts is a value the plugin will delete on request.
+    """
+    assert is_backup_name(name) is False
+
+
+def test_restored_name_leaves_a_non_backup_alone():
+    """A name that is not a backup is returned unchanged, path separators and all."""
+    assert restored_name("a/b.jar.old\n") == "a/b.jar.old\n"
+    assert restored_name("sodium.jar.old\n") == "sodium.jar.old\n"
 
 
 def test_the_suffix_matches_the_one_the_installer_writes():

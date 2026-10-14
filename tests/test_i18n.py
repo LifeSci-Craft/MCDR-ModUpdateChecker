@@ -258,6 +258,87 @@ def test_make_translator_binds_the_language():
     assert "没有发现更新" in tr("report.no_updates")
 
 
+#: Modules whose literal ``tr("key", **kwargs)`` calls are cross-checked against the catalogue.
+#:
+#: The three directions a call site can be wrong are all silent: a key that does not exist prints
+#: the key, a placeholder the call never passes prints the *whole template* unformatted (that is
+#: ``translate``'s contract — never raise), and an argument the template does not use is simply
+#: dropped. The last one is what let ``cleanup.notice_confirm`` write ``!!modupdate`` into a
+#: message while ``command=`` was being passed and ignored, so it is checked here rather than left
+#: to a review.
+_TR_CALL_MODULES = ("__init__.py", "report.py")
+
+
+def literal_tr_calls():
+    """Every literal ``tr("key", **kwargs)`` call, as ``(module, line, key, keywords)``.
+
+    Only calls whose first argument is a string literal can be checked: a key assembled at
+    runtime (``"status." + entry.status``) has no single template to compare against, and those
+    families are covered by the completeness tests above.
+    """
+    import ast
+
+    calls = []
+    for name in _TR_CALL_MODULES:
+        tree = ast.parse((PACKAGE / name).read_text(encoding="utf-8"), str(PACKAGE / name))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            func_name = getattr(func, "id", None) or getattr(func, "attr", "")
+            if func_name not in ("tr", "translate"):
+                continue
+            if not node.args or not isinstance(node.args[0], ast.Constant):
+                continue
+            key = node.args[0].value
+            if not isinstance(key, str):
+                continue
+            if any(keyword.arg is None for keyword in node.keywords):
+                continue  # ``**something``: what it passes cannot be read off the source
+            calls.append((name, node.lineno, key, {kw.arg for kw in node.keywords}))
+    return calls
+
+
+def test_the_literal_calls_can_be_read_off_the_source():
+    """A guard for the check below: a scanner that finds nothing would pass silently."""
+    calls = literal_tr_calls()
+
+    assert len(calls) > 200, len(calls)
+    assert {name for name, _line, _key, _kwargs in calls} == set(_TR_CALL_MODULES)
+
+
+def test_every_literal_message_is_called_with_exactly_its_placeholders():
+    """The call site must pass exactly what the template interpolates — no more, no less.
+
+    Both directions are bugs a reader sees but no test used to catch:
+
+    * a template that wants ``{command}`` while the call passes ``{level}`` prints the raw
+      template, ``{command}`` and all, into the admin's chat;
+    * a call that passes an argument the template never mentions is the shape F-06 took — the
+      argument was there and the sentence had the name hardcoded, so ``!!muc confirm`` produced a
+      line telling the reader to type ``!!modupdate confirm``.
+    """
+    problems = []
+    for name, line, key, passed in literal_tr_calls():
+        for language in languages():
+            template = catalogue(language).get(key)
+            if template is None:
+                problems.append("{}:{} {} has no {} entry".format(name, line, key, language))
+                continue
+            needed = set(re.findall(r"\{(\w+)\}", template))
+            missing = sorted(needed - passed)
+            extra = sorted(passed - needed)
+            if missing:
+                problems.append(
+                    "{}:{} {} [{}] is never passed {}".format(name, line, key, language, missing)
+                )
+            if extra:
+                problems.append(
+                    "{}:{} {} [{}] passes unused {}".format(name, line, key, language, extra)
+                )
+    assert problems == [], "\n".join(problems)
+
+
 def test_a_translator_says_which_language_it_is():
     """``make_translator`` 把语言挂在它返回的那个可调用对象上。
 

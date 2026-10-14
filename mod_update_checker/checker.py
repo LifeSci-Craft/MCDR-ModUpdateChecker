@@ -174,7 +174,17 @@ class ResolveCache:
         if not isinstance(data, dict) or data.get("version") != self.VERSION:
             return {}
         records = data.get("records")
-        return records if isinstance(records, dict) else {}
+        if not isinstance(records, dict):
+            return {}
+        # Per-record validation, not just the top level. The file is hand-editable and this
+        # plugin has always said so, so one malformed row is something to drop rather than
+        # something to trip over on **every** run afterwards — and dropping it here means the
+        # next save writes a file that no longer carries it.
+        usable: Dict[str, Any] = {}
+        for key, record in records.items():
+            if isinstance(record, dict) and _cache_timestamp(record) is not None:
+                usable[str(key)] = record
+        return usable
 
     def get(self, sha1: str) -> Optional[Dict[str, Any]]:
         """A cached record, or ``None`` when absent or stale.
@@ -189,7 +199,11 @@ class ResolveCache:
             record = self._data.get(sha1)
         if not isinstance(record, dict):
             return None
-        if self.ttl_seconds and time.time() - float(record.get("at") or 0) > self.ttl_seconds:
+        recorded_at = _cache_timestamp(record)
+        if recorded_at is None:
+            # A record this code cannot read is treated as no record at all.
+            return None
+        if self.ttl_seconds and time.time() - recorded_at > self.ttl_seconds:
             return None
         return record
 
@@ -216,6 +230,20 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
+def _cache_timestamp(record: Dict[str, Any]) -> Optional[float]:
+    """When a cached record was written, or ``None`` when the value is not a usable time.
+
+    ``or 0`` alone is not enough: ``float("soon")``, ``float([])`` and ``float({})`` all raise,
+    and this is read once per unidentified mod on every run — so one hand-edit used to make
+    *every* check fail, with no way back except deleting the file. A record whose timestamp
+    cannot be read is treated as a record that is not there.
+    """
+    try:
+        return float(record.get("at") or 0)
+    except (TypeError, ValueError):
+        return None
+
+
 class Checker:
     """Runs one check and returns a :class:`Report`.
 
@@ -233,6 +261,11 @@ class Checker:
         #: while stage 1 has the project data in hand and turned into one advisory at the end,
         #: so every advisory in a report is assembled in one place.
         self._server_unsupported: List[str] = []
+        #: Set when a request failed in a way that says "the platform as a whole is not
+        #: answering", as opposed to one project being missing or one call being unlucky. Every
+        #: later stage reads it and gives up rather than repeating the same dead request once per
+        #: mod — see :meth:`_stage_modrinth`.
+        self._upstream_down = False
 
     # -- lifecycle ---------------------------------------------------------------------
 
@@ -259,6 +292,7 @@ class Checker:
         )
         self._map = ProjectMap(map_path, logger=self.logger)
         self._server_unsupported = []
+        self._upstream_down = False
         # Said out loud rather than swallowed: an unreadable map is a silent loss of the
         # admin's own instructions, and "I wrote that file and nothing changed" is exactly
         # the report a bare ``debug`` line would produce.
@@ -310,17 +344,22 @@ class Checker:
 
         try:
             remaining = self._stage_modrinth(active, entries, report, server)
-            if remaining:
+            if remaining and not self._upstream_down:
                 # Before the name search, not after: this stage is the admin telling us the
                 # answer, and a guess must not be allowed to pre-empt it.
                 remaining = self._stage_manual_map(remaining, entries, server)
-            if remaining:
+            if remaining and not self._upstream_down:
                 self._stage_name_search(remaining, entries, report, server)
+            # Advisories are collected **inside** the try, before ``close`` runs in the finally.
+            # They are not decoration: the missing-dependency advisory asks the platform one more
+            # question, and asking it after ``close()`` is using a client that has been torn
+            # down. It happens to still work today because ``requests.Session.close`` can be used
+            # again, but that is an implementation detail of the library, not a contract — and a
+            # crash here would throw away a check that had otherwise fully succeeded.
+            self._collect_advisories(scan, server, report, entries)
         finally:
             self._cache.save()
             self.close()
-
-        self._collect_advisories(scan, server, report, entries)
 
         # The ``.old`` backups an earlier install left behind. Listed after the mods rather than
         # mixed in with them: they are files this plugin created, not jars to identify, and
@@ -398,7 +437,19 @@ class Checker:
             report.upstream_notes.append(
                 ("note.modrinth_unavailable", {"error": str(error)})
             )
-            return list(mods)
+            # The platform as a whole is not answering. Falling through to the name-search stage
+            # would send one search per mod — each with its own retries and its own timeout —
+            # against a service that has just told us it is unavailable: twelve mods become
+            # forty-eight requests over twelve seconds, and two hundred mods become eight hundred
+            # requests over half an hour of held check lock. Nothing is learned by any of them
+            # either; every one of them fails the same way. The refusal is remembered instead,
+            # and each entry is marked "no verdict" below.
+            self._upstream_down = True
+            for mod in mods:
+                entry = entries.get(mod.file_name)
+                if entry is not None:
+                    _mark_undetermined(entry, "modrinth")
+            return []
 
         local: Dict[str, Tuple[ScannedMod, ModrinthVersion]] = {}
         for mod in mods:
@@ -464,16 +515,45 @@ class Checker:
         # 1d. A hash absent from step 1b means the project publishes nothing for this
         #     loader/game-version pair, but the endpoint cannot say which of the two is
         #     missing. One extra per-project question tells them apart, and the two cases
-        #     deserve different advice, so it is asked.
-        answered = set(latest_by_hash.keys())
-        unanswered_projects = sorted(
-            {
-                version.project_id
-                for mod, version in local.values()
-                if version.project_id and mod.sha1 not in answered
-            }
-        )
-        context, context_failures = self._loader_versions_for(unanswered_projects)
+        #     deserve different advice, so it is asked — but only when there is an answer to
+        #     act on. If the batched call itself failed, ``_apply_modrinth`` reports "no verdict"
+        #     for every one of these mods and never looks at this data, so asking for it would
+        #     be N requests (with their retries and rate-limit grants) thrown away, aimed at a
+        #     platform that has just refused us.
+        if latest_failed:
+            context: Dict[str, List[ModrinthVersion]] = {}
+            context_failures: Set[str] = set()
+        else:
+            answered = set(latest_by_hash.keys())
+            unanswered_projects = sorted(
+                {
+                    version.project_id
+                    for mod, version in local.values()
+                    if version.project_id and mod.sha1 not in answered
+                }
+            )
+            context, context_failures = self._loader_versions_for(unanswered_projects)
+
+            # The batched "newest build" endpoint has no channel filter, so it can hand back a
+            # beta for a project whose newest *stable* build is older. Those projects need their
+            # version list to answer at all, and they are not in the set above — the batch did
+            # answer for them, it just answered something ``check.include_beta`` excludes. Asked
+            # in one batch, before the loop, so the count stays a constant instead of one request
+            # per affected mod.
+            channels = self.options.modrinth_channels()
+            needs_channel = sorted(
+                {
+                    latest_by_hash[mod.sha1].project_id
+                    for mod, _version in local.values()
+                    if mod.sha1 in latest_by_hash
+                    and not _in_channels(latest_by_hash[mod.sha1], channels)
+                    and latest_by_hash[mod.sha1].project_id not in context
+                }
+            )
+            if needs_channel:
+                extra, extra_failures = self._loader_versions_for(needs_channel)
+                context = dict(context, **extra)
+                context_failures = context_failures | extra_failures
 
         leftover: List[ScannedMod] = []
         for mod in mods:
@@ -518,6 +598,12 @@ class Checker:
 
         def fetch(project_id: str) -> Tuple[str, Optional[List[ModrinthVersion]]]:
             try:
+                # ``loaders`` only, deliberately: the game-version filter stays off because the
+                # answer is *used* to tell "no build for this loader" from "builds exist, but
+                # none for your game version" — and the second message names the newest build and
+                # what it targets. Filtering by game version here would make that list empty and
+                # the message wrong. The size of an unfiltered answer is bounded by
+                # ``HttpClient.json_max_bytes`` instead, which is where a body limit belongs.
                 return project_id, self._modrinth.project_versions(  # type: ignore[union-attr]
                     project_id, loaders=[self.options.loader]
                 )
@@ -577,6 +663,23 @@ class Checker:
                 entry, local_version, context, context_failures, server
             )
             return
+
+        channels = self.options.modrinth_channels()
+        if not _in_channels(latest, channels):
+            # Only versions already fetched for this project are re-examined; the lookup above
+            # made sure that list exists for exactly the projects this branch can be reached for,
+            # and a channel filter must never cost one request per mod inside the loop.
+            chosen = _pick_channel(context.get(local_version.project_id) or [], channels)
+            if chosen is None:
+                # Nothing in the accepted channels: say "no compatible build" rather than
+                # recommending the pre-release the admin explicitly left out. The wording of
+                # ``_mark_no_compatible_build`` already tells them a build exists that does not
+                # fit, which is exactly the situation.
+                self._mark_no_compatible_build(
+                    entry, local_version, context, context_failures, server
+                )
+                return
+            latest = chosen
 
         entry.latest_version = latest.version_number
         entry.release_channel = latest.version_type
@@ -649,8 +752,27 @@ class Checker:
             entry.add_note("note.no_build_for_loader", loader=self.options.loader)
             return
 
+        channels = self.options.modrinth_channels()
+        in_channel = [
+            version for version in versions if _in_channels(version, channels)
+        ]
         entry.status = STATUS_NO_COMPATIBLE_BUILD
-        newest = versions[0]
+        if not in_channel:
+            # Nothing in the accepted channels. Naming the version that *was* found keeps the
+            # report answerable ("no release build, only this beta"), and ``release_channel`` is
+            # what tells the reader which of the two situations this is.
+            newest = versions[0]
+            entry.latest_version = newest.version_number
+            entry.released_at = newest.date_published
+            entry.release_channel = newest.version_type
+            entry.add_note(
+                "note.prerelease_fallback",
+                channel=versions[0].version_type or "release",
+                setting=", ".join(channels),
+            )
+            return
+
+        newest = in_channel[0]
         entry.latest_version = newest.version_number
         entry.released_at = newest.date_published
         entry.release_channel = newest.version_type
@@ -778,6 +900,17 @@ class Checker:
         them, and a hundred mods asked one at a time is a check measured in minutes rather
         than seconds. Nothing is decided here, so there is nothing for the ordering to carry:
         every mod owns its own entry, and the resolve cache takes a lock around its own state.
+
+        A whole-platform outage never reaches this stage at all: :meth:`_stage_modrinth` records
+        it and the run skips the per-mod stages, so the request count stays a constant instead of
+        growing with the folder. What is left here is a failure in the *middle* of the stage —
+        the platform answering, then stopping — which is bounded by the mod count and by the
+        retry budget of each call. Stopping early on the first few failures was considered and
+        left out deliberately: "the search failed" is also what a single unfindable mod looks
+        like, and a breaker that trips on three of those would mark the remaining mods
+        ``error`` for a reason that is not true of them. Distinguishing the two needs a signal
+        the search endpoint does not currently give (a status code rather than a raised error),
+        and that belongs with the entry layer rather than here.
         """
         # Everything that needs no network is decided first, serially, so the pool is only
         # ever handed work that has to happen.
@@ -791,7 +924,7 @@ class Checker:
                 # Searching for it by file name would only ever produce a false positive.
                 continue
 
-            cached = self._cache.get(mod.sha1) if mod.sha1 else None
+            cached = self._cache.get(mod.sha1) if (mod.sha1 and self.options.use_modrinth) else None
             if cached is not None and cached.get("resolved") is False:
                 entry.status = STATUS_UNRESOLVED
                 entry.add_note("note.cached_unresolved")
@@ -830,9 +963,19 @@ class Checker:
             return
 
         entry.status = STATUS_UNRESOLVED
-        if asked_modrinth and by_modrinth is None:
+        if by_modrinth is None:
+            # Asked, and the answer did not come back. Nothing was learned, so nothing may be
+            # cached: a transient outage promoted into a day-long blind spot is the failure this
+            # branch exists to avoid.
             entry.add_note("note.search_incomplete")
+        elif not asked_modrinth:
+            # Not asked at all — the platform is switched off in the config. Also nothing
+            # learned, so also nothing cached. Writing ``resolved: false`` here is what used to
+            # make every one of these mods stay "unresolved" for a whole TTL after the admin
+            # turned Modrinth back on, with a note claiming the platforms did not know the jar.
+            entry.add_note("note.modrinth_disabled_by_config")
         elif mod.sha1:
+            # Both platforms were asked and neither knew it. That is a fact worth the disk.
             self._cache.put(mod.sha1, {"resolved": False})
 
     def _match_on_modrinth(
@@ -906,12 +1049,29 @@ class Checker:
             entry.add_note("note.no_build_for_loader", loader=self.options.loader)
             return
 
+        # Channel first, game version second, and in that order on purpose. A beta that also
+        # targets the wrong game version would otherwise be "the newest compatible build" and
+        # get recommended despite ``check.include_beta`` being off — the setting an admin
+        # changes precisely because they do not want to be told about pre-releases.
+        channels = self.options.modrinth_channels()
+        in_channel = [version for version in versions if _in_channels(version, channels)]
+        accepted = in_channel or list(versions)
+        if not in_channel:
+            # No version in the accepted channels: fall back rather than claim the project
+            # publishes nothing, and say so, or the report would recommend a pre-release with no
+            # explanation of why. Turning on ``check.include_beta`` is what removes the note.
+            entry.add_note(
+                "note.prerelease_fallback",
+                channel=versions[0].version_type or "release",
+                setting=", ".join(channels),
+            )
+
         compatible = [
             version
-            for version in versions
+            for version in accepted
             if not server.mc_version or server.mc_version in version.game_versions
         ]
-        newest = (compatible or versions)[0]
+        newest = (compatible or accepted)[0]
         entry.latest_version = newest.version_number
         entry.released_at = newest.date_published
         entry.release_channel = newest.version_type
@@ -923,7 +1083,7 @@ class Checker:
                 "note.no_build_for_game_version",
                 version=server.mc_version,
                 newest=entry.latest_version,
-                targets=", ".join((versions[0].game_versions or [])[-6:]) or "?",
+                targets=", ".join((newest.game_versions or [])[-6:]) or "?",
             )
             return
 
@@ -1065,6 +1225,35 @@ class Checker:
         if entry.status == STATUS_NOT_A_MOD:
             return "not-a-mod"
         return ""
+
+
+def _in_channels(version: ModrinthVersion, channels: Sequence[str]) -> bool:
+    """Whether a version is published in one of the accepted release channels.
+
+    ``version_type`` is Modrinth's own field (``release``/``beta``/``alpha``) and is the same
+    vocabulary as :meth:`CheckOptions.modrinth_channels`. An unrecognised value is accepted
+    rather than refused: a channel this plugin has never heard of is not a reason to hide a
+    build from the admin, and refusing it would look like "this project has no downloads".
+    """
+    kind = str(version.version_type or "release").strip().lower()
+    if kind not in ("release", "beta", "alpha"):
+        return True
+    return kind in channels
+
+
+def _pick_channel(
+    versions: Sequence[ModrinthVersion], channels: Sequence[str]
+) -> Optional[ModrinthVersion]:
+    """The first version of ``versions`` that is in ``channels``, or ``None``.
+
+    The list arrives newest-first from Modrinth, so "first" is "newest" and no second sort is
+    needed. ``None`` is a real answer: it means the accepted channels hold nothing, which the
+    caller must not confuse with "the project has no versions".
+    """
+    for version in versions:
+        if _in_channels(version, channels):
+            return version
+    return None
 
 
 def _record_download(entry: UpdateEntry, version: ModrinthVersion) -> None:

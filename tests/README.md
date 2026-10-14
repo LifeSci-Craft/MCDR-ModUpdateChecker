@@ -17,8 +17,8 @@ python -m pip install --target .testlibs -r tests/requirements-test.txt
 ## 跑测试
 
 ```bash
-PYTHONPATH=.testlibs python -m pytest          # 全量（722 项，约 4 分钟，含端到端）
-PYTHONPATH=.testlibs python -m pytest -m "not e2e"   # 跳过端到端，约 1.5 分钟
+PYTHONPATH=.testlibs python -m pytest          # 全量（827 项，含端到端；端到端本身约 1 分钟）
+PYTHONPATH=.testlibs python -m pytest -m "not e2e"   # 跳过端到端，约 25 秒
 ```
 
 `pytest.ini` 里已把 `tests/` 设为测试根，`conftest.py` 负责把仓库根和 `tests/` 放进 `sys.path`；
@@ -44,6 +44,7 @@ PYTHONPATH=.testlibs python -m pytest -m "not e2e"   # 跳过端到端，约 1.5
 | `test_i18n.py` | 两份语言目录键集一致、代码里用到的键都在、没有失效键、占位符对齐、**每条消息开头的 `[方括号]` 都是元数据里的插件名**、`install.reason.*` / `download.reason.*` 与产出它们的模块双向对齐 |
 | `test_mcdr_entry.py` | MCDR 入口：生命周期与事件注册的约束、**一份被改坏的 `resolve-cache.json` 不能拖垮插件加载**（这条是代码审查揪出来的回归）、配置分组的不变式、**配置文件的新建 / 补齐 / 补不上都会上报且状态页会显示文件路径**、**六个界面共用一个标题栏**、**控制台保留版本数字而不是 `[版本]` 标签**、`!!muc download` / `install` / `confirm` 的确认流程（超时、换人、报告换过后作废、只授权点名的那一个）、**批量形式 `download all` / `install all`**（保留字、计划计数、集合变了整条作废、逐条授权）、**下载完成通知的两条通道与开关**、**裸命令就是帮助页**（以及 `!!muc summary` 仍然可到汇总）、**游戏内的候选可以点、控制台的补全接口能列候选**、关服安装的授权路径、**复用前要不要先看「这份结果还算不算数」**、存档报告的读回、映射表路径的组装与拒绝 |
 | `test_docs.py` | 文档与代码的约定：两份 README 的受众分工（使用者的 README 里不许出现实现细节，也不许把插件说成只读的）、文档里的选项路径必须真实存在**且每个选项都必须被文档提到**（反向漏掉一项，看起来就像「功能没做」）、README 的命令表必须列全命令树里注册的每个命令、所有仓库链接指向同一个仓库、**版本号三处一致**（plugin.json / CHANGELOG 首个标题 / README 样本）、**README 里的样例标题栏逐字等于插件画出来的那条**、CHANGELOG 只留一版、矩阵检查项数量由 `required_keys()` 现算、**每条 `#锚点` 内部链接都落在一个真实存在的标题上**（按 GitHub 的锚点规则算，CJK 标点要丢掉）、**源码行末统一 LF** |
+| `test_documented_paths.py` | 文档里用反引号写出的**仓库相对路径必须存在**（`README-dev.md` 是一张证据表，指向不存在的脚本等于把「可复核」降级成「作者声称」——它曾引用七个从未进过仓库的 `bench/*.py`），以及 `bench/` 下的脚本必须在这两份文档里被点名 |
 | `test_e2e.py` | 用 `pack.py` 打出 `.mcdr`，放进**真实 MCDR**里跑：加载、自动检查、命令树、别名、报告落盘 |
 
 `tests/fake_upstream.py` 是 Modrinth 的本地假实现。它的回答形状是照着线上实测抄的
@@ -75,6 +76,19 @@ python tools/mcdr_matrix.py /path/to/mcdr-2.13/python /path/to/mcdr-2.15.7/pytho
 ```bash
 MCDR_TEST_PYTHON=/path/to/mcdr-2.14/python PYTHONPATH=.testlibs python -m pytest tests/test_e2e.py
 ```
+
+## 变异检查
+
+全绿只说明「没有失败」，不说明这些用例真的在守着什么。`tools/mutation_check.py` 把每条守卫
+逐个改坏（在仓库的**临时副本**里改，工作树不受影响），再跑该守卫对应的用例：没被抓住的守卫
+会被点名，锚点挪走了也会被点名（那是脚本过期，不是测试没牙）。
+
+```bash
+python tools/mutation_check.py
+```
+
+它拒绝在设了 `MCDR_SKIP_E2E` 的环境里运行——至少有一条守卫只有端到端套件能抓到，跳过了 e2e 就等于
+把「被抓住」误报成「存活」。CI 里有独立的 `mutation` 作业跑它。
 
 ## 无法在仓库内闭环的部分
 

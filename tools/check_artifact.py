@@ -225,6 +225,33 @@ def check_loadable(archive_path: Path) -> None:
         print("modules compile : all .py entries")
 
 
+def check_changelog(archive_path: Path) -> None:
+    """The shipped changelog carries exactly one release, and it is the one being shipped.
+
+    Two separate failure modes, both seen for real. The repository file is allowed to accumulate
+    history, but the *artifact* promises one release's notes: v1.6.0 shipped 1.0.0–1.6.0 in
+    28,363 bytes — 29.4% of that artifact — under a header saying the file keeps only the latest
+    version. And a changelog that describes a different version than the metadata does is how a
+    release ends up announcing someone else's changes.
+    """
+    with zipfile.ZipFile(archive_path) as archive:
+        if "CHANGELOG.md" not in archive.namelist():
+            raise AssertionError("CHANGELOG.md is not shipped")
+        text = archive.read("CHANGELOG.md").decode("utf-8")
+        headings = [line for line in text.splitlines() if line.startswith("## ")]
+        assert len(headings) == 1, (
+            "the shipped changelog carries {} release sections, not one: {}".format(
+                len(headings), headings[:4]
+            )
+        )
+        metadata = json.loads(archive.read("mcdreforged.plugin.json").decode("utf-8"))
+        version = metadata.get("version", "")
+        assert headings[0].strip().lstrip("# ").lstrip("v") == version.lstrip("v"), (
+            "the shipped changelog is {} but the plugin version is {}".format(headings[0], version)
+        )
+        print("changelog       : {} only ({} B)".format(headings[0].strip(), len(text.encode("utf-8"))))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -240,6 +267,7 @@ def main() -> int:
         check_contents(path)
         check_stripped(path)
         check_loadable(path)
+        check_changelog(path)
     else:
         with tempfile.TemporaryDirectory(prefix="muc_artifact_") as folder:
             workdir = Path(folder)
@@ -248,6 +276,7 @@ def main() -> int:
             check_contents(path)
             check_stripped(path)
             check_loadable(path)
+            check_changelog(path)
 
     print()
     print("all artifact checks passed")

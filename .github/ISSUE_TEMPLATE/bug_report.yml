@@ -1,0 +1,61 @@
+name: 问题反馈
+description: 插件行为不对、报错或与预期不符
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        报障时最有用的是这三样：**版本**、**日志**、**复现步骤**。缺日志的报障通常只能来回问。
+
+        与 Modrinth 有关的问题请先看一眼 `!!modupdate status` 输出的识别版本与 `sources` 配置：
+        认错游戏版本会让每个 Mod 都显示「无适配构建」。
+  - type: input
+    id: mcdr-version
+    attributes:
+      label: MCDR 版本
+      description: 控制台启动时打印的版本号，或 `!!MCDR version` 的输出
+      placeholder: 例如 2.16.0
+    validations:
+      required: true
+  - type: input
+    id: plugin-version
+    attributes:
+      label: 插件版本
+      description: 产物文件名里的版本，或 `!!modupdate status` 标题栏里的版本
+      placeholder: 例如 1.6.0
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 发生了什么
+      description: 期望的行为与实际的行为
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 越具体越好；涉及某个 Mod 时请给出它的文件名与来源（Modrinth / CurseForge / 本地）
+      placeholder: |
+        1. `!!modupdate check`
+        2. 看到 sodium 被报成 ...
+        3. `!!modupdate info sodium` 显示 ...
+    validations:
+      required: true
+  - type: textarea
+    id: status
+    attributes:
+      label: "`!!modupdate status` 的输出"
+      description: 它会打印识别到的 MC 版本、加载器、mods 目录与配置来源，多数识别问题看这一屏就够了
+      render: text
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志
+      description: MCDR 控制台输出或 `logs/MCDR.log` 里的相关片段，包含完整 traceback（如果有）
+      render: text
+    validations:
+      required: true

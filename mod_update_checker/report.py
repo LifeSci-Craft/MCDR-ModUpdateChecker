@@ -68,6 +68,7 @@ __all__ = [
     "entry_row_fields",
     "chat_row_fields",
     "chat_cell_widths",
+    "reset_cell_width_cache",
     "status_tag",
     "STATUS_ICONS",
     "text_quarters",
@@ -1104,7 +1105,8 @@ def _measure_cells(tr: Translator) -> Tuple[int, int]:
 #: rather than on the row: without this, drawing a ten-row page re-measured thirteen labels and
 #: a dozen strings eleven times. Keyed by the translator's language, and only for translators
 #: that say what they are — a stand-in (a test's lambda) is measured every time, which is the
-#: safe direction.
+#: safe direction. Cleared by :func:`reset_cell_width_cache` on every plugin load, because a
+#: language code is not a version of a catalogue and this module survives a reload.
 _CELL_WIDTHS: Dict[str, Tuple[int, int]] = {}
 
 
@@ -1116,10 +1118,16 @@ def chat_cell_widths(tr: Translator) -> Tuple[int, int]:
     language or waste a column in the other. A new status widens every row — visibly, and in one
     place.
 
-    Memoised per language. The catalogue cannot change while the plugin runs, so the only way
-    to get a stale answer is for the cache key to be wrong — hence the ``language`` attribute
-    :func:`i18n.make_translator` puts on the callable it returns, and the no-cache fallback
-    above for anything that does not carry one.
+    Memoised per language. The catalogue cannot change while **this module run** is alive, so the
+    only way to get a stale answer is for the cache key to be wrong — hence the ``language``
+    attribute :func:`i18n.make_translator` puts on the callable it returns, and the no-cache
+    fallback above for anything that does not carry one.
+
+    "Cannot change while the plugin runs" is the part that needs a qualification: MCDR reloads a
+    plugin by building a fresh copy of the *entry* module, while this sibling module stays in
+    ``sys.modules`` — so a new version of the plugin bringing a changed ``line.status_word`` for
+    the same language would keep the old measurement. :func:`reset_cell_width_cache` is the hook
+    that makes the reload visible here, and the entry module calls it on load.
     """
     language = getattr(tr, "language", None)
     if language is None:
@@ -1128,6 +1136,17 @@ def chat_cell_widths(tr: Translator) -> Tuple[int, int]:
     if widths is None:
         widths = _CELL_WIDTHS[language] = _measure_cells(tr)
     return widths
+
+
+def reset_cell_width_cache() -> None:
+    """Forget the memoised cell widths, so the next row re-measures them.
+
+    Called from the entry module's ``on_load``. The cache is keyed by language and this module
+    outlives a plugin reload (see :func:`chat_cell_widths`), so without this an upgraded
+    catalogue carrying the same language code would draw its columns with the old widths —
+    visibly, and with nothing anywhere saying why. The cost is one measurement per language.
+    """
+    _CELL_WIDTHS.clear()
 
 
 def _row_body_label(entry: UpdateEntry, tr: Translator) -> str:

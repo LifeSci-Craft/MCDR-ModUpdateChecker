@@ -11,6 +11,46 @@ in-game chat. All of the actual work lives in sibling modules that do not import
 which is what makes the logic testable without booting a server.
 
 Nothing here ever modifies ``mods/``. The plugin reports; the admin decides.
+
+Sections, in file order — the banners further down repeat these names, so a reader who wants
+one subject can jump straight to it:
+
+1. constants, and the shape of the config file;
+2. module state and ``tr``;
+3. configuration: loading, repairs, the numeric ranges, the language;
+4. running a check: scan, query, notify, report files;
+5. installing what was downloaded, and the ledger it reads;
+6. in-game screens: title bars, colours, rows, the help page, and the notifications built from
+   them — including the join/leave events that decide who gets one;
+7. scheduling;
+8. commands: permission, the ``.old`` backups and their cleanup, the staged two-step actions
+   (download / install / confirm), the status page and ``reload``;
+9. the command tree and its completions;
+10. MCDR lifecycle: ``on_load`` and the other event handlers.
+
+TODO (split this file up — deliberately not this round): over four thousand lines and 140
+top-level definitions in one module is more context than any one change should have to read, and
+the boundaries are already visible in the section list above. The plan worked out in the entry
+layer's review (§4 of the audit report) is, in dependency order:
+
+* ``state.py`` — the module globals plus ``tr``, so no other module needs ``global`` (now
+  spread over nine functions here);
+* ``config.py`` — the config classes, the legacy flat-name map, ``_load_config`` and friends;
+* ``screens.py`` — every ``RText`` builder and the colour vocabulary, taking ``server`` /
+  ``config`` as parameters rather than reading the globals (``_show_help`` and the title-bar
+  helpers still read both; ``_status_screen`` already takes everything it needs);
+* ``actions.py`` — the staged two-step state machine (``_take_pending`` and the staging
+  helpers), which is the part that most deserves tests of its own;
+* ``lifecycle.py`` — the three scheduler functions and the four MCDR event handlers, which
+  **must** stay module-level functions with their event names re-exported here, because MCDR
+  discovers them by name (see the lifecycle banner);
+* ``commands.py`` — the command tree and one entry point per subcommand.
+
+Four things have to be handled together with the move, or the split makes things worse: the
+``global`` statements have to become attribute writes on ``state``; ``screens.py`` must be
+callable without a running MCDR; ``report.py``'s public surface should shrink at the same
+time (its ``__all__`` lists far more than the entry layer imports); and each module moved has
+to be re-exported from here, because the tests patch these names on the package.
 """
 
 import json
@@ -72,6 +112,7 @@ from .downloads import (
 from .report import (
     ALL_STATUSES,
     CHAT_PAGE_LINES,
+    ELLIPSIS,
     MATCHED_BY_NOTEWORTHY,
     ROW_FIELD_BODY,
     ROW_FIELD_MARK,
@@ -106,6 +147,7 @@ from .report import (
     render_index,
     render_pager,
     render_summary,
+    reset_cell_width_cache,
     summarise,
     text_quarters,
     version_summary,
@@ -116,11 +158,16 @@ from .upstream import HttpClient
 from .projectmap import MAP_FILE_NAME, ProjectMap, resolve_map_file
 from .scanner import (
     ScanResult,
+    directory_error,
     iter_mod_jars,
     resolve_mods_directory,
     scan_mods,
 )
 from .serverinfo import detect as detect_server_context
+
+# --------------------------------------------------------------------------------------
+# Constants, and the shape of the config file
+# --------------------------------------------------------------------------------------
 
 CONFIG_FILE_NAME = "config.json"
 REPORT_FILE_NAME = "last_report.json"
@@ -143,9 +190,14 @@ _FALLBACK_TITLE = "Mod Update Checker"
 #: Width the help and status title bars aim to fill. Roughly one line of the vanilla chat
 #: window at the default font size; going wider wraps, which looks worse than a short bar.
 _TITLE_WIDTH = 53
-#: Never fewer than this many ``=`` on each side, however long the plugin name gets.
-#: 收尾线两侧最少几个 ``=``。3 而不是 4：底线现在要捎一句「悬停 [版本] [状态]，点击 [详细信息]」，
-#: 英文那份是 42 列，去掉两侧各 3 个 ``=`` 与两对空格正好等于标题栏的宽度——4 会让它长出两列。
+#: Fewest ``=`` the bar draws on either side, however long the plugin name gets.
+#:
+#: This is a floor for *drawing*, not a limit on the caption: the closing rule below shows a
+#: hint, and when that hint is too wide for the bar the caption is what gets cut. The ``3``
+#: itself is not arbitrary — with the captions shipped today, the English hint is 42 columns
+#: and removing the two sides' three ``=`` plus the two pairs of spaces lands exactly on the
+#: title bar's width; ``4`` would push the line two columns past it. That is where the number
+#: comes from, not a rule that 3 is always enough.
 _TITLE_BAR_MIN = 3
 
 #: Cap on how many mods a one-shot notification lists.
@@ -520,11 +572,16 @@ class Config(_Grouped):
 
 
 # --------------------------------------------------------------------------------------
-# Module state
+# Module state and ``tr``
 #
 # MCDR reloads a plugin by constructing a fresh module, so anything that should survive
 # ``!!MCDR reload plugin`` is deliberately kept in module globals and carried over in
 # ``on_load`` — most importantly the last report, which an admin will be looking at.
+#
+# The other globals fall into three groups, and it helps to know which is which when reading
+# the functions below: the *inputs* (``_config``, ``_server``, ``_translator``), the *results*
+# (``_last_report``), and the *locks and events* that keep the threads apart (``_check_lock``,
+# ``_stop_event``, ``_pending_lock``, ``_inflight_lock``, ``_status_lock``).
 # --------------------------------------------------------------------------------------
 
 _config: Config = Config.get_default()
@@ -541,8 +598,27 @@ _scheduler_thread: Optional[threading.Thread] = None
 #: Kept in module state rather than per-source, because ``confirm`` is typed as its own command
 #: and has nothing to correlate with. Guarded by its own lock: commands run on MCDR's task
 #: executor, and the two-step form means two of them arrive at unrelated moments.
+#:
+#: Read and emptied in the same critical section — see :func:`_take_pending`. Splitting those two
+#: steps is how one plan gets carried out twice.
 _pending_action: Optional[Dict[str, Any]] = None
 _pending_lock = threading.Lock()
+
+#: Download file names whose transfer is running right now, and the lock that owns them.
+#:
+#: A second ``!!muc download`` for the same build — two admins, or one admin pressing enter
+#: twice — would otherwise open a second connection for the same bytes and race its own ledger
+#: record. The name is the key because the name is what ends up on disk.
+_inflight_downloads: Set[str] = set()
+_inflight_lock = threading.Lock()
+
+#: True while one ``!!muc status`` is being assembled. The command now scans ``mods/`` on its own
+#: thread, so without this two quick invocations would both read the whole folder for one screen.
+_status_lock = threading.Lock()
+
+#: What ``is_server_running`` last said, and the answer used when that probe fails (see
+#: :func:`_server_running`). Starts optimistic on purpose.
+_last_server_running = True
 
 
 def tr(key: str, **kwargs: Any) -> str:
@@ -750,8 +826,92 @@ def _load_config(server: PluginServerInterface) -> Config:
     # below is the first thing on the console that has to be readable, and the language
     # setting is part of what was just read.
     _apply_language(server, config)
+    _clamp_and_report(server, config)
     _report_config_file_state(server, config, path, existed, leaves_before, legacy_rebuilt)
     return config
+
+
+#: Every numeric option the plugin is willing to use, with the range it is willing to use it in.
+#:
+#: ``(option path, minimum, maximum)``. The lower bounds are the ones the code always applied;
+#: the upper bounds are the point of this table. Both are needed, because a mistyped option is
+#: not always *too small*: ``interval_hours: 100000`` silently switches periodic checking off
+#: (the wait is longer than any server lives), ``start_delay_seconds: 100000`` does the same to
+#: the first check, ``admin_permission: 99`` silently disables every admin notification, and
+#: ``concurrent_requests: 10000`` turns a typo into thousands of connections. None of those
+#: throw, so the admin sees "the plugin stopped telling me things" and has no reason to suspect
+#: the config file. The upper bounds are chosen so that anything legitimate fits comfortably:
+#: a month between checks, a month of startup delay, an 8 GB download, 32 parallel requests
+#: (the front ends start refusing well before that), 1000 requests/minute, five minutes per
+#: request, MCDR's whole permission range, and ten years of backups.
+_NUMERIC_RANGES: Tuple[Tuple[str, int, int], ...] = (
+    ("check.start_delay_seconds", 0, 3600),
+    ("check.interval_hours", 0, 720),
+    ("download.max_size_mb", 1, 8192),
+    ("network.concurrent_requests", 1, 32),
+    ("network.requests_per_minute", 0, 1000),
+    ("network.timeout_seconds", 1, 300),
+    ("cleanup.max_age_days", 0, 3650),
+    ("command_permission_level", 0, 4),
+    ("report.admin_permission", 0, 4),
+    ("report.in_game_permission", 0, 4),
+)
+
+
+def _clamp_and_report(server: PluginServerInterface, config: Config) -> List[str]:
+    """Bring out-of-range numbers back into range, and say which ones and to what.
+
+    Silent clamping is what this replaces: the old code had lower bounds everywhere and no
+    upper ones at all, so a value an order of magnitude too big was accepted and then quietly
+    made a feature stop working. The message names the option, the value found, and the value
+    used, because the admin is the only one who can fix the file — the plugin cannot tell
+    "600000 was a typo for 60" from "I really meant it".
+
+    Applied to the config object only, not written back: MCDR owns that file, and rewriting it
+    behind the admin's back is the kind of surprise this whole layer exists to avoid. So the
+    value stays wrong in the file and the warning appears on every load until it is fixed,
+    which is the intended behaviour.
+
+    Returns the paths that were changed, for the tests and for anything that wants the count.
+    """
+    changed: List[str] = []
+    for path, minimum, maximum in _NUMERIC_RANGES:
+        # Both shapes are needed: the permission levels and the level the command needs sit at
+        # the root of the config, everything else is one section down.
+        target: Any = config
+        name = path
+        if "." in path:
+            section, name = path.split(".", 1)
+            target = getattr(config, section, None)
+            if target is None:
+                continue
+        try:
+            value: Any = getattr(target, name)
+        except AttributeError:
+            continue
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            number = minimum
+        if number < minimum:
+            used = minimum
+        elif number > maximum:
+            used = maximum
+        else:
+            continue
+        setattr(target, name, used)
+        changed.append(path)
+        server.logger.warning(
+            tr(
+                "console.config_clamped",
+                option=path,
+                value=value,
+                used=used,
+                minimum=minimum,
+                maximum=maximum,
+            )
+        )
+    return changed
 
 
 def _apply_language(server: PluginServerInterface, config: Config) -> None:
@@ -761,8 +921,15 @@ def _apply_language(server: PluginServerInterface, config: Config) -> None:
     if callable(getter):
         try:
             mcdr_language = getter()
-        except Exception:  # noqa: BLE001 - an older MCDR simply has no such API
+        except Exception as error:  # noqa: BLE001 - an older MCDR simply has no such API
             mcdr_language = None
+            # On every MCDR this plugin supports the API is there, so this branch means the
+            # environment is broken rather than that the API is missing — and the consequence is
+            # a silent fall back to English, which looks exactly like the admin having asked for
+            # English. One debug line is the difference between "we chose English" and "we ended
+            # up in English and cannot say why".
+            if server is not None:
+                server.logger.debug("get_mcdr_language() failed: {}".format(error))
 
     choice = i18n.resolve(config.language, mcdr_language)
     global _translator
@@ -805,8 +972,16 @@ def _scan_current(
     information_version = None
     try:
         information_version = server.get_server_information().version
-    except Exception:  # noqa: BLE001 - offline servers have nothing to report
+    except Exception as error:  # noqa: BLE001 - offline servers have nothing to report
+        # Expected on a stopped server, and deliberately not fatal — but not silent either. The
+        # consequence is that the game version has to be guessed from the log or from the mods
+        # themselves, which is worth less than the server's own answer; a line in the log is what
+        # makes "why did this check call every mod incompatible" answerable.
         information_version = None
+        server.logger.debug(
+            "server information unavailable, falling back to the log and mod metadata: "
+            "{}: {}".format(type(error).__name__, error)
+        )
 
     context = detect_server_context(
         working_directory=working_directory,
@@ -842,7 +1017,17 @@ def _run_check(
     announce_clean: bool = True,
     broadcast: bool = True,
 ) -> Optional[Report]:
-    """Scan, query and report. Safe to call from any thread; only one runs at a time."""
+    """Scan, query and report. Safe to call from any thread; only one runs at a time.
+
+    Gives up when the server is stopping, and gives up **twice**: once before the scan and once
+    after the queries, before the result is stored. A check that runs to completion after a stop
+    describes a server that no longer exists, and the report it writes is read back at the next
+    startup and reused (``_report_still_applies`` cannot tell the difference — nothing about the
+    mods folder changed), so an admin would be told about the state of the server as it was
+    stopping. The first checkpoint also stops a check that a stop raced into starting at all;
+    the second is the one that matters, because the scan and the network calls take seconds and
+    a stop can arrive in the middle of them.
+    """
     global _last_report
     if not _check_lock.acquire(blocking=False):
         if source is not None:
@@ -850,6 +1035,8 @@ def _run_check(
         return None
 
     try:
+        if _stop_event.is_set():
+            return None
         config = _config
         # Captured before this run replaces it: the difference between the two is the only
         # thing that can tell "this update is new" from "this update is still waiting".
@@ -861,6 +1048,19 @@ def _run_check(
                 source.reply(message)
             else:
                 server.logger.warning(message)
+            return None
+        if getattr(scan, "directory_error", ""):
+            # The folder is there but cannot be listed, so every mod would look absent and the
+            # report would say "nothing to update" about a folder nobody has read. Refusing the
+            # run is the only answer that cannot be mistaken for a clean result.
+            message = tr(
+                "command.check.mods_unreadable",
+                directory=scan.directory,
+                error=scan.directory_error,
+            )
+            server.logger.warning(message)
+            if source is not None:
+                source.reply(message)
             return None
 
         checker = Checker(
@@ -878,6 +1078,11 @@ def _run_check(
         report = checker.run(
             scan, context, cache_path=cache_path, map_path=_manual_map_path(server, config)
         )
+        if _stop_event.is_set():
+            # The server stopped while the queries were in flight. Drop the whole run: storing
+            # it would both replace a good report with a stale one and have the download
+            # reconciliation act on a server that is no longer running.
+            return None
         _last_report = report
 
         # Before the notification, not after it. What the admin reads has to describe the state
@@ -2093,17 +2298,47 @@ def on_player_left(server: PluginServerInterface, player: str) -> None:
 
 
 def _server_running(server: PluginServerInterface) -> bool:
+    """Whether the server is up — failing **open**, which is the whole point of this function.
+
+    Everything sent to players goes through here: the join notification, the download notice,
+    the cleanup reminder and ``_tell_player`` itself. Returning ``False`` on an exception is
+    therefore not a safe default but a silent mute button: one transient error inside
+    ``is_server_running`` and *every* in-game message disappears with nothing in the log. So a
+    failed probe keeps the last answer that was actually observed, and starts from ``True`` —
+    the worst case of being wrong that way is one ``execute`` that MCDR refuses while the server
+    is stopped, which it says out loud, against notifications that vanish without a word.
+
+    The last answer is module state and therefore reset by a plugin reload, which is the right
+    direction to reset it in: reloading is what an admin does when they want to hear from the
+    plugin again.
+    """
+    global _last_server_running
     probe = getattr(server, "is_server_running", None)
     if not callable(probe):
-        return False
+        # No such API at all: nothing to go on, and the optimistic answer is the one that keeps
+        # notifications working. (Every MCDR this plugin supports has it.)
+        return _last_server_running
     try:
-        return bool(probe())
-    except Exception:  # noqa: BLE001
-        return False
+        running = bool(probe())
+    except Exception as error:  # noqa: BLE001 - the direction of the fallback is the decision
+        server.logger.debug(
+            "is_server_running() failed ({}: {}); assuming the last known state ({})".format(
+                type(error).__name__, error, _last_server_running
+            )
+        )
+        return _last_server_running
+    _last_server_running = running
+    return running
 
 
 # --------------------------------------------------------------------------------------
 # Scheduling
+#
+# Three threads, one event, and one rule: ``_stop_event`` means "the server is stopping", and
+# something that notices it must stop on its own. Everything that waits also checks it — the
+# interval loop, the startup delay, ``_run_check``'s two checkpoints and the admin-on-join
+# worker — and ``on_server_startup`` clears it again, because a server that stops and starts
+# without a reload would otherwise never be checked again.
 # --------------------------------------------------------------------------------------
 
 
@@ -2163,8 +2398,33 @@ def _stop_scheduler() -> None:
     _scheduler_thread = None
 
 
+def _resume_after_stop(server: PluginServerInterface) -> None:
+    """Put periodic checking back after a server stop, and only then.
+
+    ``on_server_stop`` sets ``_stop_event``, which is also what ends the interval loop — so
+    without this a server that stops and starts again *without* a plugin reload would never run
+    another periodic check, and the startup check would be skipped too (its ``wait`` returns
+    immediately). That would be a worse bug than the one the stop event fixes.
+
+    The event is cleared first and the thread is only started when there is none: the loop may
+    still be alive for a moment after the stop (it wakes on the event, then exits), and clearing
+    the event is exactly what makes that loop carry on instead of dying. Starting a second
+    scheduler while it is alive would double every periodic check.
+    """
+    _stop_event.clear()
+    thread = _scheduler_thread
+    if thread is not None and thread.is_alive():
+        return
+    _start_interval_scheduler(server)
+
+
 # --------------------------------------------------------------------------------------
 # Commands
+#
+# One entry point per subcommand, then the two halves of the ones that act on files: the backup
+# commands (stage a plan, re-derive it at ``confirm``) and the two-step download / install
+# actions. The permission gate reads the config **when the command is typed**, not when it was
+# registered, so changing the level takes effect without a reload.
 # --------------------------------------------------------------------------------------
 
 
@@ -2448,7 +2708,8 @@ def _manual_delete(source: CommandSource, handle: str, prefix: str) -> None:
         return
     text = (handle or "").strip()
     if not text:
-        source.reply(tr("command.delete.usage", command=prefix))
+        source.reply(tr("command.delete.usage", command=prefix,
+                        cleanup="{} cleanup".format(prefix)))
         return
     if text.lower() == ALL_TARGET:
         # The bulk form, on the same word the other two verbs use. ``all`` is a reserved word
@@ -2607,11 +2868,19 @@ def _announce_cleanup(server: PluginServerInterface, broadcast: bool = True) -> 
     size = _format_size(total_bytes(expired_now))
     staged = _stage_cleanup_notice([item.file_name for item in expired_now])
 
+    # The sentence names two different commands, so it takes two arguments: ``{command}`` is the
+    # confirm that carries this plan out, and ``{list_command}`` is how to look at the files
+    # before saying yes. Both are spelled with the prefix that was configured rather than the
+    # canonical alias, which is what the rest of the catalogue does (see ``command.help.usage``).
+    command = ROOT_LITERALS[0] + " confirm"
+    list_command = ROOT_LITERALS[0] + " list old_backup"
+    stage_command = ROOT_LITERALS[0] + " cleanup"
+
     server.logger.info(tr("cleanup.notice", count=len(expired_now), days=days, size=size))
     server.logger.info(
-        tr("cleanup.notice_confirm", command=ROOT_LITERALS[0] + " confirm")
+        tr("cleanup.notice_confirm", command=command, list_command=list_command)
         if staged
-        else tr("cleanup.notice_stage", command=ROOT_LITERALS[0] + " cleanup")
+        else tr("cleanup.notice_stage", command=stage_command)
     )
 
     if not broadcast or not (_server_running(server) and _online_players):
@@ -2619,9 +2888,9 @@ def _announce_cleanup(server: PluginServerInterface, broadcast: bool = True) -> 
     notice = [
         Notice(tr("cleanup.notice", count=len(expired_now), days=days, size=size), "action"),
         Notice(
-            tr("cleanup.notice_confirm", command=ROOT_LITERALS[0] + " confirm")
+            tr("cleanup.notice_confirm", command=command, list_command=list_command)
             if staged
-            else tr("cleanup.notice_stage", command=ROOT_LITERALS[0] + " cleanup"),
+            else tr("cleanup.notice_stage", command=stage_command),
             "hint",
         ),
     ]
@@ -2670,13 +2939,11 @@ def _confirm_cleanup(source: CommandSource, pending: Dict[str, Any], prefix: str
     folder = _mods_folder(server, _config)
     doomed = _backups_for(pending["kind"], folder)
     if sorted(item.file_name for item in doomed) != pending["files"]:
-        _clear_pending()
         source.reply(tr("command.action.stale_cleanup",
                         command="{} {}".format(prefix,
                                                _BULK_DELETE_RETRY[pending["kind"]])))
         return
 
-    _clear_pending()
     removed_names = set()
     freed = 0
     failures: List[str] = []
@@ -2726,6 +2993,14 @@ def _number_of(report: Report, entry: UpdateEntry) -> Optional[int]:
 
 
 def _clear_pending() -> None:
+    """Throw away whatever is staged, without carrying it out.
+
+    Not part of the confirm path any more — :func:`_take_pending` consumes the plan by taking it
+    out, and a second clear after that would be clearing air. What is left here are the two
+    moments where dropping a plan is the *point*: a config reload (the plan was shown with
+    settings that no longer hold) and a server stop (a plan is something to act on now, not at
+    some later stop).
+    """
     global _pending_action
     with _pending_lock:
         _pending_action = None
@@ -2814,26 +3089,41 @@ def _stage_batch(
     _reply_lines(source, lines)
 
 
-def _pending_action_for(source: CommandSource) -> Optional[Dict[str, Any]]:
-    """The staged action, or ``None`` after explaining why there is nothing to confirm.
+def _take_pending(source: CommandSource) -> Optional[Dict[str, Any]]:
+    """The staged action — checked, claimed and cleared in one step.
 
-    The three ways to get here are answered separately on purpose: "you never staged anything",
-    "yours expired" and "that was somebody else's" call for three different next actions, and a
-    single "nothing to confirm" would leave the reader guessing which one they hit.
+    Reading and emptying used to be two steps with a gap between them, and three things run
+    through that gap: MCDR's command executor (which is a single thread, but a second
+    ``confirm`` can queue behind the first), the interval scheduler, and the cleanup reminder,
+    which stages a plan of its own. Within the gap the same plan could be handed out twice, so
+    one ``!!muc confirm`` could run a whole batch download twice — twice the bandwidth for the
+    same files — or report a deletion against a file another confirm had already removed.
+
+    Taking the plan out of the slot first makes "this plan has been consumed" a fact instead of
+    a race: whoever receives the dictionary is the only one who ever will. The three refusal
+    paths still answer separately, because "you never staged anything", "yours expired" and
+    "that was somebody else's" ask for three different next actions.
+
+    The requester check puts the plan *back* when it was not theirs — their confirm is a
+    mistake, not a decision, and the admin who staged it can still use it. Only into a free
+    slot, though: if a new plan was staged in the meantime, clobbering it with the old one
+    would be the opposite of what the two-step form is for.
     """
     global _pending_action
     with _pending_lock:
-        pending = _pending_action
+        pending, _pending_action = _pending_action, None
     if pending is None:
         source.reply(tr("command.action.nothing"))
         return None
     if time.monotonic() > pending["deadline"]:
-        _clear_pending()
         source.reply(tr("command.action.expired", seconds=CONFIRM_TIMEOUT_SECONDS))
         return None
     # 空字符串是「提醒替所有人准备的」——没有任何命令来源会产生它（见 _requester），
     # 所以它专门表示「读到这条的任一管理员都可以确认」。
     if pending["requester"] and pending["requester"] != _requester(source):
+        with _pending_lock:
+            if _pending_action is None:
+                _pending_action = pending
         source.reply(tr("command.action.other_player", player=pending["requester"]))
         return None
     return pending
@@ -3032,8 +3322,14 @@ def _manual_install_all(source: CommandSource, prefix: str) -> None:
 
 
 def _manual_confirm(source: CommandSource, prefix: str) -> None:
-    """``confirm`` — carry out whatever ``download`` / ``install`` / ``delete`` staged."""
-    pending = _pending_action_for(source)
+    """``confirm`` — carry out whatever ``download`` / ``install`` / ``delete`` staged.
+
+    Taking the plan out of the slot (see :func:`_take_pending`) *is* the consumption: nothing
+    below this line clears anything, because there is nothing left to clear, and every path that
+    returns early has already spent the plan it refused. The exception is the reminder's plan,
+    which is put back untouched when the confirm was not its owner's.
+    """
+    pending = _take_pending(source)
     if pending is None:
         return
 
@@ -3042,7 +3338,6 @@ def _manual_confirm(source: CommandSource, prefix: str) -> None:
         # slot). The plan has lost the thing that authorised it, so it is dropped rather than
         # carried out — a gate on the command but not here would let a staged plan walk past
         # the switch, which is the one thing it exists to stop.
-        _clear_pending()
         _refuse_deletion(source)
         return
 
@@ -3059,16 +3354,13 @@ def _manual_confirm(source: CommandSource, prefix: str) -> None:
     if entry is None or entry.file_name != pending["file_name"]:
         # The report was replaced between the two commands, so the number means something else
         # now — act on nothing rather than on whatever it happens to point at.
-        _clear_pending()
         source.reply(tr("command.action.stale", command=prefix))
         return
 
     number = int(pending["number"] or 0)
     if pending["kind"] == "download":
-        _clear_pending()
         _confirmed_download(source, entry, number, prefix)
     elif pending["kind"] == "delete":
-        _clear_pending()
         _confirmed_delete(source, entry)
     else:
         _confirmed_install(source, entry, prefix)
@@ -3081,7 +3373,8 @@ def _confirm_batch(source: CommandSource, pending: Dict[str, Any], prefix: str) 
     approved. Comparing a count would not do either: two swapped entries keep the count and
     change the work. Anything other than an exact match is dropped whole — running the
     intersection and reporting success would leave part of the batch silently undone, which is
-    worse than asking for the command again.
+    worse than asking for the command again. The plan was taken out of the slot by the caller
+    before this ran, so dropping it needs no second step.
     """
     kind = pending["kind"]
     report = _last_report
@@ -3093,13 +3386,11 @@ def _confirm_batch(source: CommandSource, pending: Dict[str, Any], prefix: str) 
         entries = list(report.awaiting_install) if report is not None else []
 
     if sorted(entry.file_name for entry in entries) != pending["files"]:
-        _clear_pending()
         source.reply(tr("command.action.stale_batch",
                         command="{} {}".format(prefix, kind.split("_", 1)[0])))
         return
 
     if kind == "download_all":
-        _clear_pending()
         _confirmed_download_all(source, entries, prefix)
     else:
         _confirmed_install_all(source, entries, prefix)
@@ -3157,6 +3448,26 @@ def _confirmed_download_all(
     ).start()
 
 
+def _begin_download(file_name: str) -> bool:
+    """Claim ``file_name`` for one transfer, or report that somebody else holds it.
+
+    Claimed on the *command* thread, before the reply, so "started" and "already running" are
+    decided once and decide the sentence the admin gets — rather than a message that depends on
+    which of two threads happened to win a race a moment later.
+    """
+    with _inflight_lock:
+        if file_name in _inflight_downloads:
+            return False
+        _inflight_downloads.add(file_name)
+        return True
+
+
+def _end_download(file_name: str) -> None:
+    """Release a claim taken by :func:`_begin_download`, whatever happened to the transfer."""
+    with _inflight_lock:
+        _inflight_downloads.discard(file_name)
+
+
 def _confirmed_download(
     source: CommandSource, entry: UpdateEntry, number: int, prefix: str
 ) -> None:
@@ -3164,8 +3475,17 @@ def _confirmed_download(
 
     Off MCDR's command thread because it is a multi-megabyte transfer: replying first and
     fetching behind is what keeps the server's own command handling responsive. Nothing needs a
-    lock — two downloads for different mods are independent, and the ledger is saved per file.
+    lock between two downloads of *different* mods, and the ledger is saved per file.
+
+    The same mod twice is a different matter, and that is what the claim below is for: two
+    admins, or one admin pressing enter twice, would otherwise open two connections for the same
+    bytes and race each other's ledger record. The second one is told so instead of being
+    silently served a second copy of the same work.
     """
+    if not _begin_download(entry.file_name):
+        source.reply(tr("command.download.in_flight", name=entry.name))
+        return
+
     source.reply(tr("command.download.started", name=entry.name,
                     version=entry.latest_version or "?"))
 
@@ -3179,6 +3499,10 @@ def _confirmed_download(
             _reply_to(source, tr("command.download.failed", name=entry.name,
                                  reason="{}: {}".format(type(error).__name__, error)))
             return
+        finally:
+            # Released as soon as the transfer is over, before the outcome is reported: a retry
+            # of the same mod should be possible the moment the reader is told it failed.
+            _end_download(entry.file_name)
         if outcome is None:
             _reply_to(source, tr("command.download.failed", name=entry.name,
                                  reason=tr("command.download.bad_folder")))
@@ -3262,11 +3586,9 @@ def _confirmed_install(
     if not ledger.approve(entry_key(entry)):
         # The record is written when the file lands, so this means the download folder was
         # emptied or the ledger edited by hand behind the plugin's back.
-        _clear_pending()
         source.reply(tr("command.install.no_record", name=entry.name))
         return
     ledger.save()
-    _clear_pending()
     source.reply(tr("command.install.approved", name=entry.name,
                     version=entry.latest_version or "?",
                     command="{} status".format(prefix)))
@@ -3294,7 +3616,6 @@ def _confirmed_install_all(
     for entry in entries:
         (approved if ledger.approve(entry_key(entry)) else missing).append(entry)
     ledger.save()
-    _clear_pending()
 
     if approved:
         source.reply(tr("command.install.all_approved", count=len(approved),
@@ -3405,29 +3726,31 @@ def _backup_state(directory: Any) -> str:
     return value
 
 
-def _show_status(source: CommandSource) -> None:
-    """What the plugin currently thinks the server is, and what it is configured to do.
+def _status_screen(
+    server: PluginServerInterface,
+    config: Config,
+    report: Optional[Report],
+    scan: Any,
+    context: Any,
+) -> RTextList:
+    """The whole status screen, from what has already been read. Draws nothing, reads nothing.
+
+    Split out of :func:`_show_status` so that everything the screen says can be tested without
+    a thread, a server or a mods folder: every fact it prints arrives as an argument, and the
+    only module state it touches is through functions that take the server (the config path, the
+    ledger count, the map file). That is also what makes it the second half of the two-stage
+    command — the stage that has no business on MCDR's command thread is the *scan*.
 
     One rich message rather than a line per ``reply`` call: the lines are a single screen, and
     building them as one ``RTextList`` is what lets colours and the title bar survive. (A
     ``server.logger`` call cannot do this — MCDR's log formatter stringifies its argument and
     ``RTextBase.__str__`` drops the colour, which is why the console paths log plain strings.)
-
-    Scanned **without hashing**, deliberately. This page shows a jar count, a directory and the
-    detected version; it has no use for a SHA-1, and computing one per jar would mean this
-    command reads a whole modpack off the disk — on MCDR's command thread, so the server waits
-    for it. A modpack of a few hundred megabytes measures at about a second, which is a second
-    of stall for a screen that only needed the file names.
     """
-    server = _server
-    if server is None:
-        return
-    scan, context = _scan_current(server, _config, hashes=False)
-
     modrinth_state = (
-        tr("command.status.enabled") if _config.sources.modrinth.enabled else tr("command.status.disabled")
+        tr("command.status.enabled") if config.sources.modrinth.enabled
+        else tr("command.status.disabled")
     )
-    automatic = _config.download.install_on_stop
+    automatic = config.download.install_on_stop
     if automatic:
         install_state, install_colour = tr("command.status.install_on"), RColor.yellow
     else:
@@ -3446,40 +3769,69 @@ def _show_status(source: CommandSource) -> None:
                loader=context.loader, source=context.mc_version_source),
             RColor.white,
         ),
-        "\n",
+    )
+    # 版本识别的降级说明：``server.get_server_information()`` 拿不到版本时（停服、老 MCDR），
+    # 版本是从日志或 Mod 元数据推出来的——那远不如服务端自己报的可靠，后果是所有 Mod 都可能被
+    # 判成「无适配构建」。这一行只在真的降级时出现，并把「怎么修」一起说了。
+    if context.mc_version and context.mc_version_source in ("log", "mods"):
+        parts.append("\n")
+        parts.append(
+            _field(
+                tr("command.status.version_guess_label"),
+                tr("command.status.version_guess", source=context.mc_version_source),
+                RColor.yellow,
+            )
+        )
+    parts.append("\n")
+    # A folder that could not be listed and a folder with no jars in it both report a count of
+    # zero, and only one of them is something the admin has to fix. Say which one this is.
+    unreadable = getattr(scan, "directory_error", "")
+    parts.append(
         _field(
             tr("command.status.mods_dir_label"),
-            tr("command.status.mods_dir", directory=scan.directory, count=len(scan.mods)),
-            RColor.white,
-        ),
+            tr("command.status.mods_unreadable", directory=scan.directory, error=unreadable)
+            if unreadable
+            else tr("command.status.mods_dir", directory=scan.directory, count=len(scan.mods)),
+            RColor.yellow if unreadable else RColor.white,
+        )
+    )
+    parts.append(
         # The file the rest of this page was read from. Nothing else in the plugin ever shows
         # it, and "which file is this server actually using" is otherwise unanswerable from
         # the player's side of the server — the question that made a config file somebody had
         # edited and an install the plugin had done look like two different things.
-        "\n",
+        "\n"
+    )
+    parts.append(
         _field(
             tr("command.status.config_label"),
             tr("command.status.config", path=_config_path(server)),
             RColor.white,
-        ),
-        "\n",
+        )
+    )
+    parts.append("\n")
+    parts.append(
         _field(tr("command.status.upstream_label"),
                tr("command.status.upstream", modrinth=modrinth_state),
-               RColor.white),
-        "\n",
+               RColor.white)
+    )
+    parts.append("\n")
+    parts.append(
         _field(
             tr("command.status.manual_map_label"),
             _manual_map_state(server),
             RColor.white,
-        ),
-        # The setting that changes files on this server belongs on the page that describes
-        # what the plugin is doing, not only in the config file.
-        "\n",
+        )
+    )
+    # The setting that changes files on this server belongs on the page that describes
+    # what the plugin is doing, not only in the config file.
+    parts.append("\n")
+    parts.append(
         _field(
             tr("command.status.install_label"),
             install_state,
             install_colour,
-        ),
+        )
     )
     # 备份这一类东西以前完全没有出现在任何界面上：管理员装了半年插件，mods/ 里堆着多少
     # 个 .old 只有他自己 ls 才知道。这一行是它在状态屏上的位置，list 里则是完整的行。
@@ -3491,26 +3843,26 @@ def _show_status(source: CommandSource) -> None:
             RColor.white,
         )
     )
-    if _config.check.ignored_mods:
+    if config.check.ignored_mods:
         parts.append("\n")
         parts.append(
             _field(
                 tr("command.status.ignored_label"),
-                tr("command.status.ignored", count=len(_config.check.ignored_mods),
-                   names=", ".join(_config.check.ignored_mods[:8])),
+                tr("command.status.ignored", count=len(config.check.ignored_mods),
+                   names=", ".join(config.check.ignored_mods[:8])),
                 RColor.white,
             )
         )
     parts.append("\n")
-    if _last_report is None:
+    if report is None:
         parts.append(_field(tr("command.status.last_report_label"),
                             tr("command.status.never_checked"), RColor.gray))
     else:
         parts.append(
             _field(
                 tr("command.status.last_report_label"),
-                tr("command.status.last_report", when=_last_report.generated_at,
-                   actionable=_last_report.actionable_count),
+                tr("command.status.last_report", when=report.generated_at,
+                   actionable=report.actionable_count),
                 RColor.white,
             )
         )
@@ -3519,16 +3871,83 @@ def _show_status(source: CommandSource) -> None:
         _field(
             tr("command.status.scheduling_label"),
             tr("command.status.scheduling",
-               on_start=tr("command.status.yes") if _config.check.on_server_start
+               on_start=tr("command.status.yes") if config.check.on_server_start
                else tr("command.status.no"),
-               hours=_config.check.interval_hours),
+               hours=config.check.interval_hours),
             RColor.white,
         )
     )
     # 这一屏没有可点可悬的东西，底栏就是一条闭合线——它把这块输出和后面别的输出分开。
     parts.append("\n")
     parts.append(_rule_line())
-    source.reply(parts)
+    return parts
+
+
+def _status_worker(source: CommandSource) -> None:
+    """Scan and reply — the half of ``!!muc status`` that must not run on the command thread.
+
+    The scan is deliberately made with ``hashes=False``: this page shows a jar count, a
+    directory and a detected version, and it has no use for a SHA-1 — computing one per jar
+    would mean reading every jar's bytes rather than its central directory. That switch is not
+    permission to do the reading *here*, though: ``scan_mods`` still opens every archive, and
+    MCDR runs every command callback on its one ``SyncTaskExecutor`` thread — the same thread
+    that dispatches every plugin event and every ``!!MCDR`` command. MCDR's watchdog starts
+    complaining (and rebuilding the executor) when that thread stops answering, and on a real
+    modpack this page is a second of reading for a screen that only wants a count.
+
+    The reply goes out from here on the normal ``source.reply`` path, which is the same path the
+    check command replies on and is safe from any thread (MCDR's own ``tell`` / console print
+    both are). What stays on the command thread is the acknowledgement, so a reader is never
+    left with silence wondering whether the command registered.
+    """
+    try:
+        server = _server
+        if server is None:
+            return
+        config = _config
+        report = _last_report
+        try:
+            scan, context = _scan_current(server, config, hashes=False)
+        except Exception as error:  # noqa: BLE001 - a status page is not worth a traceback
+            server.logger.warning(
+                "could not read the server state for the status page: {}: {}".format(
+                    type(error).__name__, error
+                )
+            )
+            source.reply(tr("command.status_failed",
+                            error="{}: {}".format(type(error).__name__, error)))
+            return
+        source.reply(_status_screen(server, config, report, scan, context))
+    finally:
+        _status_lock.release()
+
+
+def _show_status(source: CommandSource) -> Optional[threading.Thread]:
+    """``!!muc status`` — reply that the page is being built, then build it off-thread.
+
+    The shape of ``_trigger_check``: the acknowledgement is the command thread's whole job, and
+    everything that touches a disk belongs to the thread below. What made this different from
+    the check is that the answer is a *screen*, so the reading and the drawing are split —
+    :func:`_status_screen` takes everything it needs as arguments and can be rendered head-less.
+
+    Re-entry is refused rather than queued: two quick invocations would both read the whole
+    ``mods/`` folder to produce the same screen, and the second one is always a double tap.
+
+    Returns the worker thread, which is only for the tests to join; MCDR ignores a command
+    callback's return value.
+    """
+    server = _server
+    if server is None:
+        return None
+    if not _status_lock.acquire(blocking=False):
+        source.reply(tr("command.status_already_running"))
+        return None
+    source.reply(tr("command.status_started"))
+    thread = threading.Thread(
+        target=_status_worker, args=(source,), name="mod_update_checker_status", daemon=True
+    )
+    thread.start()
+    return thread
 
 
 def _reload_config(source: CommandSource) -> None:
@@ -3565,6 +3984,23 @@ def _plugin_title(server: Optional[PluginServerInterface]) -> Tuple[str, str]:
     return name, version
 
 
+def _title_bar_metrics(
+    server: Optional[PluginServerInterface] = None,
+) -> Tuple[str, str, int, int]:
+    """``(name, version, bars, total)`` — the title bar's arithmetic, in exactly one place.
+
+    ``bars`` is how many ``=`` go on each side, and ``total`` is what the bar therefore draws:
+    ``2 * bars + len(core) + 4``. The closing rule is sized to the same ``total`` rather than
+    recomputing it from ``_TITLE_WIDTH`` (the two differ by one column whenever the arithmetic
+    leaves a remainder), which is what makes a screen's top and bottom edges line up — and why
+    both of them have to come from here rather than from two copies of the sum.
+    """
+    name, version = _plugin_title(server)
+    core = "{} v{}".format(name, version) if version else name
+    bars = max(_TITLE_BAR_MIN, (_TITLE_WIDTH - len(core) - 4) // 2)
+    return name, version, bars, 2 * bars + len(core) + 4
+
+
 def _title_line(server: Optional[PluginServerInterface] = None) -> RTextList:
     """``========  Mod Update Checker v1.0.0  ========`` — the name and version read from
     the plugin metadata, so the example above is just a shape, not a version to keep in step.
@@ -3573,9 +4009,7 @@ def _title_line(server: Optional[PluginServerInterface] = None) -> RTextList:
     very short name still looks deliberate. Name and version are coloured differently because
     the version is the part an admin is usually looking for when they report a problem.
     """
-    name, version = _plugin_title(server)
-    core = "{} v{}".format(name, version) if version else name
-    bars = max(_TITLE_BAR_MIN, (_TITLE_WIDTH - len(core) - 4) // 2)
+    name, version, bars, _total = _title_bar_metrics(server)
     rule = "=" * bars
     line = RTextList(RText(rule, RColor.gold), "  ", RText(name, RColor.aqua))
     if version:
@@ -3585,24 +4019,56 @@ def _title_line(server: Optional[PluginServerInterface] = None) -> RTextList:
     return line
 
 
+def _fit_rule_caption(caption: str, limit: int) -> str:
+    """``caption`` cut to at most ``limit`` columns, ending in an ellipsis.
+
+    Measured with :func:`report.display_width` — the same model the rule's arithmetic uses —
+    so the cut cannot disagree with the sum that asked for it, and a Chinese caption is not
+    silently cut half a character short of where the line says it ends.
+    """
+    if limit <= 0:
+        return ""
+    if display_width(caption) <= limit:
+        return caption
+    if display_width(ELLIPSIS) > limit:
+        return ""
+    kept = ""
+    used = 0
+    for char in caption:
+        char_width = display_width(char)
+        if used + char_width + display_width(ELLIPSIS) > limit:
+            break
+        kept += char
+        used += char_width
+    return kept + ELLIPSIS
+
+
 def _rule_line(caption: str = "") -> RTextList:
     """``========  caption  ========`` — the plain rule every screen now closes with.
 
-    Sized to the **title bar's own total width** (computed from the same name and version, not
-    from ``_TITLE_WIDTH`` — the two differ by a space when the bar's arithmetic leaves a
-    remainder), so the top and bottom edges of a screen line up.
+    Sized to the **title bar's own total width**, from the same helper the bar itself uses, so
+    the top and bottom edges of a screen line up whatever the plugin is called and whatever
+    version it is.
 
     With no caption it is a plain run of ``=``; with one it carries the reminder that belongs
     at the bottom of that screen — the listing says which of its parts can be hovered and which
     can be clicked. Callers pass a caption only where the reader has a mouse: on the console
     the same sentence would be describing things a terminal cannot do, so the rule stays plain.
+
+    A caption too wide for the bar is **cut**, not allowed to push the bar wider. The floor on
+    each side used to do the opposite: once the caption no longer fit, ``max(_TITLE_BAR_MIN, …)``
+    on each side started *adding* columns, so the line grew past the title bar exactly when it
+    needed to stay inside it. Cutting is the honest failure — the reader still gets the
+    sentence, shortened, on a line that matches the screen — and the alternative, a caption
+    silently dropping off the end, would hide that a translation needs shortening.
     """
-    name, version = _plugin_title(_server)
-    core = "{} v{}".format(name, version) if version else name
-    total = 2 * max(_TITLE_BAR_MIN, (_TITLE_WIDTH - len(core) - 4) // 2) + len(core) + 4
+    _name, _version, _bars, total = _title_bar_metrics(_server)
     if not caption:
         return RTextList(RText("=" * total, RColor.gold))
     room = total - display_width(caption) - 4
+    if room < 2 * _TITLE_BAR_MIN:
+        caption = _fit_rule_caption(caption, total - 2 * _TITLE_BAR_MIN - 4)
+        room = total - display_width(caption) - 4
     left = max(_TITLE_BAR_MIN, room // 2)
     right = max(_TITLE_BAR_MIN, room - left)
     return RTextList(
@@ -3785,6 +4251,11 @@ def _trigger_check(source: CommandSource) -> None:
     ).start()
 
 
+# --------------------------------------------------------------------------------------
+# The command tree and its completions
+# --------------------------------------------------------------------------------------
+
+
 def _suggest_handles(pick: Any, include_all: bool = False) -> Any:
     """A completion provider for a command that takes a mod handle.
 
@@ -3889,7 +4360,9 @@ def _command_tree(prefix: str):
             Literal("delete")
             # 裸 delete 给用法，和 info / download / install 一致：只说 "delete" 没说删什么，
             # 唯一能确定的事就是他还需要知道语法。
-            .runs(lambda source: source.reply(tr("command.delete.usage", command=prefix)))
+            .runs(lambda source: source.reply(tr("command.delete.usage",
+                                                 command=prefix,
+                                                 cleanup="{} cleanup".format(prefix))))
             .then(
                 GreedyText("target").suggests(
                     _suggest_handles(lambda report: report.backups, include_all=True)
@@ -3925,7 +4398,7 @@ def _register_commands(server: PluginServerInterface) -> None:
 
 
 def on_load(server: PluginServerInterface, prev_module: Any) -> None:
-    global _config, _last_report, _server, _online_players
+    global _config, _last_report, _last_server_running, _server, _online_players
 
     _server = server
 
@@ -3955,6 +4428,19 @@ def on_load(server: PluginServerInterface, prev_module: Any) -> None:
     _stop_event.clear()
     _config = _load_config(server)
 
+    # ``report`` is a sibling module of this one, and MCDR's reload only builds a fresh copy of
+    # the *entry* module — so anything cached over there outlives the reload. Its column widths
+    # are cached per language, which is not enough to notice that a new version of the plugin
+    # shipped a changed label for the same language: the columns would keep the old measurements
+    # and lean over with nothing in the log. One line here removes the whole class of staleness.
+    reset_cell_width_cache()
+    # Same reasoning for a claim left behind by a download thread that was interrupted by the
+    # reload: no transfer is running any more, so no name is in flight.
+    with _inflight_lock:
+        _inflight_downloads.clear()
+    # And the last thing ``is_server_running`` said describes the module that is being replaced.
+    _last_server_running = True
+
     _register_commands(server)
 
     if not _config.enabled:
@@ -3978,10 +4464,18 @@ def on_load(server: PluginServerInterface, prev_module: Any) -> None:
                 tr("console.no_mods_directory", directory=str(directory))
             )
         else:
-            jars, _disabled = iter_mod_jars(directory)
-            server.logger.info(
-                tr("console.loaded", count=len(jars), directory=str(directory))
-            )
+            # "could not be listed" and "holds no jars" are different answers that both count
+            # zero here; asking for the reason is one extra directory listing and no jar reads.
+            unreadable = directory_error(directory)
+            if unreadable:
+                server.logger.warning(
+                    tr("console.mods_unreadable", directory=str(directory), error=unreadable)
+                )
+            else:
+                jars, _disabled = iter_mod_jars(directory)
+                server.logger.info(
+                    tr("console.loaded", count=len(jars), directory=str(directory))
+                )
     except Exception as error:  # noqa: BLE001 - a broken mods folder is not fatal
         server.logger.warning("could not inspect the mods folder: {}".format(error))
 
@@ -4029,6 +4523,9 @@ def on_unload(server: PluginServerInterface) -> None:
 def on_server_startup(server: PluginServerInterface) -> None:
     if not _config.enabled:
         return
+    # Before anything else, and before the startup check's delay is waited out: a stop set the
+    # stop event, which is what ends both the interval loop and that delay.
+    _resume_after_stop(server)
     # What the last stop replaced. Announced here rather than at install time because there is
     # nobody listening while the server is down.
     _announce_install_reminder(server)
@@ -4041,6 +4538,7 @@ def on_server_stop(server: PluginServerInterface, server_return_code: int) -> No
     # A pending startup check would otherwise fire against a stopped server and report
     # nonsense; the event is also the natural point to drop stale player state, and a staged
     # ``!!muc confirm`` — whose whole point is that it is acted on now, not at some later stop.
+    _stop_event.set()
     _online_players.clear()
     _clear_pending()
 
