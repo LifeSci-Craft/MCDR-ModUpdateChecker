@@ -5,10 +5,37 @@ on:
     branches: [main]
   pull_request:
 
+# Nothing here needs to write to the repository, and the unit job executes whatever the tree
+# contains — so the token is narrowed rather than left at the repository default.
+permissions:
+  contents: read
+
+# A second push to the same branch makes the first run pointless; the artifact job rewrites
+# source files to prove the packer normalises line endings, so overlapping runs are worse than
+# useless.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  lint:
+    name: lint (ruff)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install ruff
+        run: python -m pip install "ruff==0.17.0"
+      - name: Lint
+        run: ruff check .
+
   unit:
     name: unit tests (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -26,6 +53,37 @@ jobs:
       - name: Run the suite
         run: PYTHONPATH=.testlibs python -m pytest -m "not e2e"
 
+  python-floor:
+    # `ruff.toml` sets target-version = py38 because that is MCDR 2.13.0's floor, but a config
+    # file is not a check and no job above runs an interpreter that old. This job is the check:
+    # every file must parse as 3.8 and use no newer annotation or standard-library name.
+    name: Python 3.8 floor
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Every file still runs on the declared floor
+        run: python tools/check_python_floor.py
+
+  mutation:
+    # The suite passing is not the same as the suite having teeth. Each mutation below breaks one
+    # guard in a temporary copy of the repository and must be caught by the tests named with it.
+    name: mutation check
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install test dependencies
+        run: python -m pip install --target .testlibs -r tests/requirements-test.txt
+      - name: Every mutation must be caught by at least one test
+        run: python tools/mutation_check.py
+
   mcdr-matrix:
     # The headline claim is "works on MCDR 2.13.0 and newer", and it is only worth anything if
     # it is tested against real MCDR releases rather than asserted. One job per version, each
@@ -33,6 +91,7 @@ jobs:
     # automatic check and every command including the alias.
     name: real MCDR ${{ matrix.mcdr }}
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -56,10 +115,11 @@ jobs:
 
   artifact:
     # `.mcdr` is built from the tag and attached to a release, so "rebuild it from the source
-    # and compare the hash" has to actually work. The packer pins zip timestamps and
-    # permissions for exactly that reason; this job is what keeps it true.
+    # and compare the hash" has to actually work. The packer pins zip timestamps, permissions
+    # and line endings for exactly that reason; this job is what keeps it true.
     name: the artifact is reproducible and loadable
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

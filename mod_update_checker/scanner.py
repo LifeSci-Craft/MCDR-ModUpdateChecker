@@ -26,6 +26,7 @@ import json
 import logging
 import re
 import zipfile
+import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -35,18 +36,29 @@ from .versioning import RangeSpec, normalize_spec
 
 __all__ = [
     "MOD_METADATA_ENTRIES",
+    "METADATA_SIZE_LIMIT",
     "PLATFORM_MOD_IDS",
     "ModMetadata",
     "ScannedMod",
     "ScanResult",
     "resolve_mods_directory",
     "iter_mod_jars",
+    "read_metadata",
+    "read_metadata_error",
     "scan_jar",
     "scan_mods",
     "missing_dependencies",
 ]
 
 _LOGGER = logging.getLogger(__name__)
+
+#: Largest metadata entry this plugin will unpack. Real ``fabric.mod.json`` and ``mods.toml``
+#: files are a few kilobytes; the largest seen in the wild are well under a hundred. The limit
+#: exists because ``ZipFile.read`` allocates the size the entry *declares*, so a 20 KiB jar can
+#: ask for 20 MiB in one go and a ~1 MiB jar for a gigabyte — measured, and a memory spike is
+#: not something a scan should be able to cause on a live server. Four mebibytes is ~40x the
+#: biggest real file and still bounded, and it is checked before a single byte is decompressed.
+METADATA_SIZE_LIMIT = 4 * 1024 * 1024
 
 #: Recognised metadata files, most specific first. The loader name is derived from which
 #: one was found, which is more reliable than guessing from the file name.
@@ -173,6 +185,19 @@ class ScanResult:
     directory: str
     mods: List[ScannedMod] = field(default_factory=list)
     disabled: List[str] = field(default_factory=list)
+    #: Why the folder itself could not be read, when that happened. Empty in every other case,
+    #: including the ordinary one of a folder that does not exist yet.
+    #:
+    #: It is a separate field rather than an entry in ``mods`` because "the directory could not
+    #: be listed" and "the directory holds no jars" are different answers, and a caller has to be
+    #: able to tell them apart: one is a permission problem for the admin to fix, the other is a
+    #: server with nothing installed. Both produce an empty list, so the list alone cannot say.
+    directory_error: str = ""
+
+    @property
+    def directory_readable(self) -> bool:
+        """Whether ``mods/`` could be listed at all."""
+        return not self.directory_error
 
     @property
     def identified(self) -> List[ScannedMod]:
@@ -223,13 +248,48 @@ def iter_mod_jars(directory: Path) -> Tuple[List[Path], List[str]]:
     Only ``*.jar`` is treated as installed. ``*.disabled`` / ``*.old`` / ``*.bak`` are
     counted separately: they are usually a previous version that was renamed out of the way,
     and including them would double-report every mod.
+
+    A directory that cannot be listed is an empty result rather than an exception: ``mods/``
+    can be stat-able and still unreadable — held exclusively by another process on Windows, an
+    ACL that was changed, an antivirus scanning it, a sync client mid-upload — and ``iterdir``
+    raises ``OSError`` for all of them. Letting it out means the whole check becomes one line in
+    the log, with no report at all, for a folder the plugin could still describe as unreadable.
+
+    The reason is deliberately **not** a third return value. This function has callers outside
+    ``scanner`` that unpack exactly two names, and widening the tuple turns every one of them
+    into a ``ValueError``; :func:`scan_mods` reports the failure through
+    :attr:`ScanResult.directory_error` instead, where it costs nothing and cannot break a caller.
     """
+    jars, disabled, _failure = _iter_mod_jars(directory)
+    return jars, disabled
+
+
+def directory_error(directory: Path) -> str:
+    """Why ``directory`` could not be listed, or an empty string when it could.
+
+    The cheap companion to :func:`iter_mod_jars` for callers that want a *count* rather than the
+    files: ``scan_mods`` can report the same failure, but it opens every jar to do so, which is
+    far too much work for a startup line. Without this, "there is no mods folder yet" and "your
+    mods folder cannot be read" both reach the console as a jar count of zero.
+    """
+    return _iter_mod_jars(directory)[2]
+
+
+def _iter_mod_jars(directory: Path) -> Tuple[List[Path], List[str], str]:
+    """``iter_mod_jars`` plus the reason the directory could not be listed, if it could not."""
     if not directory.is_dir():
-        return [], []
+        return [], [], ""
 
     jars: List[Path] = []
     disabled: List[str] = []
-    for entry in sorted(directory.iterdir(), key=lambda item: item.name.lower()):
+    try:
+        entries = sorted(directory.iterdir(), key=lambda item: item.name.lower())
+    except OSError as error:
+        # Emphatically not the same answer as "no jars": see :attr:`ScanResult.directory_error`,
+        # which :func:`scan_mods` sets so the caller can tell the two apart.
+        return [], [], "{}: {}".format(type(error).__name__, error)
+
+    for entry in entries:
         if not entry.is_file():
             continue
         lowered = entry.name.lower()
@@ -240,7 +300,7 @@ def iter_mod_jars(directory: Path) -> Tuple[List[Path], List[str]]:
             for suffix in (".jar.disabled", ".jar.old", ".jar.bak", ".jar~")
         ):
             disabled.append(entry.name)
-    return jars, disabled
+    return jars, disabled, ""
 
 
 # --------------------------------------------------------------------------------------
@@ -249,7 +309,14 @@ def iter_mod_jars(directory: Path) -> Tuple[List[Path], List[str]]:
 
 
 def _loads_lenient(raw: str) -> Any:
-    """Parse JSON, then retry after stripping the JSON5-isms that turn up in the wild."""
+    """Parse JSON, then retry after stripping the JSON5-isms that turn up in the wild.
+
+    Refuses anything over :data:`METADATA_SIZE_LIMIT` up front as well. The entry's declared
+    uncompressed size is checked before this runs, so this is the second half of one boundary
+    rather than a duplicate: it is also the only bound on the work ``json.loads`` is asked to do.
+    """
+    if len(raw) > METADATA_SIZE_LIMIT:
+        raise ValueError("metadata entry is too large to parse")
     try:
         return json.loads(raw)
     except ValueError:
@@ -577,15 +644,34 @@ def _count_nested_jars(names: Iterable[str]) -> int:
 
 
 def read_metadata(archive: zipfile.ZipFile) -> Optional[ModMetadata]:
-    """Extract mod metadata from an open jar, or ``None`` if nothing recognisable is there."""
+    """Extract mod metadata from an open jar, or ``None`` if nothing recognisable is there.
+
+    ``None`` covers two different situations — a valid jar that carries no metadata at all, and
+    a jar whose metadata is *listed* but cannot be unpacked — and the caller has to be able to
+    tell them apart: the first is a library, the second is a broken file worth reporting.
+    :func:`scan_jar` recovers the difference by asking :func:`read_metadata_error` afterwards,
+    which is one extra ``namelist`` and no extra decompression.
+    """
     names = archive.namelist()
     available = set(names)
     for entry, loader in MOD_METADATA_ENTRIES:
         if entry not in available:
             continue
         try:
+            info = archive.getinfo(entry)
+            if info.file_size > METADATA_SIZE_LIMIT:
+                # A metadata entry that claims to be enormous is not something to unpack, no
+                # matter what its compressed size is: a 20 KiB file can declare 20 MiB and
+                # ``ZipFile.read`` allocates the declared size in one go. This runs once per jar
+                # from the check thread, so an absurd entry is a memory spike that can stall or
+                # kill the server for a file nobody asked it to read.
+                continue
             raw = archive.read(entry).decode("utf-8", errors="replace")
-        except (KeyError, OSError, zipfile.BadZipFile):
+        except (KeyError, OSError, RuntimeError, zipfile.BadZipFile, zlib.error):
+            # ``RuntimeError`` is what ``zipfile`` raises for an entry whose encryption bit is
+            # set, and ``zlib.error`` is a corrupt deflate stream — which is exactly what a jar
+            # copied while the download was still running looks like. ``BadZipFile`` covers
+            # neither, so without these two the "never raises" contract has a hole in it.
             continue
 
         metadata: Optional[ModMetadata] = None
@@ -613,8 +699,46 @@ def read_metadata(archive: zipfile.ZipFile) -> Optional[ModMetadata]:
     return None
 
 
+def read_metadata_error(archive: zipfile.ZipFile) -> str:
+    """Why the jar's metadata could not be read, or ``""`` when it could.
+
+    Called only after :func:`read_metadata` has answered ``None``, so this walks the same four
+    names and finds the same condition rather than repeating the read: a metadata entry that is
+    present but unreadable, or one that declares a size past :data:`METADATA_SIZE_LIMIT`. A jar
+    that simply carries no metadata file — a library, a datapack, a stray download — returns
+    ``""``, which is not a failure.
+    """
+    try:
+        available = set(archive.namelist())
+    except (OSError, RuntimeError, zipfile.BadZipFile, zlib.error) as error:
+        return "cannot list the archive contents ({}: {})".format(type(error).__name__, error)
+
+    for entry, _loader in MOD_METADATA_ENTRIES:
+        if entry not in available:
+            continue
+        try:
+            info = archive.getinfo(entry)
+        except (KeyError, OSError) as error:
+            return "the {} entry cannot be read ({}: {})".format(entry, type(error).__name__, error)
+        if info.file_size > METADATA_SIZE_LIMIT:
+            return "{} declares {} bytes, over the {} byte limit".format(
+                entry, info.file_size, METADATA_SIZE_LIMIT
+            )
+        try:
+            archive.read(entry)
+        except (KeyError, OSError, RuntimeError, zipfile.BadZipFile, zlib.error) as error:
+            return "{} cannot be unpacked ({}: {})".format(entry, type(error).__name__, error)
+    return ""
+
+
 def scan_jar(path: Path, hashes: bool = True) -> ScannedMod:
     """Hash one jar and read its metadata. Never raises.
+
+    "Never" includes the ways a *zip* can be broken rather than merely absent: an entry with the
+    encryption bit set (``RuntimeError``), a deflate stream that does not decompress
+    (``zlib.error``), a truncated central directory (``BadZipFile``). All of them become
+    ``ScannedMod.error``, because one unreadable file in ``mods/`` is a fact to report and not a
+    reason to produce no report at all.
 
     :param hashes: when ``False``, the file's bytes are never read — the size comes from
         ``stat`` and ``sha1`` is left empty. Callers that only want to describe a folder
@@ -641,7 +765,15 @@ def scan_jar(path: Path, hashes: bool = True) -> ScannedMod:
     try:
         with zipfile.ZipFile(mod.path) as archive:
             mod.metadata = read_metadata(archive)
-    except (zipfile.BadZipFile, OSError) as error:
+            if mod.metadata is None:
+                # ``None`` is also what a valid jar with no metadata looks like, so ask why
+                # before calling it either way. A jar whose ``fabric.mod.json`` is *there* and
+                # unreadable is a broken file, and saying so is the difference between an admin
+                # replacing it and an admin wondering why a mod silently does nothing.
+                failure = read_metadata_error(archive)
+                if failure:
+                    mod.error = "unreadable metadata ({})".format(failure)
+    except (OSError, RuntimeError, zipfile.BadZipFile, zlib.error) as error:
         mod.error = "not a readable jar ({}: {})".format(type(error).__name__, error)
         return mod
 
@@ -656,14 +788,23 @@ def scan_mods(
 ) -> ScanResult:
     """Scan a ``mods/`` folder. Missing directory yields an empty, well-formed result.
 
+    A directory that exists but cannot be listed also yields an empty result — with
+    :attr:`ScanResult.directory_error` set, so the caller can say "I could not read your mods
+    folder" instead of "you have no mods". Never raises.
+
     :param hashes: passed through to :func:`scan_jar`. ``False`` gives the same list of jars
         with the same metadata and no bytes read, for the callers that are describing the
         folder rather than identifying its contents.
     """
     log = logger or _LOGGER
     result = ScanResult(directory=str(directory))
-    jars, disabled = iter_mod_jars(directory)
+    jars, disabled, failure = _iter_mod_jars(directory)
     result.disabled = disabled
+    result.directory_error = failure
+    if failure:
+        # Said out loud here as well as reported through the result: this is the log line an
+        # admin will actually read, and it names the folder and the reason in one place.
+        log.warning("could not list the mods directory %s: %s", directory, failure)
 
     for jar in jars:
         try:

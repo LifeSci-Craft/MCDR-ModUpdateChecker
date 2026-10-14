@@ -7,10 +7,12 @@ nothing.
 """
 
 import hashlib
+import struct
 import zipfile
 from pathlib import Path
 
 from mod_update_checker.scanner import (
+    METADATA_SIZE_LIMIT,
     _metadata_from_toml_regex,
     _toml_string_list,
     _toml_value,
@@ -23,6 +25,41 @@ from mod_update_checker.scanner import (
 )
 
 from support import fabric_metadata, write_jar, write_plain_file
+
+
+def _set_central_directory_sizes(path: Path, uncompressed: int) -> None:
+    """Rewrite the *declared* uncompressed size of every central-directory entry.
+
+    The declared size is what ``ZipFile.getinfo().file_size`` reports and what ``read`` used to
+    allocate against, so this is how a small jar claims to hold a huge metadata file — the shape
+    of the memory spike the size limit exists for. Walked record by record rather than searched
+    for, because the file *contents* may contain the signature bytes.
+    """
+    raw = bytearray(path.read_bytes())
+    start = raw.find(b"PK\x01\x02")
+    while start != -1:
+        name_length, extra_length, comment_length = struct.unpack_from("<HHH", raw, start + 28)
+        struct.pack_into("<I", raw, start + 24, uncompressed)
+        start = raw.find(
+            b"PK\x01\x02", start + 46 + name_length + extra_length + comment_length
+        )
+    path.write_bytes(bytes(raw))
+
+
+def _encrypt_every_entry(path: Path) -> None:
+    """Set the encryption bit on every entry, which ``zipfile`` refuses to read.
+
+    Both copies of the flag matter: ``zipfile`` checks the central-directory one when the entry
+    is opened, and the local header one when the bytes are read.
+    """
+    raw = bytearray(path.read_bytes())
+    for signature, offset in ((b"PK\x03\x04", 6), (b"PK\x01\x02", 8)):
+        start = raw.find(signature)
+        while start != -1:
+            flags = struct.unpack_from("<H", raw, start + offset)[0]
+            struct.pack_into("<H", raw, start + offset, flags | 0x1)
+            start = raw.find(signature, start + 4)
+    path.write_bytes(bytes(raw))
 
 MODS_TOML = """\
 modLoader="javafml"
@@ -111,6 +148,54 @@ def test_iter_mod_jars(tmp_path):
 
 def test_iter_mod_jars_on_a_missing_directory():
     assert iter_mod_jars(Path("does/not/exist")) == ([], [])
+
+
+def test_iter_mod_jars_swallows_a_directory_it_cannot_list(tmp_path, monkeypatch):
+    """``mods/`` that can be stat-ed but not listed is not the same as ``mods/`` with no jars.
+
+    On Windows that happens whenever something else holds the folder — an antivirus scan, a
+    sync client, an editor — and on any platform when the ACL or the permission bits say so.
+    ``iterdir`` raises ``OSError`` for all of them, and letting it out turned the whole check
+    into a single "check failed" line: no report, no list, nothing an admin could act on.
+
+    The return shape stays a two-tuple on purpose: ``__init__.py`` unpacks exactly two names.
+    The reason travels on :class:`ScanResult`, which does not change any caller's contract.
+    """
+    directory = tmp_path / "mods"
+    directory.mkdir()
+
+    def denied(_self):
+        raise PermissionError(13, "Access is denied")
+
+    monkeypatch.setattr("pathlib.Path.iterdir", denied)
+
+    assert iter_mod_jars(directory) == ([], [])
+
+
+def test_scan_mods_reports_an_unreadable_directory_without_raising(tmp_path, monkeypatch):
+    """The empty result must be distinguishable from an empty folder, or the advice is wrong."""
+    directory = tmp_path / "mods"
+    directory.mkdir()
+
+    def denied(_self):
+        raise PermissionError(13, "Access is denied")
+
+    monkeypatch.setattr("pathlib.Path.iterdir", denied)
+
+    scan = scan_mods(directory)
+
+    assert scan.mods == []
+    assert scan.directory_readable is False
+    assert "PermissionError" in scan.directory_error
+
+
+def test_scan_mods_says_a_missing_directory_is_not_a_failure(tmp_path):
+    """Not every empty scan is a problem: a folder that does not exist yet is the first run."""
+    scan = scan_mods(tmp_path / "not-there")
+
+    assert scan.mods == []
+    assert scan.directory_readable is True
+    assert scan.directory_error == ""
 
 
 # --------------------------------------------------------------------------------------
@@ -344,10 +429,111 @@ def test_one_bad_jar_does_not_stop_the_scan(tmp_path, caplog):
     assert len(result.unidentified) == 1
 
 
+def test_an_encrypted_entry_is_reported_as_a_broken_jar(tmp_path):
+    """``zipfile`` raises ``RuntimeError`` for an entry with the encryption bit set.
+
+    That is not a ``BadZipFile``, so the ``except`` clause used to miss it — and the docstring
+    promises ``scan_jar`` never raises. It must also not be *silently* downgraded to "a jar with
+    no metadata": the mod is installed, does nothing, and the admin is told nothing. So the
+    ``error`` field carries it, exactly as an unreadable file would.
+    """
+    path = write_jar(tmp_path / "encrypted.jar", fabric=fabric_metadata(id="secret"))
+    _encrypt_every_entry(path)
+
+    mod = scan_jar(path)
+
+    assert mod.identified is False
+    assert mod.metadata is None
+    assert mod.error is not None
+    assert "RuntimeError" in mod.error or "encrypted" in mod.error
+    assert len(mod.sha1) == 40, "the file is still hashed, so it can still be looked up"
+
+
+def test_a_corrupt_deflate_stream_is_reported_as_a_broken_jar(tmp_path):
+    """``zlib.error`` is what a jar copied while it was still being written looks like.
+
+    It is also the one corruption ``BadZipFile`` does **not** cover: the central directory is
+    intact, only the compressed bytes are wrong.
+    """
+    path = write_jar(tmp_path / "half-copied.jar",
+                     fabric=fabric_metadata(id="torn", description="x" * 4000))
+    raw = bytearray(path.read_bytes())
+    data_start = raw.index(b"PK\x03\x04")
+    # Corrupt the compressed payload without touching the headers, so the entry is still listed
+    # correctly and only the deflate stream is broken.
+    payload_start = data_start + 30 + len("fabric.mod.json")
+    for offset in range(payload_start + 4, min(payload_start + 40, len(raw) - 1)):
+        raw[offset] ^= 0xFF
+    path.write_bytes(bytes(raw))
+
+    mod = scan_jar(path)
+
+    assert mod.identified is False
+    assert mod.error is not None
+    assert len(mod.sha1) == 40
+
+
+def test_a_jar_with_no_metadata_at_all_is_not_an_error(tmp_path):
+    """The distinction the ``error`` field has to keep: a library is not a broken file."""
+    path = write_jar(tmp_path / "library.jar", fabric=None,
+                     extra_entries={"com/example/Lib.class": b"\xca\xfe\xba\xbe"})
+
+    mod = scan_jar(path)
+
+    assert mod.identified is False
+    assert mod.error is None
+
+
+def test_an_enormous_declared_metadata_entry_is_not_unpacked(tmp_path, monkeypatch):
+    """A 20 KiB jar can declare 20 MiB, and ``ZipFile.read`` allocates the declared size.
+
+    The declared size is checked before a single byte is decompressed, so this asserts the
+    mechanism (``read`` was never called for the entry) as well as the outcome.
+    """
+    path = write_jar(tmp_path / "bomb.jar", fabric=fabric_metadata(id="bomb"))
+    _set_central_directory_sizes(path, 20 * 1024 * 1024)
+
+    calls = []
+    original = zipfile.ZipFile.read
+
+    def watching(self, name, *args, **kwargs):
+        calls.append(name)
+        return original(self, name, *args, **kwargs)
+
+    monkeypatch.setattr(zipfile.ZipFile, "read", watching)
+
+    mod = scan_jar(path)
+
+    assert calls == [], "an oversized entry was decompressed anyway"
+    assert mod.metadata is None
+    assert mod.identified is False
+    assert mod.error is not None
+    assert "over the" in mod.error
+
+
+def test_a_metadata_entry_just_under_the_limit_is_still_read(tmp_path):
+    """The boundary has to be above real files, or the limit itself loses mods.
+
+    A ``fabric.mod.json`` of a quarter of a mebibyte is already absurd, and it must still parse:
+    the limit exists for decompression bombs, not for wordy descriptions.
+    """
+    path = write_jar(
+        tmp_path / "wordy.jar",
+        fabric=fabric_metadata(id="wordy", description="d" * (256 * 1024)),
+    )
+
+    mod = scan_jar(path)
+
+    assert mod.identified is True
+    assert mod.mod_id == "wordy"
+    assert METADATA_SIZE_LIMIT > 256 * 1024
+
+
 def test_scan_mods_on_a_missing_directory(tmp_path):
     result = scan_mods(tmp_path / "nope")
     assert result.mods == []
     assert result.disabled == []
+    assert result.directory_readable is True
 
 
 def test_scan_mods_reports_disabled_jars_separately(tmp_path):

@@ -46,10 +46,13 @@ SRC = Path(__file__).resolve().parent
 # "this timestamp carries no information".
 FIXED_ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 
+#: Trimmed to its latest section on the way into the artifact (see ``packaged_changelog``).
+CHANGELOG_NAME = "CHANGELOG.md"
+
 ROOT_FILES = {
     "mcdreforged.plugin.json",
     "LICENSE",
-    "CHANGELOG.md",
+    CHANGELOG_NAME,
 }
 
 # Code package: same name as the plugin id.
@@ -196,6 +199,29 @@ def packaged_bytes(path: Path) -> bytes:
     return data
 
 
+def packaged_changelog(path: Path) -> bytes:
+    """The changelog as it ships: **only the latest release section**.
+
+    The artifact is supposed to carry one release's notes (older ones live on the release
+    page) — this is what makes that true rather than merely intended. v1.6.0 shipped a
+    28,363-byte changelog with 1.0.0–1.6.0 in it, whose own header said the file keeps only
+    the latest version, which is 29.4% of that artifact and a direct contradiction of
+    :data:`ROOT_FILES`' description. Trimming here means the repository file may accumulate
+    history without the artifact growing, and the guard below makes an empty or unparsable
+    changelog fail the pack instead of shipping silently.
+    """
+    text = packaged_bytes(path).decode("utf-8")
+    lines = text.splitlines(keepends=True)
+    headings = [index for index, line in enumerate(lines) if line.startswith("## ")]
+    if not headings:
+        raise SystemExit("{} carries no '## <version>' section".format(path.name))
+    if len(headings) > 1:
+        text = "".join(lines[: headings[1]])
+    if sum(1 for line in text.splitlines() if line.startswith("## ")) != 1:
+        raise SystemExit("{} did not trim to a single release".format(path.name))
+    return text.encode("utf-8")
+
+
 def build(out_path: Path) -> Path:
     files = collect()
     if not files:
@@ -216,7 +242,12 @@ def build(out_path: Path) -> Path:
     with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
         for path in files:
             rel = path.relative_to(SRC).as_posix()
-            data = packaged_source(path) if path.suffix == ".py" else packaged_bytes(path)
+            if path.suffix == ".py":
+                data = packaged_source(path)
+            elif path.name == CHANGELOG_NAME:
+                data = packaged_changelog(path)
+            else:
+                data = packaged_bytes(path)
             # Hand-built ZipInfo rather than archive.write(): mtime, permission bits and
             # host system all have to be pinned, or the same source packs into different
             # bytes on a different day (or a different OS).

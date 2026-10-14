@@ -10,12 +10,13 @@ So the plugin can report them, and — only after an admin says so — remove th
 Two rules stand between that sentence and somebody's ``mods/`` folder. The first is a config
 switch and lives upstream (``cleanup.allow_delete``, off by default: the plugin removes nothing
 at all until an admin turns it on, and the reminder sits behind it too). The second is this
-module's, and it is the one that decides *what*: **only names this plugin itself creates are
-ever touched.** :func:`is_backup_name` is that rule, and every write path goes through it,
-including the one that deletes: the name is checked again at the moment of removal, not only
-when the list was built. Everything else in ``mods/`` — hand-installed jars, ``.disabled``
-files, someone else's ``.bak`` — is invisible to this module, and a request to delete one of
-those is refused rather than honoured.
+module's, and it is the one that decides *what*: **only names that follow this plugin's own
+backup naming rule are ever touched** — ``<name>.jar.old``, ``<name>.jar.old.2``, and nothing
+that is a path or carries anything else. :func:`is_backup_name` is that rule, and every write
+path goes through it, including the one that deletes: the name is checked again at the moment
+of removal, not only when the list was built. Everything else in ``mods/`` — hand-installed
+jars, ``.disabled`` files, someone else's ``.bak`` — is invisible to this module, and a request
+to delete one of those is refused rather than honoured.
 
 Ages come from the file's modification time, which is only meaningful because the installer
 :func:`~os.utime`\\s a backup the moment it creates it: a rename preserves the timestamp of the
@@ -51,7 +52,13 @@ BACKUP_SUFFIX = ".old"
 #:
 #: The ``.jar`` is required. A file called ``notes.old`` or ``config.yml.old`` is somebody
 #: else's, and "it ends in .old" is not a reason to offer it for deletion.
-_JAR_BACKUP = re.compile(r"\.jar\.old(?:\.\d+)?$", re.IGNORECASE)
+#:
+#: Anchored at **both** ends, and the leading part may not contain a separator. ``search`` with
+#: a ``$`` anchor accepted ``"a/b.jar.old"`` (a path, not a name) and ``"x.jar.old\n"`` (``$``
+#: also matches before a trailing newline), so the one predicate allowed to authorise deleting
+#: something from ``mods/`` was wider than the rule it documents. ``fullmatch`` states the rule
+#: the docstring has always claimed: this plugin's own ``<name>.jar.old`` spelling, nothing else.
+_JAR_BACKUP = re.compile(r"[^/\\]*\.jar\.old(?:\.\d+)?", re.IGNORECASE)
 
 #: The suffix chain that makes a name a backup, used to strip it back to the jar it replaced.
 _STRIP = re.compile(r"\.old(?:\.\d+)?$", re.IGNORECASE)
@@ -81,8 +88,11 @@ def is_backup_name(name: str) -> bool:
     """Whether ``name`` is one of the backups this plugin creates.
 
     The only predicate in the codebase allowed to authorise deleting something from ``mods/``.
+    It answers about a **file name**, which is what it is given: a value containing a path
+    separator, or a trailing newline, is not a name this plugin ever creates, so it is not a
+    backup — see :data:`_JAR_BACKUP`.
     """
-    return bool(_JAR_BACKUP.search(str(name or "")))
+    return bool(_JAR_BACKUP.fullmatch(str(name or "")))
 
 
 def restored_name(backup_name: str) -> str:

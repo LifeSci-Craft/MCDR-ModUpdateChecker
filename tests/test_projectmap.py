@@ -126,6 +126,46 @@ def test_a_version_key_is_optional(tmp_path):
     assert mapping.lookup(sha1=SHA) == "sodium"
 
 
+def test_a_file_that_is_not_utf8_is_reported_rather_than_raised(tmp_path):
+    """GBK/ANSI is what a Chinese Windows editor writes unless it is told otherwise.
+
+    ``UnicodeDecodeError`` is a ``ValueError``, not an ``OSError``, so the old ``except`` never
+    saw it: the exception escaped ``ProjectMap`` and took down the whole check with it — no
+    report at all — and the status page, which builds the map without a guard, with it.
+    """
+    path = tmp_path / "project-map.json"
+    path.write_bytes(
+        json.dumps({"by_mod_id": {"\u9502": "lithium"}}, ensure_ascii=False).encode("gbk")
+    )
+
+    mapping = ProjectMap(path)
+
+    assert mapping.error, "an undecodable file has to be reported"
+    assert mapping.loaded is False
+    assert mapping.lookup(mod_id="lithium") == ""
+
+
+def test_a_file_with_a_byte_order_mark_is_read(tmp_path):
+    """Notepad and friends add one, and ``json`` rejects it outright."""
+    path = tmp_path / "project-map.json"
+    path.write_bytes(
+        b"\xef\xbb\xbf" + json.dumps({"by_mod_id": {"lithium": "lithium"}}).encode("utf-8")
+    )
+
+    mapping = ProjectMap(path)
+
+    assert mapping.error == ""
+    assert mapping.lookup(mod_id="lithium") == "lithium"
+
+
+def test_a_utf8_file_with_chinese_in_it_still_round_trips(tmp_path):
+    """The ordinary case must not be collateral damage of the encoding handling."""
+    mapping = loaded(tmp_path, {"by_mod_id": {"\u9502": "lithium"}})
+
+    assert mapping.error == ""
+    assert mapping.lookup(mod_id="\u9502") == "lithium"
+
+
 def test_unusable_rows_are_counted_rather_than_silently_dropped(tmp_path):
     """A dropped row is a mapping the admin believes is in force and is not.
 

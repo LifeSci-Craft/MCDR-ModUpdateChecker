@@ -41,7 +41,7 @@
 游戏内列表效果：
 
 ```
-============  Mod Update Checker v1.6.0  ============
+============  Mod Update Checker v1.6.1  ============
 服务端: 26.3 / Fabric(版本来源：server_info)
 [1] Lithium                 [版本]  [状态: ↑]  [详细信息]
 [2] Sodium                 [版本]  [状态: ↑]  [详细信息]
@@ -77,7 +77,7 @@
 | `!!modupdate delete <文件名 / 编号 / all>` | 删除旧版备份（需先开 `cleanup.allow_delete`） |
 | `!!modupdate cleanup` | 删除所有已过期的旧版备份（同上） |
 | `!!modupdate confirm` | 确认上一条 `download` / `install` / `delete` / `cleanup` |
-| `!!modupdate status` | 显示服务端、配置与上次检查的状态 |
+| `!!modupdate status` | 显示服务端、配置与上次检查的状态（先回一句「正在读取」，再整屏给出结果） |
 | `!!modupdate reload` | 重载配置文件 |
 
 位置可以填四种写法：**编号**（来自 `list`）、**Mod 名**（打一半也行）、**mod id**、**jar 文件名**；
@@ -109,6 +109,7 @@
 
 配置文件：`config/mod_update_checker/config.json`。升级后新增的选项会自动按默认值补齐并重写文件。
 下面每张表的选项名就是文件中的完整路径。
+数值选项超出允许范围时会**在内存里钳制到边界**并在控制台提示一次（文件里写的值不会被改，所以改之前每次加载都会再提一次）；范围写在对应的说明里。
 
 ### 顶层
 
@@ -118,7 +119,7 @@
 |---|---|---|
 | `enabled` | `true` | 总开关。关掉后只保留命令 |
 | `language` | `"auto"` | `auto` 跟随 MCDR；可写 `zh_cn` / `en_us` |
-| `command_permission_level` | `3` | 执行 `!!modupdate` 的最低 MCDR 权限等级 |
+| `command_permission_level` | `3` | 执行 `!!modupdate` 的最低 MCDR 权限等级（范围 0–4） |
 
 </details>
 
@@ -141,8 +142,8 @@
 | 选项 | 默认 | 说明 |
 |---|---|---|
 | `check.on_server_start` | `true` | 启动完成后自动检查一次，结果写进控制台 |
-| `check.start_delay_seconds` | `60` | 开服后延迟多久再查，避开 Mod 加载 |
-| `check.interval_hours` | `0` | 定时检查间隔（小时）；`0` = 关闭 |
+| `check.start_delay_seconds` | `60` | 开服后延迟多久再查，避开 Mod 加载（范围 0–3600） |
+| `check.interval_hours` | `0` | 定时检查间隔（小时）；`0` = 关闭（范围 0–720） |
 | `check.include_beta` | `false` | beta 也算作可用更新 |
 | `check.include_alpha` | `false` | alpha 也算作可用更新 |
 | `check.ignored_mods` | `[]` | 完全不做检测的 Mod（填 mod id / 文件名 / 去掉 `.jar` 的文件名）；不产生请求，报告中仍会列出 |
@@ -157,10 +158,10 @@
 |---|---|---|
 | `report.updates_only` | `true` | 自动检查时没问题就只留一行 |
 | `report.on_admin_join` | `true` | 管理员上线时把结果单独发给他（必要时先查一次） |
-| `report.admin_permission` | `3` | 多少权限等级算「管理员」 |
+| `report.admin_permission` | `3` | 多少权限等级算「管理员」（范围 0–4） |
 | `report.reuse_report_minutes` | `1440` | 上线通知可复用的最近结果时限；`0` = 每次都重查 |
 | `report.in_game` | `false` | 发现更新时在游戏内广播给在线管理员 |
-| `report.in_game_permission` | `3` | 广播的最低权限等级 |
+| `report.in_game_permission` | `3` | 广播的最低权限等级（范围 0–4） |
 | `report.write_file` | `true` | 报告落盘（`last_report.json` / `last_report.txt`） |
 
 </details>
@@ -189,7 +190,7 @@
 |---|---|---|
 | `download.enabled` | `false` | 发现更新时自动下载到插件文件夹 |
 | `download.folder_name` | `"downloads"` | 下载子文件夹名（不能填路径） |
-| `download.max_size_mb` | `128` | 单个文件大小上限 |
+| `download.max_size_mb` | `128` | 单个文件大小上限（范围 1–8192） |
 | `download.install_on_stop` | `false` | 关服后自动安装已下载的更新（不依赖 `download.enabled`） |
 | `download.retries` | `3` | 下载重试次数（总尝试 = 1 + 该值） |
 
@@ -209,7 +210,7 @@
 |---|---|---|
 | `cleanup.allow_delete` | `false` | 删除总开关；关着时一切删除命令被拒绝 |
 | `cleanup.enabled` | `false` | 有过期备份时提醒管理员（前提：`allow_delete` 已开） |
-| `cleanup.max_age_days` | `30` | 多少天算过期；`0` = 立即过期 |
+| `cleanup.max_age_days` | `30` | 多少天算过期；`0` = 立即过期（范围 0–3650） |
 
 旧版备份照常显示在列表里（状态 `⏪`），一行长这样：
 
@@ -227,10 +228,10 @@
 
 | 选项 | 默认 | 说明 |
 |---|---|---|
-| `network.timeout_seconds` | `20` | 单次请求超时 |
+| `network.timeout_seconds` | `20` | 单次请求超时（范围 1–300）；下载另有按声明大小的总时长上限 |
 | `network.retries` | `3` | 失败重试次数（含 429 限流与网络错误） |
-| `network.concurrent_requests` | `4` | 并发数。调大更快，也更容易触发上游限流 |
-| `network.requests_per_minute` | `240` | 自限速（Modrinth 官方上限 300/分钟） |
+| `network.concurrent_requests` | `4` | 并发数。调大更快，也更容易触发上游限流（范围 1–32） |
+| `network.requests_per_minute` | `240` | 自限速（Modrinth 官方上限 300/分钟；范围 0–1000） |
 | `network.cache.enabled` | `true` | 记住「这个 jar 上游不认」，下次不重复查询 |
 | `network.cache.ttl_hours` | `24` | 该结论的有效期；`0` = 永不过期 |
 
@@ -241,7 +242,8 @@
 - 重新打包过的 jar 可能认不出（哈希会变），可用 `project-map.json` 手动映射。
 - 不单独检查 jar 内嵌套的 jar；「缺少依赖」提醒可能误报（依赖打包在其他 jar 内时看不到）。
 - Modrinth 不可达时检查照常完成，报告会写明上游不可达，不会把 Mod 错报成「已是最新」；可配置镜像或系统代理。
-- 游戏版本是自动推断的；升级大版本后如大量出现 `no_compatible_build`，先用 `!!modupdate status` 确认识别到的版本。
+- 游戏版本是自动推断的；升级大版本后如大量出现 `no_compatible_build`，先用 `!!modupdate status` 确认识别到的版本。版本是从日志或 Mod 元数据推断出来的时候，状态页会多一行说明它来自哪里。
+- `mods` 目录读不到（权限、被其它程序占住）时，`!!modupdate status` 会写明读不到与原因，`!!modupdate check` 会跳过本次检查并说明原因——不会报成「0 个 jar，一切正常」。
 
 ## 贡献者
 

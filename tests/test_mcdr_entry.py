@@ -32,12 +32,16 @@ EVENT_HANDLERS = (
 class _FakeLogger:
     def __init__(self):
         self.messages = []
+        #: Debug lines, kept **separately**: ``messages`` is what several tests read as "what the
+        #: admin was told", and mixing diagnostics into it would make those assertions depend on
+        #: how chatty the code happens to be. Tests that are about a diagnostic read this.
+        self.debugs = []
 
     def info(self, message, *_args, **_kwargs):
         self.messages.append(str(message))
 
-    def debug(self, *_args, **_kwargs):
-        pass
+    def debug(self, message, *_args, **_kwargs):
+        self.debugs.append(str(message))
 
     def warning(self, message, *_args, **_kwargs):
         self.messages.append("WARN " + str(message))
@@ -136,6 +140,22 @@ class _FakeServer:
 
 def _entry_source() -> str:
     return ENTRY.read_text(encoding="utf-8")
+
+
+def _run_status(plugin, source):
+    """Drive ``!!muc status`` and wait for the thread it hands the reading to.
+
+    The page is built off MCDR's command thread (see ``_show_status``): the first reply, on the
+    command thread, is the acknowledgement, and the screen itself is the next reply once the
+    worker has finished. Joining the thread the command returns is what keeps every assertion
+    below about the screen rather than about the race — and asserting that it is gone is what
+    keeps a hung worker from turning into a missing reply.
+    """
+    thread = plugin._show_status(source)
+    if thread is not None:
+        thread.join(timeout=5)
+        assert not thread.is_alive(), "the status worker did not finish"
+    return source
 
 
 def test_the_lifecycle_handlers_exist_with_mcdr_names():
@@ -287,6 +307,111 @@ def test_on_load_warns_when_the_mods_folder_is_missing(tmp_path):
     assert "WARN" in joined and "mods" in joined, joined
 
     plugin._stop_scheduler()
+
+
+def test_on_load_says_when_the_mods_folder_cannot_be_listed(tmp_path, monkeypatch):
+    """An unreadable folder is not an empty folder.
+
+    Both count zero jars, and only one of them is something the admin can fix. ``iter_mod_jars``
+    swallows the listing error by design — that is what keeps the startup count from failing —
+    so the entry layer asks for the reason separately. Without that question, a folder whose
+    permissions changed reads as "0 jar(s) found" and the admin goes looking for a missing mod.
+    """
+    import mod_update_checker as plugin
+
+    (Path(tmp_path) / "mods").mkdir(parents=True)
+    monkeypatch.setattr(plugin, "directory_error", lambda _path: "PermissionError: denied")
+
+    plugin._stop_event.clear()
+    server = _FakeServer(tmp_path)
+    plugin.on_load(server, None)
+
+    joined = "\n".join(server.logger.messages)
+    assert "PermissionError: denied" in joined, joined
+    assert "已加载" not in joined, "the folder was not read, so the loaded count is a lie"
+
+    plugin._stop_scheduler()
+
+
+def test_the_status_page_says_when_the_mods_folder_cannot_be_read(tmp_path, monkeypatch):
+    """The status line is the one place an admin looks to find out why nothing was found."""
+    import mod_update_checker as plugin
+    from mod_update_checker.serverinfo import ServerContext
+
+    class _Scan:
+        directory = "server/mods"
+        mods = []
+        disabled = []
+        directory_error = "PermissionError: denied"
+
+    config = _config_with({"language": "zh_cn"})
+    previous = (plugin._config, plugin._scan_current, plugin._server)
+    try:
+        plugin._config = config
+        plugin._apply_language(None, config)
+        plugin._scan_current = lambda *_a, **_k: (
+            _Scan(),
+            ServerContext(mc_version="26.3", mc_version_source="config", loader="fabric"),
+        )
+        plugin._server = _FakeServer(tmp_path)
+
+        source = _ReplyRecorder()
+        _run_status(plugin, source)
+    finally:
+        plugin._config, plugin._scan_current, plugin._server = previous
+
+    text = "".join(str(part) for part in source.replies)
+    assert "PermissionError: denied" in text, text
+    assert "0 个 jar" not in text, "an unreadable folder must not be reported as an empty one"
+
+
+def test_a_check_is_skipped_when_the_mods_folder_cannot_be_read(tmp_path, monkeypatch):
+    """A check over a folder nobody could read would report "nothing to update".
+
+    That is the worst possible answer: it looks like a clean result and hides the permission
+    problem. The run refuses instead, and says why.
+    """
+    import mod_update_checker as plugin
+    from mod_update_checker.serverinfo import ServerContext
+
+    (Path(tmp_path) / "mods").mkdir(parents=True)
+    scan = _scan_of(tmp_path)
+    scan.directory_error = "PermissionError: denied"
+
+    calls = []
+
+    class _RecordingChecker:
+        def __init__(self, *_args, **_kwargs):
+            calls.append("init")
+
+        def run(self, *_args, **_kwargs):  # pragma: no cover - must never be reached
+            calls.append("run")
+            raise AssertionError("a check ran over a folder that could not be read")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(plugin, "Checker", _RecordingChecker, raising=False)
+    monkeypatch.setattr(
+        plugin,
+        "_scan_current",
+        lambda *_a, **_k: (
+            scan,
+            ServerContext(mc_version="26.3", mc_version_source="config", loader="fabric"),
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(plugin, "_config", _config_with({"report.write_file": False}), raising=False)
+    plugin._stop_event.clear()
+    plugin._last_report = None
+
+    server = _FakeServer(tmp_path)
+    try:
+        assert plugin._run_check(server, broadcast=False) is None
+        assert calls == [], calls
+        assert "PermissionError: denied" in "\n".join(server.logger.messages)
+    finally:
+        plugin._last_report = None
 
 
 def test_config_defaults_are_the_documented_ones():
@@ -1645,15 +1770,16 @@ def test_the_status_screen_uses_the_same_title_bar_as_the_help(tmp_path):
         plugin._server = _FakeServer(tmp_path)
 
         source = _ReplyRecorder()
-        plugin._show_status(source)
+        _run_status(plugin, source)
     finally:
         plugin._config, plugin._scan_current, plugin._server = (
             previous_config, previous_scan, previous_server,
         )
 
-    assert len(source.replies) == 1
+    # 两条回复：命令线程上的「正在读取」和后台线程画完的那一屏。标题栏在后一条里。
+    assert len(source.replies) == 2
     bars = [
-        item for item in _segments(source.replies[0])
+        item for item in _segments(source.replies[-1])
         if item.get("text", "").startswith("=") and item.get("color") == "gold"
     ]
     assert bars, "the status screen has no title bar"
@@ -1700,6 +1826,25 @@ def _entry_for_screens():
     return entry
 
 
+def _screen_of(source):
+    """The reply that carries the screen's title bar.
+
+    Neither "the first reply" nor "the last reply" works for all five screens: ``summary``,
+    ``list`` and ``info`` open with the bar and *close* with the rule, ``help`` is one message
+    either way, and ``status`` now opens with a plain-text acknowledgement and draws the screen
+    afterwards. The bar is simply the reply that has one, so that is what this looks for — and
+    a plain string (the acknowledgement) has no segments to walk.
+    """
+    replies = getattr(source, "raw", None) or source.replies
+    for reply in replies:
+        if not hasattr(reply, "to_json_object"):
+            continue
+        for item in _segments(reply):
+            if item.get("color") == "gold" and item.get("text", "").startswith("="):
+                return reply
+    raise AssertionError("no reply carries a title bar: {}".format(replies))
+
+
 def test_every_screen_opens_with_the_same_title_bar(tmp_path, monkeypatch):
     """One bar, five screens.
 
@@ -1717,7 +1862,8 @@ def test_every_screen_opens_with_the_same_title_bar(tmp_path, monkeypatch):
         "summary": lambda source: plugin._reply_summary(source, report),
         "list": lambda source: plugin._reply_index(source, report),
         "info": lambda source: plugin._reply_detail(source, entry),
-        "status": plugin._show_status,
+        # ``status`` 提交两段：命令线程的一句「正在读取」，后台线程画出来的那一屏。
+        "status": lambda source: _run_status(plugin, source),
         "help": plugin._show_help,
     }
 
@@ -1726,10 +1872,10 @@ def test_every_screen_opens_with_the_same_title_bar(tmp_path, monkeypatch):
         source = _ReplyRecorder()
         call(source)
         assert source.replies, "{} replied with nothing".format(name)
-        # 只取第一条回复里**第一个换行之前**的金色段：整块屏幕作为一条消息的屏（help、
-        # status）末尾还有一条金色的闭合线，它不是标题栏。
+        # 只取那一屏里**第一个换行之前**的金色段：屏幕可能不止一条回复（``status`` 的确认句、
+        # summary/list/info 的收尾线各占一条），末尾那条金色的闭合线也不是标题栏。
         gold = []
-        for item in _segments(source.replies[0]):
+        for item in _segments(_screen_of(source)):
             if item.get("text") == "\n":
                 break
             if item.get("color") == "gold":
@@ -1761,7 +1907,7 @@ def test_every_screen_closes_with_a_rule_as_wide_as_its_title(tmp_path, monkeypa
         "summary": lambda source: plugin._reply_summary(source, report),
         "list": lambda source: plugin._reply_index(source, report),
         "info": lambda source: plugin._reply_detail(source, entry),
-        "status": plugin._show_status,
+        "status": lambda source: _run_status(plugin, source),
         "help": plugin._show_help,
     }
 
@@ -1776,7 +1922,8 @@ def test_every_screen_closes_with_a_rule_as_wide_as_its_title(tmp_path, monkeypa
     for name, call in screens.items():
         source = _PlayerSource("Admin")
         call(source)
-        title = str(source.raw[0]).split("\n")[0]
+        # 最后一屏，而不是第一条回复：``status`` 先回一句「正在读取」，那一屏随后才到。
+        title = str(source.raw[-1]).split("\n")[0]
         closing = str(source.raw[-1]).split("\n")[-1]
 
         assert closing.startswith("=") and closing.endswith("="), (name, closing)
@@ -3514,7 +3661,7 @@ def _status_with_map(tmp_path, monkeypatch, map_payload=None, setting=None):
         )
         plugin._server = server
         source = _ReplyRecorder()
-        plugin._show_status(source)
+        _run_status(plugin, source)
     finally:
         plugin._config, plugin._scan_current, plugin._server = previous
     return "\n".join(str(item) for item in source.replies)
@@ -3602,7 +3749,7 @@ def test_the_status_screen_does_not_hash_the_mods_folder(tmp_path, monkeypatch):
         plugin._apply_language(server, plugin._config)
         plugin._server = server
         source = _ReplyRecorder()
-        plugin._show_status(source)
+        _run_status(plugin, source)
     finally:
         plugin._config, plugin._server = previous
 
@@ -3633,7 +3780,7 @@ def test_the_status_screen_still_reads_the_metadata(tmp_path, monkeypatch):
         plugin._apply_language(server, plugin._config)
         plugin._server = server
         source = _ReplyRecorder()
-        plugin._show_status(source)
+        _run_status(plugin, source)
     finally:
         plugin._config, plugin._server = previous
 
@@ -3924,7 +4071,7 @@ def test_the_status_screen_names_the_backups(tmp_path, monkeypatch):
     )
     source = _PlayerSource("Admin")
 
-    plugin._show_status(source)
+    _run_status(plugin, source)
 
     body = source.body
     assert "旧版备份" in body
@@ -4004,6 +4151,169 @@ def test_installing_stamps_the_backup_with_the_moment_it_was_made(tmp_path):
     assert backup.is_file()
     age_days = (time.time() - backup.stat().st_mtime) / 86400
     assert age_days < 1, "备份的时间戳还是那个旧 jar 的"
+
+
+def test_a_recorded_file_name_cannot_leave_the_download_folder(tmp_path):
+    """``file`` becomes a path inside the download folder, and the ledger is hand-editable.
+
+    A value like ``../server.properties`` used to be joined as-is, so the install stage would
+    *move* a file from outside the download folder into ``mods/`` and rename the mod it was
+    replacing out of the way while doing it. Nothing that writes the ledger ever produces such a
+    name, so refusing one costs nothing legitimate.
+    """
+    from mod_update_checker import installer
+
+    mods = tmp_path / "mods"
+    downloads = tmp_path / "downloads"
+    mods.mkdir()
+    downloads.mkdir()
+    outside = tmp_path / "server.properties"
+    outside.write_text("level-name=world\n", encoding="utf-8")
+    (mods / "lithium.jar").write_bytes(b"old")
+
+    record = {
+        "file": "../server.properties",
+        "name": "Lithium",
+        "local": "lithium.jar",
+        "version": "1.1.0",
+        "sha1": hashlib.sha1(outside.read_bytes()).hexdigest(),
+    }
+
+    result = installer._install_one(record, installer.InstallOptions(mods, downloads))
+
+    assert result.status == installer.STATUS_SKIPPED
+    assert result.detail.startswith("unsafe-name")
+    assert outside.is_file(), "a file outside the download folder was moved"
+    assert (mods / "lithium.jar").read_bytes() == b"old"
+    assert not (mods / "server.properties.jar").exists()
+
+
+def test_a_recorded_installed_name_that_is_a_path_is_refused(tmp_path):
+    """The other half: ``local`` is joined to ``mods/`` when the jar to replace is located."""
+    from mod_update_checker import installer
+
+    mods = tmp_path / "mods"
+    downloads = tmp_path / "downloads"
+    mods.mkdir()
+    downloads.mkdir()
+    fresh = downloads / "lithium-1.1.0.jar"
+    fresh.write_bytes(b"new")
+    outside = tmp_path / "sodium.jar"
+    outside.write_bytes(b"someone else's jar")
+
+    record = {
+        "file": "lithium-1.1.0.jar",
+        "name": "Lithium",
+        "local": "../sodium.jar",
+        "version": "1.1.0",
+        "sha1": hashlib.sha1(fresh.read_bytes()).hexdigest(),
+    }
+
+    result = installer._install_one(record, installer.InstallOptions(mods, downloads))
+
+    assert result.status == installer.STATUS_SKIPPED
+    assert result.detail.startswith("unsafe-name")
+    assert outside.read_bytes() == b"someone else's jar"
+    assert list(mods.iterdir()) == []
+
+
+def test_a_failed_move_leaves_no_half_written_jar_in_mods(tmp_path, monkeypatch):
+    """The new jar is copied to a sibling and renamed, so ``mods/`` never holds a truncated one.
+
+    ``shutil.move`` was used before because the download folder may be on another volume — and
+    on another volume it copies. A copy interrupted half-way (a full disk, a killed server, an
+    antivirus quarantine) left the truncated bytes under the *new mod's own name*, with the old
+    jar already moved aside: the next server start would load a broken mod, and nothing in the
+    report said so.
+    """
+    import shutil
+
+    from mod_update_checker import installer
+
+    mods = tmp_path / "mods"
+    downloads = tmp_path / "downloads"
+    mods.mkdir()
+    downloads.mkdir()
+    (mods / "lithium.jar").write_bytes(b"old")
+    fresh = downloads / "lithium-1.1.0.jar"
+    fresh.write_bytes(b"new")
+
+    def exploding_copy(source, destination, **_kwargs):
+        # What a copy that runs out of disk looks like: some bytes, then a failure.
+        with open(destination, "wb") as handle:
+            handle.write(b"half")
+        raise shutil.Error("simulated disk full")
+
+    monkeypatch.setattr(shutil, "copy2", exploding_copy)
+
+    record = {
+        "file": "lithium-1.1.0.jar",
+        "name": "Lithium",
+        "local": "lithium.jar",
+        "version": "1.1.0",
+        "sha1": hashlib.sha1(fresh.read_bytes()).hexdigest(),
+    }
+
+    result = installer._install_one(record, installer.InstallOptions(mods, downloads))
+
+    assert result.status == installer.STATUS_FAILED
+    assert "could not copy the new jar in" in result.detail
+    assert "partial file may remain" not in result.detail, "the temporary copy was left behind"
+    # The server is exactly as it was: the old jar is back, and no truncated jar wears the new
+    # mod's name.
+    assert (mods / "lithium.jar").read_bytes() == b"old"
+    assert [path.name for path in mods.iterdir()] == ["lithium.jar"]
+    # And the download itself is untouched, so the next run can try again.
+    assert fresh.read_bytes() == b"new"
+
+
+def test_a_failed_copy_that_leaves_a_file_says_so(tmp_path, monkeypatch):
+    """When the temporary copy cannot even be deleted, the report has to name it.
+
+    ``mods/`` is then dirty, and an admin who is not told will only find out when the server
+    loads a jar called ``lithium-1.1.0.jar.new`` — or, worse, when they cannot work out why the
+    folder looks wrong.
+    """
+    import shutil
+
+    from mod_update_checker import installer
+
+    mods = tmp_path / "mods"
+    downloads = tmp_path / "downloads"
+    mods.mkdir()
+    downloads.mkdir()
+    (mods / "lithium.jar").write_bytes(b"old")
+    fresh = downloads / "lithium-1.1.0.jar"
+    fresh.write_bytes(b"new")
+
+    def exploding_copy(source, destination, **_kwargs):
+        with open(destination, "wb") as handle:
+            handle.write(b"half")
+        raise shutil.Error("simulated disk full")
+
+    real_unlink = Path.unlink
+
+    def refusing_unlink(self, *args, **kwargs):
+        if self.name.endswith(".new"):
+            raise PermissionError(13, "held open by something else")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(shutil, "copy2", exploding_copy)
+    monkeypatch.setattr(Path, "unlink", refusing_unlink)
+
+    record = {
+        "file": "lithium-1.1.0.jar",
+        "name": "Lithium",
+        "local": "lithium.jar",
+        "version": "1.1.0",
+        "sha1": hashlib.sha1(fresh.read_bytes()).hexdigest(),
+    }
+
+    result = installer._install_one(record, installer.InstallOptions(mods, downloads))
+
+    assert result.status == installer.STATUS_FAILED
+    assert "partial file may remain: lithium-1.1.0.jar.new" in result.detail
+    assert (mods / "lithium.jar").read_bytes() == b"old"
 
 
 # --------------------------------------------------------------------------------------
@@ -4137,7 +4447,7 @@ def test_the_status_line_says_why_nothing_is_cleaning_up(tmp_path, monkeypatch):
     )
     source = _PlayerSource("Admin")
 
-    plugin._show_status(source)
+    _run_status(plugin, source)
 
     assert "旧版备份" in source.body
     assert "删除功能未开启" in source.body
@@ -4152,7 +4462,7 @@ def test_the_status_line_is_quiet_about_the_switch_when_there_is_nothing_to_dele
     )
     source = _PlayerSource("Admin")
 
-    plugin._show_status(source)
+    _run_status(plugin, source)
 
     assert "旧版备份" in source.body
     assert "删除功能未开启" not in source.body
@@ -4440,3 +4750,484 @@ def test_every_status_gets_the_colour_the_rule_says(tmp_path, monkeypatch):
         words = chinese("status." + status)
         body = "".join(text for role, text in fields if role != ROW_FIELD_NOTE)
         assert words not in body, (status, body)
+
+
+# --------------------------------------------------------------------------------------
+# 入口层的第二轮修复：静默异常、暂存动作的原子性、status 的线程归属、停服检查点、
+# 别名的传播、列宽缓存、收尾线截断、数值配置的上下限
+#
+# 这一组大多是「某件事不许再发生」：通知不许因为一次探测异常而整批消失、同一条 confirm
+# 不许被用两次、整包 mods 的扫描不许占着 MCDR 唯一的同步执行器、停服后的在途检查不许把
+# 结果留下来。它们都是**没有报错**的失效，所以只能靠断言钉住。
+# --------------------------------------------------------------------------------------
+
+
+class _RaiseOnProbeServer(_FakeServer):
+    """A server whose ``is_server_running`` blows up, the way a status transition can."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.probe_failures = 0
+
+    def is_server_running(self):
+        self.probe_failures += 1
+        raise RuntimeError("status is being torn down")
+
+
+class _NoServerInformationServer(_FakeServer):
+    """A stopped server: MCDR has nothing parsed, so ``get_server_information`` raises."""
+
+    def get_server_information(self):
+        raise RuntimeError("the server is not running")
+
+
+class _NoLanguageApiServer(_FakeServer):
+    """The API that is always there on a supported MCDR — except when the environment is odd."""
+
+    def get_mcdr_language(self):
+        raise RuntimeError("language API broken")
+
+
+def test_a_failed_server_information_lookup_is_logged_rather_than_silent(tmp_path):
+    """``information_version`` failing is expected — the *silence* was the defect.
+
+    Its consequence is real: the game version is then guessed from the log or from the mods
+    themselves, which is worth less than the server's own answer, and "every mod says no
+    compatible build" is the symptom. A debug line is what makes that answerable.
+    """
+    import mod_update_checker as plugin
+
+    server = _NoServerInformationServer(tmp_path)
+    config = _config_with({})
+    monkeypatch_target = plugin._config
+    try:
+        plugin._config = config
+        scan, context = plugin._scan_current(server, config, hashes=False)
+    finally:
+        plugin._config = monkeypatch_target
+
+    assert server.logger.debugs, "the fallback left no trace at all"
+    assert any("information" in line for line in server.logger.debugs), server.logger.debugs
+    assert context.mc_version_source in ("log", "mods", "unknown"), context.mc_version_source
+
+
+def test_the_status_page_says_when_the_version_was_guessed(tmp_path, monkeypatch):
+    """A version read out of the log or the mods is a guess, and the page has to say so."""
+    import mod_update_checker as plugin
+    from mod_update_checker.serverinfo import ServerContext
+
+    class _Scan:
+        directory = "server/mods"
+        mods = []
+        disabled = []
+
+    server = _FakeServer(tmp_path)
+    monkeypatch.setattr(plugin, "_config", _config_with({"language": "zh_cn"}), raising=False)
+    plugin._apply_language(server, plugin._config)
+
+    guessed = plugin._status_screen(
+        server, plugin._config, None, _Scan(),
+        ServerContext(mc_version="26.3", mc_version_source="log", loader="fabric"),
+    )
+    reported = plugin._status_screen(
+        server, plugin._config, None, _Scan(),
+        ServerContext(mc_version="26.3", mc_version_source="server_info", loader="fabric"),
+    )
+
+    assert "推断" in str(guessed), str(guessed)
+    assert "推断" not in str(reported), "服务端自己报的版本不该被说成猜的"
+
+
+def test_a_probe_failure_does_not_mute_every_notification(tmp_path, monkeypatch):
+    """The failure direction is the decision: keep talking, not go silent.
+
+    Every in-game message in the plugin passes through ``_server_running``. Treating a raised
+    probe as "the server is down" therefore turns one transient error into total silence —
+    the failure mode an admin reports as "the plugin stopped telling me anything", with no log
+    line to explain it.
+    """
+    import mod_update_checker as plugin
+
+    server = _RaiseOnProbeServer(tmp_path)
+    monkeypatch.setattr(plugin, "_last_server_running", True, raising=False)
+
+    assert plugin._server_running(server) is True
+    assert server.logger.debugs, "the failed probe was swallowed without a word"
+
+    plugin._tell_player(server, "Admin", [plugin.Notice("hello", "hint")])
+    assert server.told("Admin") == ["hello"], "the message was dropped over a probe failure"
+
+
+def test_a_probe_failure_keeps_the_last_answer_it_actually_got(tmp_path, monkeypatch):
+    """The other half: a server known to be down stays down, so nothing is sent to nobody."""
+    import mod_update_checker as plugin
+
+    server = _FakeServer(tmp_path, running=False)
+    monkeypatch.setattr(plugin, "_last_server_running", True, raising=False)
+    assert plugin._server_running(server) is False
+
+    server.is_server_running = lambda: (_ for _ in ()).throw(RuntimeError("torn down"))
+    assert plugin._server_running(server) is False, "the last observed answer was forgotten"
+
+
+def test_a_broken_language_api_is_logged(tmp_path, monkeypatch):
+    """The branch is unreachable on a supported MCDR, so reaching it means the environment is off."""
+    import mod_update_checker as plugin
+
+    server = _NoLanguageApiServer(tmp_path)
+    monkeypatch.setattr(plugin, "_config", _config_with({"language": "auto"}), raising=False)
+
+    plugin._apply_language(server, plugin._config)
+
+    assert server.logger.debugs, "a silent fall back to another language"
+    assert plugin._translator.language == "en_us", plugin._translator.language
+
+
+def test_taking_a_plan_is_what_consumes_it(tmp_path, monkeypatch):
+    """No gap between "is there a plan" and "it is gone" — the gap could be spent twice."""
+    plugin, server, source, entry, _ledger = _manual_env(
+        tmp_path, monkeypatch, status="awaiting_install"
+    )
+    plugin._manual_install(source, "1", "!!muc")
+    assert plugin._pending_action is not None
+
+    taken = plugin._take_pending(source)
+
+    assert taken is not None and taken["kind"] == "install"
+    assert plugin._pending_action is None, "取出来之后槽位里还留着，就能被再消费一次"
+    assert plugin._take_pending(source) is None
+
+
+def test_a_staged_plan_cannot_be_carried_out_twice(tmp_path, monkeypatch):
+    """Two confirms, one install: the second must find nothing, not repeat the first."""
+    plugin, server, source, entry, _ledger = _manual_env(
+        tmp_path, monkeypatch, status="awaiting_install"
+    )
+    carried = []
+    monkeypatch.setattr(plugin, "_confirmed_install",
+                        lambda src, item, prefix: carried.append(item.file_name), raising=False)
+
+    plugin._manual_install(source, "1", "!!muc")
+    plugin._manual_confirm(source, "!!muc")
+    plugin._manual_confirm(source, "!!muc")
+
+    assert carried == ["sodium.jar"], carried
+    assert "没有待确认的操作" in source.body, source.body
+
+
+def test_a_second_download_of_the_same_mod_is_not_started(tmp_path, monkeypatch):
+    """Two confirmations of the same mod mean two connections for the same bytes."""
+    import threading
+
+    plugin, server, source, entry, _ledger = _manual_env(tmp_path, monkeypatch)
+    fetches = []
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_fetch(item):
+        fetches.append(item.file_name)
+        started.set()
+        release.wait(5)
+        return None
+
+    monkeypatch.setattr(plugin, "_perform_manual_download", slow_fetch, raising=False)
+
+    plugin._confirmed_download(source, entry, 1, "!!muc")
+    assert started.wait(5), "the first fetch never started"
+    plugin._confirmed_download(source, entry, 1, "!!muc")
+    release.set()
+    for _ in range(200):
+        if not plugin._inflight_downloads:
+            break
+        time.sleep(0.01)
+
+    assert fetches == ["sodium.jar"], fetches
+    assert "正在下载中" in source.body, source.body
+    assert not plugin._inflight_downloads, "占用的名字没有被放回去"
+
+
+def test_the_status_page_is_built_off_the_command_thread(tmp_path, monkeypatch):
+    """``scan_mods`` reads every jar, and the command thread is MCDR's only one."""
+    import threading
+
+    import mod_update_checker as plugin
+    from mod_update_checker.serverinfo import ServerContext
+
+    server = _FakeServer(tmp_path)
+    monkeypatch.setattr(plugin, "_server", server, raising=False)
+    monkeypatch.setattr(plugin, "_config", _config_with({"language": "zh_cn"}), raising=False)
+    plugin._apply_language(server, plugin._config)
+    seen_thread = []
+    scan_block = threading.Event()
+
+    class _Scan:
+        directory = "server/mods"
+        mods = []
+        disabled = []
+
+    def stub(*_args, **_kwargs):
+        seen_thread.append(threading.current_thread().name)
+        scan_block.set()
+        return (_Scan(), ServerContext(mc_version="26.3", mc_version_source="config",
+                                       loader="fabric"))
+
+    monkeypatch.setattr(plugin, "_scan_current", stub, raising=False)
+
+    source = _ReplyRecorder()
+    worker = plugin._show_status(source)
+
+    assert worker is not None and worker is not threading.current_thread()
+    assert worker.name == "mod_update_checker_status", worker.name
+    # 命令线程上先给一句回执，别让读者对着空屏等；真正的扫描不在这个线程上。
+    assert len(source.replies) == 1, source.replies
+    assert "正在读取服务端状态" in str(source.replies[0]), source.replies
+    assert scan_block.wait(5), "the worker never started"
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert seen_thread == ["mod_update_checker_status"], seen_thread
+    assert len(source.replies) == 2, source.replies
+    assert "服务端:" in str(source.replies[-1]), source.replies
+
+
+def test_a_second_status_while_one_is_running_is_refused(tmp_path, monkeypatch):
+    """Two pages at once would read the whole folder twice for one answer."""
+    import mod_update_checker as plugin
+
+    server = _FakeServer(tmp_path)
+    monkeypatch.setattr(plugin, "_server", server, raising=False)
+    monkeypatch.setattr(plugin, "_config", _config_with({"language": "zh_cn"}), raising=False)
+    plugin._apply_language(server, plugin._config)
+
+    assert plugin._status_lock.acquire(blocking=False), "（前提：先占住那把锁）"
+    try:
+        source = _ReplyRecorder()
+        result = plugin._show_status(source)
+    finally:
+        plugin._status_lock.release()
+
+    assert result is None
+    assert len(source.replies) == 1
+    assert "状态页" in str(source.replies[0]) and "在生成" in str(source.replies[0]), source.replies
+
+
+def test_a_check_still_in_flight_when_the_server_stops_drops_its_result(tmp_path, monkeypatch):
+    """A report finished after the stop describes a server that is no longer there.
+
+    And it is not merely cosmetic: the report is written to disk and read back at the next
+    startup, where nothing about it looks stale, so the admin would be told about the state of a
+    server as it was going down.
+    """
+    import threading
+
+    import mod_update_checker as plugin
+    from mod_update_checker.serverinfo import ServerContext
+
+    server = _FakeServer(tmp_path)
+    monkeypatch.setattr(plugin, "_config", _config_with({"language": "zh_cn"}), raising=False)
+    plugin._apply_language(server, plugin._config)
+    monkeypatch.setattr(plugin, "_last_report", None, raising=False)
+    monkeypatch.setattr(plugin, "_stop_event", threading.Event(), raising=False)
+    monkeypatch.setattr(plugin, "_install_on_stop", lambda srv: None, raising=False)
+
+    class _Scan:
+        directory = str(tmp_path / "mods")
+        mods = []
+        disabled = []
+
+    (tmp_path / "mods").mkdir(exist_ok=True)
+
+    inside = threading.Event()
+    release = threading.Event()
+
+    class _Checker:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def run(self, *_args, **_kwargs):
+            inside.set()
+            release.wait(5)
+            return _report(updates=1)
+
+    monkeypatch.setattr(plugin, "Checker", _Checker, raising=False)
+    monkeypatch.setattr(
+        plugin, "_scan_current",
+        lambda *_a, **_k: (_Scan(), ServerContext(mc_version="26.3",
+                                                  mc_version_source="config", loader="fabric")),
+        raising=False,
+    )
+
+    worker = threading.Thread(target=lambda: plugin._run_check(server))
+    worker.start()
+    assert inside.wait(5), "the stand-in checker never ran"
+
+    plugin.on_server_stop(server, 0)
+    release.set()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert plugin._last_report is None, "停服后完成的检查把结果留下了"
+    assert not (Path(server.get_data_folder()) / plugin.REPORT_FILE_NAME).exists(), \
+        "停服后完成的检查把报告文件也写了"
+
+
+def test_a_check_does_not_start_once_the_server_has_stopped(tmp_path, monkeypatch):
+    """The first checkpoint: a check queued behind a stop must not scan at all."""
+    import mod_update_checker as plugin
+
+    server = _FakeServer(tmp_path)
+    monkeypatch.setattr(plugin, "_config", _config_with({"language": "zh_cn"}), raising=False)
+    plugin._apply_language(server, plugin._config)
+    plugin._stop_event.set()
+    try:
+        built = []
+        monkeypatch.setattr(plugin, "Checker", lambda *a, **k: built.append(a), raising=False)
+        assert plugin._run_check(server) is None
+        assert built == [], "停服之后还去建了 checker"
+    finally:
+        plugin._stop_event.clear()
+
+
+def test_a_stop_and_a_start_without_a_reload_keeps_checking(tmp_path, monkeypatch):
+    """And the other side of the stop event: it must not silently end periodic checking."""
+    import mod_update_checker as plugin
+
+    server = _FakeServer(tmp_path)
+    monkeypatch.setattr(
+        plugin, "_config",
+        _config_with({"language": "zh_cn", "check.interval_hours": 1}), raising=False,
+    )
+    plugin._apply_language(server, plugin._config)
+    monkeypatch.setattr(plugin, "_install_on_stop", lambda srv: None, raising=False)
+    monkeypatch.setattr(plugin, "_announce_install_reminder", lambda srv: None, raising=False)
+    monkeypatch.setattr(plugin, "_schedule_startup_check", lambda srv: None, raising=False)
+    previous = plugin._scheduler_thread
+    try:
+        plugin._start_interval_scheduler(server)
+        assert plugin._scheduler_thread is not None
+        plugin.on_server_stop(server, 0)
+        assert plugin._stop_event.is_set()
+
+        plugin.on_server_startup(server)
+
+        assert not plugin._stop_event.is_set(), "开机之后停服事件还立着，定时检查就死了"
+        assert plugin._scheduler_thread is not None
+        assert plugin._scheduler_thread.is_alive()
+    finally:
+        plugin._stop_scheduler()
+        # ``_stop_scheduler`` sets the event on its way out (that is how it stops the loop), and
+        # leaving it set would hand every test after this one a plugin that thinks the server is
+        # going down — the same "one test's state is the next test's failure" trap the language
+        # fixtures are careful about.
+        plugin._stop_event.clear()
+        plugin._scheduler_thread = previous
+
+
+def test_the_alias_reaches_every_line_that_names_a_command(tmp_path, monkeypatch):
+    """A line must name the spelling the reader typed — or the canonical one, never the other.
+
+    Two different situations, and the difference is who is reading:
+
+    * a command's own reply knows the prefix that was typed, so ``!!muc delete`` must not answer
+      with ``!!modupdate delete``;
+    * the cleanup reminder is not an answer to anybody — it is staged for whoever reads the
+      console next, so it uses the canonical first spelling (and the placeholders must still be
+      *rendered* with a real command, not left as ``{command}`` in the text).
+    """
+    plugin, server, _mods = _cleanup_setup(
+        tmp_path, monkeypatch, backups=[("ancient.jar.old", 10, 400)],
+    )
+
+    plugin._announce_cleanup(server)
+    logged = "\n".join(server.logger.messages)
+    assert "!!modupdate confirm" in logged, logged
+    assert "!!modupdate list old_backup" in logged, logged
+    assert "{command}" not in logged and "{list_command}" not in logged, logged
+
+    source = _PlayerSource("Admin")
+    plugin._manual_delete(source, "", "!!muc")
+    body = source.body
+    assert "!!muc delete" in body and "!!muc cleanup" in body, body
+    assert "!!modupdate" not in body, body
+
+
+def test_a_plugin_reload_drops_the_cached_column_widths(tmp_path, monkeypatch):
+    """``report`` is a sibling module and survives a reload; its cache is keyed by language."""
+    import mod_update_checker as plugin
+    from mod_update_checker import report
+
+    monkeypatch.setitem(report._CELL_WIDTHS, "zh_cn", (1, 1))
+    server = _FakeServer(tmp_path)
+
+    plugin.on_load(server, None)
+
+    assert "zh_cn" not in report._CELL_WIDTHS, "旧版本量出来的列宽跨过了 reload"
+
+
+def test_a_caption_too_wide_for_the_bar_is_cut_not_fitted_around(tmp_path, monkeypatch):
+    """超宽时应该把话截短，而不是把线撑长——原来那个 ``max`` 方向是反的。"""
+    import mod_update_checker as plugin
+    from mod_update_checker.report import display_width
+
+    server = _FakeServer(tmp_path)
+    monkeypatch.setattr(plugin, "_server", server, raising=False)
+    monkeypatch.setattr(plugin, "_config", _config_with({"language": "en_us"}), raising=False)
+    plugin._apply_language(server, plugin._config)
+
+    _name, _version, _bars, total = plugin._title_bar_metrics(server)
+    plain = str(plugin._rule_line())
+    assert display_width(plain) == total
+    assert display_width(str(plugin._title_line(server))) == total, "标题栏与收尾线不是同一个 total"
+
+    long_caption = "x" * 200
+    rule = str(plugin._rule_line(long_caption))
+
+    assert display_width(rule) == total, "caption 太长时收尾线反而变宽了"
+    assert rule.startswith("=") and rule.endswith("=")
+    assert "..." in rule, "截断处没有省略号"
+    assert long_caption not in rule
+    # 保留展示下限：两侧仍是 ``_TITLE_BAR_MIN`` 个起
+    assert display_width(plugin._fit_rule_caption(long_caption, 10)) <= 10
+
+
+@pytest.mark.parametrize(
+    "path,low,high",
+    [
+        ("check.start_delay_seconds", 0, 3600),
+        ("check.interval_hours", 0, 720),
+        ("download.max_size_mb", 1, 8192),
+        ("network.concurrent_requests", 1, 32),
+        ("network.requests_per_minute", 0, 1000),
+        ("network.timeout_seconds", 1, 300),
+        ("cleanup.max_age_days", 0, 3650),
+        ("command_permission_level", 0, 4),
+        ("report.admin_permission", 0, 4),
+        ("report.in_game_permission", 0, 4),
+    ],
+)
+def test_an_out_of_range_number_is_clamped_and_reported(tmp_path, path, low, high):
+    """上限和下限一样重要：``interval_hours: 100000`` 等于把定时检查静默关掉。"""
+    import mod_update_checker as plugin
+
+    server = _FakeServer(tmp_path)
+    for value, used in ((high + 1, high), (low - 1 if low else -1, low)):
+        config = _config_with({path: value})
+        changed = plugin._clamp_and_report(server, config)
+
+        section, name = path.split(".", 1) if "." in path else (None, path)
+        target = getattr(config, section) if section else config
+        assert getattr(target, name) == used, (path, value)
+        assert path in changed, changed
+        assert any(path in line for line in server.logger.messages), server.logger.messages
+
+
+def test_a_number_inside_its_range_is_left_alone(tmp_path):
+    """钳制不能变成每一屏都在念的噪音——出厂配置必须一句话都不说。"""
+    import mod_update_checker as plugin
+
+    server = _FakeServer(tmp_path)
+
+    changed = plugin._clamp_and_report(server, _config_with({}))
+
+    assert changed == []
+    assert server.logger.messages == [], server.logger.messages
+

@@ -15,7 +15,10 @@ missing, the entry is skipped and said to be skipped.
 **An existing file is never overwritten with different content.** If the name is taken by a
 different file, the new one lands under a name derived from its own hash, so the older build
 stays available for a rollback. Re-running is therefore idempotent: the same expected hash
-always maps to the same name, and a file already there with the right hash is left alone.
+always maps to the same name, and a file already there with the right hash is left alone. The
+same promise governs this mod's *own* earlier download: a superseded file is removed only once
+its replacement has been verified and moved into place, so a failed download leaves the older
+build exactly where it was.
 
 **The size is bounded twice.** Once against the size Modrinth declares (a cheap pre-flight)
 and again against the bytes that actually arrive, because the declared size is upstream data
@@ -28,6 +31,7 @@ directly unit-testable.
 import hashlib
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -97,6 +101,14 @@ _CHUNK = 65536
 _RETRY_BACKOFF_SECONDS = 0.25
 _RETRY_BACKOFF_CAP = 2.0
 
+#: One lock for the whole process, not one per :class:`DownloadLedger` instance. The instances
+#: are the problem rather than the solution: every caller builds its own (the check thread, the
+#: stop-event install, ``!!muc download``, ``!!muc install``, the status page), and each one
+#: holds its own snapshot of the file. A per-instance lock would let two of them write the same
+#: target concurrently, which is the very thing being prevented. Re-entrant, because
+#: :meth:`DownloadLedger.save` is also called from paths that already hold it.
+_LEDGER_LOCK = threading.RLock()
+
 
 def _safe_stem(raw: str, fallback: str) -> str:
     """A bare, writable stem with no separators and no directory meaning.
@@ -128,21 +140,22 @@ def safe_jar_name(raw: str, fallback: str = "mod") -> str:
     The fallback is used when the name is unusable — empty, only dots, or a Windows device
     name — so a caller always gets a name it can write. It is assumed to be safe already
     (the downloader builds it from the mod id).
+
+    The extension is taken off **only when it really is a ``.jar``**, and is still filtered
+    through :func:`_safe_stem` as part of the name otherwise. That distinction is the whole
+    reason this is fiddly: a name that is not a jar (``mod.zip``) has to keep what it was and
+    merely gain the extension, while a name that is only an extension (``.jar``) has to fall
+    back rather than collapse into ``.jar``. Stripping unconditionally would turn a directory
+    called ``mod.zip`` into ``mod.jar`` and lose the fact that it was not a jar at all.
     """
     text = str(raw or "")
     text = text.replace("\\", "/").split("/")[-1]
     text = _ILLEGAL.sub("_", text)
-
-    # Split the extension off before filtering, so "my mod .jar" does not lose its ".jar" to
-    # the trailing-space strip, and so a name that is only an extension does not survive.
-    stem, dot, extension = text.rpartition(".")
-    if dot and extension.strip().lower() == "jar":
-        stem = stem
-    else:
-        # Not a .jar name at all: keep whatever it was as the stem and impose the extension.
-        stem = text
-    stem = _safe_stem(stem, fallback)
-    return "{}.jar".format(stem)
+    # Windows silently drops trailing spaces and dots, so ``"x.jar "`` and ``"x.jar."`` are both
+    # the same file as ``"x.jar"`` — and the suffix test below has to see the name the disk would.
+    text = text.strip().rstrip(".")
+    stem = text[: -len(".jar")] if text.lower().endswith(".jar") else text
+    return "{}.jar".format(_safe_stem(stem, fallback))
 
 
 def is_safe_component(name: str) -> Tuple[bool, str]:
@@ -255,6 +268,15 @@ class DownloadLedger:
 
     Every method is defensive: the file is hand-editable, and a plugin must not fail a check
     over a malformed JSON it wrote itself in an earlier version.
+
+    **Writes are targeted, not wholesale.** Several instances of this class exist at once — the
+    check thread and MCDR's command thread each build their own — and each starts from its own
+    snapshot of the file. Writing that snapshot back would silently erase whatever the other
+    instance had written in the meantime: an admin typing ``!!muc install 3`` would be told the
+    download was authorised, and the check's next save would drop the mark, so the stop-time
+    install would find nothing and do nothing. So ``save`` re-reads the file, applies only the
+    keys *this* instance changed, and writes the merged result. A deletion is applied because
+    it was asked for, never merely because another instance's snapshot did not mention the key.
     """
 
     VERSION = 1
@@ -263,23 +285,32 @@ class DownloadLedger:
         self.path: Optional[Path] = Path(path) if path is not None else None
         self.logger = logger
         self._records: Dict[str, Dict[str, Any]] = {}
+        #: Keys this instance has changed since its last save, and how. ``None`` means "delete
+        #: it"; a dict is the record to store. Only these keys are ever written back.
+        self._dirty: Dict[str, Optional[Dict[str, Any]]] = {}
         self._load()
 
     def _load(self) -> None:
+        self._records = self._read_records()
+
+    def _read_records(self) -> Dict[str, Dict[str, Any]]:
+        """The usable records currently on disk, or ``{}`` when there are none."""
         if self.path is None or not self.path.is_file():
-            return
+            return {}
         data = read_json(self.path)
         if data is None:
             self._debug("download ledger unreadable, starting empty")
-            return
+            return {}
         if not isinstance(data, dict) or data.get("version") != self.VERSION:
-            return
+            return {}
         records = data.get("mods")
         if not isinstance(records, dict):
-            return
+            return {}
+        usable: Dict[str, Dict[str, Any]] = {}
         for key, record in records.items():
-            if isinstance(record, dict) and isinstance(record.get("file"), str):
-                self._records[str(key)] = dict(record)
+            if isinstance(record, dict) and _usable_record(record):
+                usable[str(key)] = dict(record)
+        return usable
 
     def _debug(self, message: str) -> None:
         handler = getattr(self.logger, "debug", None) if self.logger else None
@@ -311,10 +342,18 @@ class DownloadLedger:
         for key, record in list(self._records.items()):
             if not (base / str(record.get("file", ""))).is_file():
                 dropped.append(key)
-                self._records.pop(key, None)
+                self._mark_deleted(key)
         return dropped
 
     # -- writing -----------------------------------------------------------------------
+
+    def _mark_changed(self, key: str, record: Optional[Dict[str, Any]]) -> None:
+        """Remember that this instance owns ``key`` now, and what it should become."""
+        self._dirty[key] = dict(record) if record is not None else None
+
+    def _mark_deleted(self, key: str) -> None:
+        self._records.pop(key, None)
+        self._mark_changed(key, None)
 
     def record(
         self,
@@ -339,7 +378,18 @@ class DownloadLedger:
         have that approval dropped by the next unrelated check — while an approval for a build
         that has since been replaced by a different one must not carry over to bytes nobody
         agreed to install.
+
+        A ``file_name`` that is not a bare file name is refused outright rather than stored.
+        Nothing in the plugin passes one, so the only way to reach this is a caller that has
+        gone wrong — and a record pointing outside the download folder is a much worse outcome
+        than a refused write. :meth:`_load` applies the same rule to the file on disk.
         """
+        ok, reason = is_safe_component(file_name)
+        if not ok:
+            self._debug(
+                "refusing to record {} for {}: {}".format(file_name, key, reason)
+            )
+            return
         digest = (sha1 or "").lower()
         previous = self._records.get(key)
         keep_approval = bool(
@@ -359,6 +409,7 @@ class DownloadLedger:
         if keep_approval:
             record["approved"] = True
         self._records[key] = record
+        self._mark_changed(key, record)
 
     def approve(self, key: str) -> bool:
         """Mark this download as authorised for the next install. ``False`` if unknown.
@@ -371,6 +422,7 @@ class DownloadLedger:
         if record is None:
             return False
         record["approved"] = True
+        self._mark_changed(key, record)
         return True
 
     def approved_keys(self) -> List[str]:
@@ -378,16 +430,35 @@ class DownloadLedger:
         return sorted(key for key, record in self._records.items() if record.get("approved"))
 
     def forget(self, key: str) -> None:
-        self._records.pop(key, None)
+        self._mark_deleted(key)
 
     def save(self) -> None:
+        """Merge this instance's changes into the file and write it back.
+
+        Read-modify-write rather than "write what I have in memory": the other instances are
+        alive at the same time and their changes are just as real. Under one process-wide lock,
+        so two savers cannot interleave their read and their write.
+        """
         if self.path is None:
             return
-        payload = {"version": self.VERSION, "mods": self._records}
-        try:
-            write_json(self.path, payload, sort_keys=True)
-        except OSError as error:
-            self._debug("could not write the download ledger: {}".format(error))
+        with _LEDGER_LOCK:
+            merged = self._read_records()
+            for key, record in self._dirty.items():
+                if record is None:
+                    merged.pop(key, None)
+                else:
+                    merged[key] = dict(record)
+            in_memory = self._records
+            self._records = merged
+            try:
+                write_json(self.path, {"version": self.VERSION, "mods": merged}, sort_keys=True)
+            except OSError as error:
+                self._records = in_memory
+                self._debug("could not write the download ledger: {}".format(error))
+                return
+            # Only now are the changes on disk; until this point they are still pending, so a
+            # failed write is retried by the next save rather than silently forgotten.
+            self._dirty = {}
 
 
 def _sha1_of(path: Path) -> str:
@@ -399,6 +470,46 @@ def _sha1_of(path: Path) -> str:
                 break
             digest.update(block)
     return digest.hexdigest()
+
+
+def _safe_sha1(path: Path) -> str:
+    """The SHA-1 of ``path``, or ``""`` when it cannot be read.
+
+    One definition, because the two callers want opposite-sounding things from the same
+    failure. :meth:`Downloader._read_hash` uses it to say "not the bytes we recorded", and
+    :func:`classify_downloaded` to say "not the build we wanted" — both of which are correct
+    answers for a file that is locked, denied or broken. What must not happen is the exception
+    escaping: a jar the antivirus happens to be holding open is not a reason to abandon a check.
+    """
+    try:
+        return _sha1_of(path)
+    except OSError:
+        return ""
+
+
+def _safe_name_of(record: Dict[str, Any], field: str) -> str:
+    """One of a record's file names, or ``""`` when it is missing or not a bare file name.
+
+    The ledger is hand-editable, so ``file`` can say ``../../server.properties``. That value is
+    used to build a path inside a managed folder, which makes it an input worth checking at the
+    door rather than at each of the three places that later join it to a folder.
+    """
+    value = record.get(field)
+    if not isinstance(value, str) or not value.strip():
+        return ""
+    ok, _reason = is_safe_component(value)
+    return value if ok else ""
+
+
+def _usable_record(record: Dict[str, Any]) -> bool:
+    """Whether a record from the file may be used at all.
+
+    A record with no file name, or one that is a path in disguise, is dropped: it describes a
+    file this plugin did not download, and acting on it could move a file from outside the
+    download folder into ``mods/``. The remaining fields are read defensively wherever they are
+    used, so nothing else here needs to reject a record.
+    """
+    return bool(_safe_name_of(record, "file"))
 
 
 def classify_downloaded(
@@ -441,7 +552,13 @@ def classify_downloaded(
 
         for name in names:
             path = base / name
-            if path.is_file() and _sha1_of(path) == expected:
+            # ``_safe_sha1`` rather than a bare call: a jar that cannot be read right now — a
+            # share conflict, an ACL, an antivirus scan — means "not the build we wanted", and
+            # leaving the entry as an update hands it to the download stage, which is the right
+            # answer. Letting the ``OSError`` out would abort the phase that produced it, and in
+            # the manual-download path would report a *failed download* for a file that is
+            # already on disk and already verified.
+            if path.is_file() and _safe_sha1(path) == expected:
                 entry.status = STATUS_AWAITING_INSTALL
                 moved.append(entry)
                 break
@@ -517,20 +634,34 @@ class Downloader:
     # -- targets -----------------------------------------------------------------------
 
     def _read_hash(self, path: Path) -> str:
-        try:
-            return _sha1_of(path)
-        except OSError as error:
-            self._log("debug", "could not hash {}: {}".format(path, error))
+        digest = _safe_sha1(path)
+        if not digest:
+            self._log("debug", "could not hash {}".format(path))
+        return digest
+
+    def _recorded_name(self, entry: UpdateEntry) -> str:
+        """The file the ledger says belongs to this mod, when it is a usable bare name.
+
+        The ledger is hand-editable, and this value is joined to the download folder in two
+        places below. ``_safe_name_of`` is the same door check the record is given on the way in
+        and on the way out of the file, so a value that is a path is dropped here rather than
+        being used to look somewhere else.
+        """
+        if self.ledger is None:
             return ""
+        return _safe_name_of({"file": self.ledger.file_of(entry_key(entry))}, "file")
 
-    def _retire_older_download(self, entry: UpdateEntry) -> str:
-        """Delete this mod's previously downloaded file, if it is now for an older build.
+    def _retire_older_download(self, entry: UpdateEntry) -> Optional[Path]:
+        """The older download this entry supersedes, still on disk. ``None`` when there is none.
 
-        Returns the name that was removed, or ``""``. This is what stops the folder filling up
-        with every version a mod has ever been through: the ledger knows the old file belongs
-        to *this* mod, so it can be removed deliberately rather than left to accumulate.
+        Nothing is removed here, and that ordering is the point. The module promises that the
+        older build "stays available for a rollback", and a build that has already been deleted
+        cannot be rolled back to: if the new download then fails — a 404, a dropped stream, a
+        killed server — the folder is left with neither the old file nor the new one, and the
+        admin is told only that a download failed. So the decision is made here and the deletion
+        happens after the replacement is in place, in :meth:`_retire_now`.
 
-        Two conditions are required before deleting anything, and both matter:
+        Two conditions are required before a file is ever offered up, and both matter:
 
         * the recorded hash must differ from the build we now want — otherwise the file on disk
           is the file we want, and re-downloading it would be wasted traffic;
@@ -539,47 +670,51 @@ class Downloader:
           wrote would be the worst possible bug in a plugin that only otherwise creates files.
         """
         if self.ledger is None:
-            return ""
+            return None
         key = entry_key(entry)
         record = self.ledger.get(key)
         if not record:
-            return ""
-        name = str(record.get("file", ""))
+            return None
+        name = _safe_name_of(record, "file")
         if not name:
-            return ""
+            return None
         path = self.options.folder / name
         if not path.is_file():
             # Already gone; the ledger is just stale.
             self.ledger.forget(key)
-            return ""
+            return None
 
         recorded = str(record.get("sha1", "")).lower()
         wanted = (entry.download_sha1 or "").lower()
         if recorded and recorded == wanted:
             # The file on disk is the build we want. Not ours to delete.
-            return ""
+            return None
         if recorded and self._read_hash(path) != recorded:
             # Different content from what we wrote. Someone else's file now — leave it.
             self._log(
                 "debug",
                 "{} no longer matches what was recorded, leaving it alone".format(path.name),
             )
-            return ""
+            return None
+        return path
 
+    def _retire_now(self, entry: UpdateEntry, path: Optional[Path]) -> None:
+        """Remove a superseded download, now that its replacement is safely in place."""
+        if path is None or self.ledger is None:
+            return
         try:
             path.unlink()
         except OSError as error:
             self._log("debug", "could not remove the older download {}: {}".format(path, error))
-            return ""
+            return
 
-        self.ledger.forget(key)
+        self.ledger.forget(entry_key(entry))
         self._log(
             "info",
             "removed the older download {} (superseded by {})".format(
-                name, entry.latest_version or "a newer build"
+                path.name, entry.latest_version or "a newer build"
             ),
         )
-        return name
 
     def _choose_target(self, entry: UpdateEntry) -> Tuple[Optional[Path], bool, str]:
         """``(path, already_present, reason)``. ``path`` is ``None`` when nothing can be used.
@@ -600,10 +735,9 @@ class Downloader:
         suffixed = plain.with_name("{}.{}{}".format(plain.stem, expected[:8], plain.suffix))
 
         candidates: List[Path] = []
-        if self.ledger is not None:
-            recorded = self.ledger.file_of(entry_key(entry))
-            if recorded:
-                candidates.append(self.options.folder / recorded)
+        recorded = self._recorded_name(entry)
+        if recorded:
+            candidates.append(self.options.folder / recorded)
         candidates.extend([plain, suffixed])
 
         for path in candidates:
@@ -614,12 +748,10 @@ class Downloader:
         # free, so a re-download replaces our own file instead of multiplying names; then the
         # upstream name; then the hash-suffixed one rather than destroying a different build an
         # admin may need for a rollback.
-        if self.ledger is not None:
-            recorded = self.ledger.file_of(entry_key(entry))
-            if recorded:
-                path = self.options.folder / recorded
-                if not path.exists():
-                    return path, False, ""
+        if recorded:
+            path = self.options.folder / recorded
+            if not path.exists():
+                return path, False, ""
         if not plain.exists():
             return plain, False, ""
         if not suffixed.exists():
@@ -657,6 +789,9 @@ class Downloader:
         attempts = max(1, int(self.options.retries) + 1)
         part = target.with_name(target.name + ".part")
         outcome = None
+        #: How many attempts were really made, which is not the same as how many were allowed:
+        #: a 404 or a write error is not retried, so the log must not claim four tries for one.
+        made = 0
         for attempt in range(1, attempts + 1):
             if attempt > 1:
                 self._log(
@@ -665,6 +800,7 @@ class Downloader:
                         entry.name, attempt, attempts
                     ),
                 )
+            made = attempt
             outcome, retryable = self._transfer_once(entry, target, part)
             if outcome.status == STATUS_DOWNLOADED:
                 return outcome
@@ -673,10 +809,10 @@ class Downloader:
             delay = min(_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)), _RETRY_BACKOFF_CAP)
             time.sleep(delay)
 
-        if attempts > 1 and outcome is not None and outcome.status == STATUS_FAILED:
+        if made > 1 and outcome is not None and outcome.status == STATUS_FAILED:
             # Say how hard it was tried, otherwise "download failed" reads like a single attempt
             # and the admin has no way to tell a flaky link from a file that is not there.
-            outcome.detail = "{} (after {} attempts)".format(outcome.detail or "failed", attempts)
+            outcome.detail = "{} (after {} attempts)".format(outcome.detail or "failed", made)
         return outcome  # type: ignore[return-value]
 
     def _transfer_once(
@@ -795,42 +931,52 @@ class Downloader:
             return outcomes
 
         for entry in wanted:
-            # Before choosing a name: drop this mod's older download, if the ledger says the
-            # file sitting there is one of ours for a version that has now been superseded.
-            self._retire_older_download(entry)
-
-            target, present, reason = self._choose_target(entry)
-            if target is None:
-                outcomes.append(
-                    DownloadOutcome(
-                        file_name=entry.file_name,
-                        mod_id=entry.mod_id,
-                        name=entry.name,
-                        status=STATUS_FAILED,
-                        detail=reason,
+            # Before choosing a name: work out whether this mod's older download is superseded.
+            # Deciding it here keeps ``_choose_target`` looking at a folder that still holds the
+            # old file, which is what lets it reuse our own name rather than invent a new one.
+            superseded = self._retire_older_download(entry)
+            try:
+                target, present, reason = self._choose_target(entry)
+                if target is None:
+                    outcomes.append(
+                        DownloadOutcome(
+                            file_name=entry.file_name,
+                            mod_id=entry.mod_id,
+                            name=entry.name,
+                            status=STATUS_FAILED,
+                            detail=reason,
+                        )
                     )
-                )
-                continue
-            if present:
-                self._remember(entry, target)
-                outcomes.append(
-                    DownloadOutcome(
-                        file_name=entry.file_name,
-                        mod_id=entry.mod_id,
-                        name=entry.name,
-                        status=STATUS_ALREADY_PRESENT,
-                        path=str(target),
+                    continue
+                if present:
+                    # The file on disk is already the build we want, so there is nothing left to
+                    # supersede and nothing to fetch — but the record still has to be refreshed.
+                    self._retire_now(entry, superseded)
+                    self._remember(entry, target)
+                    outcomes.append(
+                        DownloadOutcome(
+                            file_name=entry.file_name,
+                            mod_id=entry.mod_id,
+                            name=entry.name,
+                            status=STATUS_ALREADY_PRESENT,
+                            path=str(target),
+                        )
                     )
-                )
-                continue
+                    continue
 
-            outcome = self._fetch(entry, target)
-            if outcome.status == STATUS_DOWNLOADED:
-                self._remember(entry, target)
-            outcomes.append(outcome)
+                outcome = self._fetch(entry, target)
+                if outcome.status == STATUS_DOWNLOADED:
+                    # Only now: the replacement is in place, so the rollback point can go.
+                    self._retire_now(entry, superseded)
+                    self._remember(entry, target)
+                outcomes.append(outcome)
+            finally:
+                # One save attempt per mod, whatever happened — including the case where the old
+                # file was dropped above merely because it had already vanished. A crash between
+                # the file and its record is what leaves an unclaimed jar behind.
+                if self.ledger is not None:
+                    self.ledger.save()
 
-        if self.ledger is not None:
-            self.ledger.save()
         return outcomes
 
     def _remember(self, entry: UpdateEntry, path: Path) -> None:

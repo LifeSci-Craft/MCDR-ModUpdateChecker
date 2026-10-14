@@ -14,7 +14,9 @@ they already know about their own files, and the check stops having to guess.
 The file is **read, never written** by the plugin. It is the admin's document; generating it
 would only produce something they then have to overwrite. A file that cannot be understood
 is reported and then ignored — never repaired, never deleted, and never a reason to fail a
-check.
+check. "Cannot be understood" includes a file that cannot be *decoded*: an editor on a
+Chinese Windows install saves ``UTF-8`` as GBK unless it is told otherwise, and that file is
+reported and ignored like any other unusable one, with a byte-order mark tolerated.
 
 Shape (every part optional; a bare ``{}`` is valid and means "no mappings")::
 
@@ -116,14 +118,17 @@ class ProjectMap:
     def _load(self) -> None:
         if self.path is None or not self.path.is_file():
             return
+        # ``utf-8-sig`` rather than ``json.load`` on a hand-decoded string, and one ``except``
+        # that covers decoding as well as I/O. Decoding used to sit outside the ``except``, and
+        # ``UnicodeDecodeError`` is a ``ValueError`` rather than an ``OSError`` — so a map file
+        # saved as GBK or ANSI by a Chinese Windows editor escaped this method entirely and took
+        # down the whole check, plus the status page that reads the map without a guard. The
+        # codec strips a byte-order mark when there is one and behaves exactly like ``utf-8``
+        # when there is not.
         try:
-            raw = self.path.read_text(encoding="utf-8")
-        except OSError as error:
-            self.error = "{}: {}".format(type(error).__name__, error)
-            return
-        try:
-            data = json.loads(raw)
-        except ValueError as error:
+            with open(str(self.path), "r", encoding="utf-8-sig") as handle:
+                data = json.load(handle)
+        except (OSError, ValueError) as error:
             self.error = "{}: {}".format(type(error).__name__, error)
             return
         if not isinstance(data, dict):

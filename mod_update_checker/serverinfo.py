@@ -14,6 +14,13 @@ The update check needs two facts, and neither is written down anywhere convenien
   answer came from, and the report prints it, which lets an admin spot a bad autodetect
   immediately and override it in the config.
 
+  The last source is the one with the least standing: :func:`_vote_mc_version` reads the
+  ``depends.minecraft`` ranges the mods declare themselves and takes the most often declared
+  *lower* bound. It cannot verify that the version it settles on exists as a release, because
+  that needs an HTTP client this module deliberately does not have — the caller that owns one
+  is where such a check belongs, and the report already prints ``mc_version_source`` so a guess
+  is always visible as one.
+
 * **Loader** — assumed from the configuration (``fabric`` by default), but cross-checked
   against what the jars on disk actually are, because a folder of Forge jars on a "Fabric"
   server is exactly the kind of mix-up worth surfacing.
@@ -27,7 +34,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .scanner import ScanResult
-from .versioning import covers
+from .versioning import _INTERVAL, RangeSpec, covers
+from .versioning import compare as _compare_versions
 
 __all__ = [
     "ServerContext",
@@ -169,25 +177,45 @@ def detect_loader_from_mods(scan: ScanResult) -> Dict[str, int]:
 def _vote_mc_version(mods: Iterable) -> Optional[str]:
     """Guess the game version from the mods' own ``depends.minecraft`` ranges.
 
-    Only used when nothing better is available. The most frequently declared *lowest*
-    bound wins, because that is the version a range such as ``>=1.21 <1.22`` was built for;
-    a range with no usable bound is ignored rather than defaulted.
+    Only used when nothing better is available. The most frequently declared *lowest* bound
+    wins, because that is the version a range such as ``>=1.21 <1.22`` was built for. The
+    **upper** bound is deliberately not counted: a Fabric mod declares one, it is the version
+    *after* the last supported one, and counting it lets the vote settle on a version every one
+    of those mods refuses to run on. A tie is broken by :func:`~.versioning.compare` — the
+    newest of the tied versions — because "1.22" beats "1.21" and "1.9" beats "1.21" when
+    compared as strings, and the whole point of this function is to avoid a guess that makes
+    every mod look incompatible.
     """
     votes: Dict[str, int] = {}
     for mod in mods:
         if not (mod.metadata and mod.metadata.mc_range):
             continue
-        spec = mod.metadata.mc_range
-        for candidate in _candidate_versions(spec):
+        for candidate in _candidate_versions(mod.metadata.mc_range):
             votes[candidate] = votes.get(candidate, 0) + 1
     if not votes:
         return None
-    best = max(votes.items(), key=lambda item: (item[1], item[0]))
-    return best[0] if best[1] > 0 else None
+
+    most = max(votes.values())
+    if most <= 0:
+        return None
+    # Ties are broken by comparing versions, not by comparing strings: "1.22" > "1.21" and
+    # "1.9" > "1.21" as text, and picking either of those over the real answer is how a guess
+    # makes every mod look like it has no compatible build.
+    newest = None
+    for name, count in votes.items():
+        if count != most:
+            continue
+        if newest is None or _compare_versions(name, newest) > 0:
+            newest = name
+    return newest
 
 
-def _candidate_versions(spec) -> List[str]:
-    """Every version-ish token an expression mentions, in declaration order."""
+def _candidate_versions(spec: RangeSpec) -> List[str]:
+    """Every **lower** bound an expression mentions, in declaration order.
+
+    ``>=1.21 <1.22`` contributes ``1.21``; the ``<1.22`` half is where the first version that is
+    *not* supported starts, so it is not a version any of these mods was built for.
+    """
     texts: Sequence[str]
     if isinstance(spec, str):
         texts = [spec]
@@ -197,9 +225,63 @@ def _candidate_versions(spec) -> List[str]:
         texts = [str(item) for item in spec]
     found: List[str] = []
     for text in texts:
-        for token in re.findall(r"\d+(?:\.\d+)+", text):
+        for token in _lower_bounds(text):
             if token not in found:
                 found.append(token)
+    return found
+
+
+def _lower_bounds(expression: str) -> List[str]:
+    """The version tokens of one expression that are lower bounds.
+
+    Bracket intervals (``[1.21,1.22)``), operator lists (``>=1.21 <1.22``) and bare versions
+    (``1.21``, ``1.21.x``) are all read, and an upper bound is skipped in each of those spellings.
+    The rules are deliberately permissive about what a *bound* looks like and strict about which
+    side it is on: misreading the side is the failure that matters, and the exact version is
+    checked against the API later anyway.
+    """
+    text = str(expression or "").strip()
+    if not text or text in ("*", "x", "X"):
+        return []
+
+    interval = _INTERVAL.match(text)
+    if interval:
+        low = interval.group(2).strip()
+        return _versions_of(low) if low else []
+
+    bounds: List[str] = []
+    for raw in re.split(r"[,\s]+", text):
+        if not raw:
+            continue
+        if raw.startswith("<"):
+            # ``<1.22`` and ``<=1.22``: the first version *not* supported, or the last one that
+            # is; either way not what the range was built for.
+            continue
+        token = raw
+        for operator in (">>=", ">=", "<=", "==", "~>", "^>", "~", "^", ">", "="):
+            if token.startswith(operator):
+                token = token[len(operator):]
+                break
+        token = token.strip()
+        if not token or token in ("*", "x", "X"):
+            continue
+        if token.startswith("<"):
+            continue
+        bounds.extend(_versions_of(token))
+    return bounds
+
+
+def _versions_of(text: str) -> List[str]:
+    """Version-shaped tokens in ``text``, with a trailing wildcard segment dropped.
+
+    ``1.21.x`` is the range ``1.21.*``, so the useful bound is ``1.21`` — keeping the ``x`` would
+    put a literal ``x`` in the vote and in the Modrinth query.
+    """
+    found: List[str] = []
+    for token in re.findall(r"\d+(?:\.\d+)+(?:\.\d+)*|\d+\.[xX*]", text):
+        cleaned = re.sub(r"\.(?:[xX*])$", "", token)
+        if cleaned and cleaned not in found:
+            found.append(cleaned)
     return found
 
 

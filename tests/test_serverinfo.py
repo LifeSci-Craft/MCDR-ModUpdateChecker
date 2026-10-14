@@ -226,6 +226,111 @@ def test_context_describe_without_a_version():
 
 
 # --------------------------------------------------------------------------------------
+# The last-resort vote
+#
+# Reached only when the config says ``auto``, MCDR has parsed no ``ServerInformation`` and
+# ``logs/latest.log`` has no startup line either — a server that has been restarted without the
+# log being written, or whose log was rotated. The answer becomes the game-version filter that
+# goes to Modrinth, so a wrong guess makes **every** mod report "no compatible build": a fake
+# result that looks exactly like a real one, on every line at once.
+# --------------------------------------------------------------------------------------
+
+
+def test_the_vote_counts_lower_bounds_not_upper_ones(tmp_path):
+    """``>=1.21 <1.22`` was built for 1.21. The ``<1.22`` half is what it refuses.
+
+    Counting both made the vote land on 1.22 — the version these very mods exclude — and every
+    one of them then came back from Modrinth with nothing for this game version.
+    """
+    scan = make_mods(
+        tmp_path,
+        [
+            ("a.jar", "a", ">=1.21 <1.22", "fabric"),
+            ("b.jar", "b", ">=1.21 <1.22", "fabric"),
+        ],
+    )
+    context = detect(working_directory=str(tmp_path), configured_version="auto", scan=scan)
+
+    assert context.mc_version == "1.21"
+    assert context.mc_version_source == "mods"
+
+
+def test_the_vote_ignores_upper_bounds_in_every_spelling(tmp_path):
+    from mod_update_checker.serverinfo import _candidate_versions
+
+    assert _candidate_versions(">=1.21 <1.22") == ["1.21"]
+    assert _candidate_versions("[1.21,1.22)") == ["1.21"]
+    assert _candidate_versions("[1.21,1.22]") == ["1.21"]
+    assert _candidate_versions("<=1.21") == []
+    assert _candidate_versions("<1.22") == []
+    assert _candidate_versions("~1.21.4") == ["1.21.4"]
+    assert _candidate_versions("^1.20") == ["1.20"]
+    assert _candidate_versions("1.21.x") == ["1.21"]
+    assert _candidate_versions("1.21") == ["1.21"]
+    assert _candidate_versions("") == []
+    assert _candidate_versions(None) == []
+    # A list is *any of*, so every alternative contributes its own bound.
+    assert _candidate_versions([">=1.21 <1.22", ">=1.20.1"]) == ["1.21", "1.20.1"]
+
+
+def test_a_tie_is_broken_by_comparing_versions_not_strings(tmp_path):
+    """``max(key=lambda item: (count, name))`` picked "1.9" out of 1.9 / 1.21 / 1.20.1.
+
+    As text "1.9" is the largest; as a version it is the oldest. The newest of the tied bounds
+    is the right answer: a mod that declares ``>=1.21`` also runs on everything it declares
+    above, so the newest bound is the one the fewest of them exclude.
+    """
+    scan = make_mods(
+        tmp_path,
+        [
+            ("a.jar", "a", ">=1.9", "fabric"),
+            ("b.jar", "b", ">=1.21", "fabric"),
+            ("c.jar", "c", ">=1.20.1", "fabric"),
+        ],
+    )
+    context = detect(working_directory=str(tmp_path), configured_version="auto", scan=scan)
+
+    assert context.mc_version == "1.21"
+
+
+def test_the_vote_needs_a_declared_range(tmp_path):
+    """A range with no usable bound is ignored rather than defaulted to something."""
+    scan = make_mods(
+        tmp_path,
+        [
+            ("a.jar", "a", None, "fabric"),
+            ("b.jar", "b", "<1.22", "fabric"),
+        ],
+    )
+    context = detect(working_directory=str(tmp_path), configured_version="auto", scan=scan)
+
+    assert context.mc_version is None
+    assert context.mc_version_source == "unknown"
+
+
+def test_the_vote_is_only_used_when_nothing_better_exists(tmp_path):
+    """The log beats it: a guess must never override a statement."""
+    path = tmp_path / "logs" / "latest.log"
+    path.parent.mkdir(parents=True)
+    path.write_text(FABRIC_STARTUP, encoding="utf-8")
+    scan = make_mods(tmp_path, [("a.jar", "a", ">=1.20.1", "fabric")])
+
+    context = detect(working_directory=str(tmp_path), configured_version="auto", scan=scan)
+
+    assert context.mc_version == "26.3"
+    assert context.mc_version_source == "log"
+
+
+def test_the_vote_ignores_jars_with_no_metadata(tmp_path):
+    scan = make_mods(tmp_path, [("a.jar", "a", ">=1.21", "fabric")])
+    (tmp_path / "mods" / "library.jar").write_bytes(b"not a jar")
+
+    context = detect(working_directory=str(tmp_path), configured_version="auto", scan=scan)
+
+    assert context.mc_version == "1.21"
+
+
+# --------------------------------------------------------------------------------------
 # mod_supports_server_version
 # --------------------------------------------------------------------------------------
 

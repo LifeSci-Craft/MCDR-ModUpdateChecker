@@ -12,6 +12,8 @@ starts from "there may not be a file yet".
 """
 
 import json
+import threading
+from pathlib import Path
 
 import pytest
 
@@ -81,11 +83,56 @@ def test_a_failed_write_leaves_the_old_file_untouched(tmp_path, monkeypatch):
 
     # 目标文件一个字没变。留下的 ``.tmp`` 是这次失败的痕迹，不是会被当成结果读走的东西——
     # 这也正是「换个名字」和「就地改写」的区别：就地改写的那份文件现在是半份。
+    #
+    # 临时名的**前缀**是目标名，后面两个数字是 pid 与线程号（见
+    # ``test_two_threads_writing_one_file_do_not_share_a_temporary_name``）：它们的存在让两个
+    # 写者不可能用同一个临时名互相截断，而断言仍要求这份文件「看起来是这次写的」。
     assert target.read_text(encoding="utf-8") == before
     assert read_json(target) == {"version": 1, "mods": {"kept": {"file": "kept.jar"}}}
-    assert [path.name for path in tmp_path.iterdir()] == [
-        "download-manifest.json", "download-manifest.json.tmp",
-    ]
+    leftovers = [path.name for path in tmp_path.iterdir() if path.name != target.name]
+    assert len(leftovers) == 1, leftovers
+    assert leftovers[0].startswith("download-manifest.json.")
+    assert leftovers[0].endswith(".tmp")
+
+
+def test_two_threads_writing_one_file_do_not_share_a_temporary_name(tmp_path, monkeypatch):
+    """两个写者共用一个 ``.tmp`` 会互相截断——账本正是被两个线程同时写的那个文件。
+
+    这里不靠时序碰运气：临时名里的 pid 与线程号就是这条性质的实现，所以直接观察**两个线程
+    留下的临时名不同**。旧实现下两者都是 ``download-manifest.json.tmp``，断言立刻失败。
+    """
+    blocker = tmp_path / "download-manifest.json"
+    write_json(blocker, {"version": 1, "mods": {}})
+
+    seen = []
+    lock = threading.Lock()
+    ready = threading.Barrier(2)
+
+    def recording(source, _destination):
+        with lock:
+            seen.append(Path(source).name)
+        raise OSError("stop after the temporary file has been written")
+
+    def writer():
+        ready.wait()
+        with pytest.raises(OSError):
+            write_json(blocker, {"version": 1, "mods": {}})
+
+    monkeypatch.setattr("os.replace", recording)
+    threads = [threading.Thread(target=writer) for _index in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    monkeypatch.undo()
+
+    try:
+        assert len(seen) == 2, seen
+        assert seen[0] != seen[1], "two writers shared one temporary name: {}".format(seen)
+    finally:
+        for leftover in tmp_path.iterdir():
+            if leftover.name != blocker.name:
+                leftover.unlink()
 
 
 # -- reading -----------------------------------------------------------------------------

@@ -97,6 +97,13 @@ def _version(project_id, version_id, number, sha1, game_versions=("26.3",), date
     )
 
 
+def _channel_version(project_id, version_id, number, sha1, version_type, **kwargs):
+    """A version published in a channel other than ``release``."""
+    version = _version(project_id, version_id, number, sha1, **kwargs)
+    version.version_type = version_type
+    return version
+
+
 class Scenario:
     """A populated ``mods/`` folder plus the matching upstream catalogue."""
 
@@ -243,12 +250,12 @@ def make_options(upstream, **overrides):
     return CheckOptions(**values)
 
 
-def run_check(upstream, scenario, tmp_path, map_path=None, **overrides):
+def run_check(upstream, scenario, tmp_path, map_path=None, cache_path=None, **overrides):
     options = make_options(upstream, **overrides)
     checker = Checker(options)
     try:
         return checker.run(
-            scenario.scan(), SERVER, cache_path=None, map_path=map_path
+            scenario.scan(), SERVER, cache_path=cache_path, map_path=map_path
         )
     finally:
         checker.close()
@@ -615,6 +622,56 @@ def test_an_unreachable_upstream_is_reported_and_not_fatal(tmp_path, upstream):
     assert report.updates == []
 
 
+def test_the_request_count_does_not_grow_with_the_mod_count_when_the_upstream_is_down(
+    tmp_path, upstream
+):
+    """Twelve mods, four requests — not forty-eight.
+
+    The batched lookup failing told the plugin the platform as a whole was not answering. It
+    used to fall through to the per-mod name search anyway: one search per mod, each with its own
+    retries, each possibly waiting out the full request timeout. Twelve mods became forty-eight
+    requests over twelve seconds; two hundred mods become eight hundred requests over half an
+    hour of held check lock, during which no admin can run another check. None of them can
+    learn anything either — they all fail the same way.
+
+    The assertion is on the relationship, not on a magic number: "the same constant however many
+    mods there are" is the property, and it is what makes the cost predictable.
+    """
+    scenario = build_scenario(tmp_path, upstream)
+    upstream.fail_paths = {"/v2/version_files"}
+
+    report = run_check(upstream, scenario, tmp_path, retries=0)
+
+    assert upstream.count_path("/v2/search") == 0, "a name search was sent to a dead upstream"
+    assert upstream.count_path("/v2/project/proj-alpha/version") == 0
+    assert len(upstream.requests) == 1, upstream.request_paths()
+    assert "note.modrinth_unavailable" in dict(report.upstream_notes)
+    # And the verdicts say "no answer", which is what happened, rather than "no compatible build".
+    alpha = entry_for(report, "alpha")
+    assert alpha.status == STATUS_ERROR
+    assert "note.upstream_failed" in dict(alpha.notes)
+
+
+def test_a_bigger_folder_costs_exactly_the_same_when_the_upstream_is_down(tmp_path, upstream):
+    """The same scenario twice, with five times the mods: the request count must not move."""
+    counts = []
+    for extra in (0, 40):
+        folder = tmp_path / "run{}".format(extra)
+        folder.mkdir()
+        scenario = build_scenario(folder, upstream)
+        for index in range(extra):
+            scenario.add_jar(
+                "spare{}.jar".format(index), id="spare{}".format(index), version="1.0.0",
+                name="Spare {}".format(index),
+            )
+        upstream.fail_paths = {"/v2/version_files"}
+        upstream.clear_requests()
+        run_check(upstream, scenario, folder, retries=0)
+        counts.append(len(upstream.requests))
+
+    assert counts[0] == counts[1] == 1, counts
+
+
 def test_a_rate_limited_request_is_retried(tmp_path, upstream):
     scenario = build_scenario(tmp_path, upstream)
     upstream.scripted_responses = [429]
@@ -626,7 +683,7 @@ def test_a_rate_limited_request_is_retried(tmp_path, upstream):
 
 # --------------------------------------------------------------------------------------
 # The lookups that scale with the mod count are overlapped
-#
+# --------------------------------------------------------------------------------------
 # Two stages talk to the upstream once per mod, and both are latency-bound rather than
 # bandwidth-bound: a jar whose bytes are not published anywhere costs a search plus a version
 # list, and a jar that is published but has no build for this loader costs a version list. On a
@@ -824,6 +881,203 @@ def test_a_failed_search_is_not_cached_as_a_negative_verdict(tmp_path, upstream)
 
 
 # --------------------------------------------------------------------------------------
+# Release channels: ``check.include_beta`` / ``check.include_alpha``
+#
+# Modrinth tags every version with ``version_type``. The batched "newest build" endpoint has no
+# channel filter, so a project whose newest build is a beta comes back as the newest build — and
+# the plugin used to recommend it no matter what the config said. The setting existed, was
+# documented in the README, and did nothing at all.
+# --------------------------------------------------------------------------------------
+
+
+def test_a_beta_is_not_recommended_when_betas_are_switched_off(tmp_path, upstream):
+    scenario = Scenario(tmp_path, upstream)
+    mod = scenario.add_jar("gamma.jar", id="gamma", version="1.0.0", name="Gamma")
+    beta = _channel_version("proj-gamma", "gamma-200", "2.0.0-beta.1", "b" * 40, "beta",
+                            date="2026-02-01T00:00:00Z")
+    upstream.add_project(
+        FakeProject(
+            id="proj-gamma",
+            slug="gamma",
+            title="Gamma Mod",
+            versions=[
+                _version("proj-gamma", "gamma-100", "1.0.0", mod.sha1,
+                         filename="gamma-1.0.0.jar"),
+                beta,
+            ],
+        )
+    )
+
+    report = run_check(upstream, scenario, tmp_path, include_beta=False)
+
+    entry = entry_for(report, "gamma")
+    assert entry.latest_version != "2.0.0-beta.1", "a beta was recommended with betas switched off"
+    assert entry.release_channel == "release"
+    assert entry.status == STATUS_UP_TO_DATE
+
+
+def test_the_same_project_with_betas_switched_on_gets_the_beta(tmp_path, upstream):
+    """The other half of the pair: the setting has to *do* something when it is on."""
+    scenario = Scenario(tmp_path, upstream)
+    mod = scenario.add_jar("gamma.jar", id="gamma", version="1.0.0", name="Gamma")
+    beta = _channel_version("proj-gamma", "gamma-200", "2.0.0-beta.1", "b" * 40, "beta",
+                            date="2026-02-01T00:00:00Z")
+    upstream.add_project(
+        FakeProject(
+            id="proj-gamma",
+            slug="gamma",
+            title="Gamma Mod",
+            versions=[
+                _version("proj-gamma", "gamma-100", "1.0.0", mod.sha1,
+                         filename="gamma-1.0.0.jar"),
+                beta,
+            ],
+        )
+    )
+
+    report = run_check(upstream, scenario, tmp_path, include_beta=True)
+
+    entry = entry_for(report, "gamma")
+    assert entry.latest_version == "2.0.0-beta.1"
+    assert entry.release_channel == "beta"
+    assert entry.status == STATUS_UPDATE_AVAILABLE
+
+
+def test_the_setting_also_decides_which_channel_a_beta_is_judged_against(tmp_path, upstream):
+    """The name-search stage, not the hash stage.
+
+    ``_settle_by_versions`` is the other place a newest version is chosen, and it is reached for
+    every jar whose bytes Modrinth has never seen. It filters the channels first and the game
+    version second, because a beta that also fails the game-version filter would otherwise be
+    adopted as "the newest compatible build" with no pre-release warning at all.
+    """
+    scenario = Scenario(tmp_path, upstream)
+    scenario.add_jar("epsilon.jar", id="epsilon", version="1.0.0", name="Epsilon")
+    upstream.add_project(
+        FakeProject(
+            id="proj-epsilon",
+            slug="epsilon",
+            title="Epsilon Mod",
+            versions=[
+                _version("proj-epsilon", "eps-100", "1.0.0", "a" * 40),
+                _version("proj-epsilon", "eps-190", "1.9.0", "c" * 40,
+                         date="2026-01-15T00:00:00Z"),
+                _channel_version("proj-epsilon", "eps-200", "2.0.0-alpha.1", "d" * 40, "alpha",
+                                 date="2026-02-01T00:00:00Z"),
+            ],
+        )
+    )
+
+    without = run_check(upstream, scenario, tmp_path, include_alpha=False)
+    entry = entry_for(without, "epsilon")
+    assert entry.latest_version == "1.9.0"
+    assert entry.status == STATUS_UPDATE_AVAILABLE
+
+    upstream.clear_requests()
+    with_alpha = run_check(upstream, scenario, tmp_path, include_alpha=True)
+    entry = entry_for(with_alpha, "epsilon")
+    assert entry.latest_version == "2.0.0-alpha.1"
+    assert entry.release_channel == "alpha"
+
+
+def test_a_channel_fallback_says_so(tmp_path, upstream):
+    """Nothing in the accepted channels: fall back, and explain rather than silently recommend.
+
+    Without the note the report shows a beta version number with nothing to say why, which is
+    exactly the "recommended a pre-release and never mentioned it" complaint the setting exists
+    to prevent.
+    """
+    scenario = Scenario(tmp_path, upstream)
+    scenario.add_jar("epsilon.jar", id="epsilon", version="1.0.0", name="Epsilon")
+    upstream.add_project(
+        FakeProject(
+            id="proj-epsilon",
+            slug="epsilon",
+            title="Epsilon Mod",
+            versions=[
+                _channel_version("proj-epsilon", "eps-200", "2.0.0-beta.1", "d" * 40, "beta"),
+            ],
+        )
+    )
+
+    report = run_check(upstream, scenario, tmp_path, include_beta=False)
+
+    entry = entry_for(report, "epsilon")
+    notes = dict(entry.notes)
+    assert "note.prerelease_fallback" in notes
+    assert notes["note.prerelease_fallback"]["channel"] == "beta"
+    assert notes["note.prerelease_fallback"]["setting"] == "release"
+
+
+def test_beta_is_never_adopted_as_a_compatible_build_when_only_betas_exist(tmp_path, upstream):
+    """The run-judged version list holds a stable build that is *older* than the beta.
+
+    The verdict must be "there is a newer stable build", not "there is a newer build" — the
+    admin said they do not want pre-releases — and it must not be "no verdict" either: the
+    platform answered clearly.
+    """
+    scenario = Scenario(tmp_path, upstream)
+    mod = scenario.add_jar("gamma.jar", id="gamma", version="0.8.0", name="Gamma")
+    upstream.add_project(
+        FakeProject(
+            id="proj-gamma",
+            slug="gamma",
+            title="Gamma Mod",
+            versions=[
+                _version("proj-gamma", "gamma-local", "0.8.0", mod.sha1,
+                         filename="gamma-0.8.0.jar"),
+                _version("proj-gamma", "gamma-stable", "0.9.0", "e" * 40,
+                         date="2026-01-15T00:00:00Z", filename="gamma-0.9.0.jar"),
+                _channel_version("proj-gamma", "gamma-beta", "2.0.0-beta.1", "b" * 40, "beta",
+                                 date="2026-02-01T00:00:00Z"),
+            ],
+        )
+    )
+
+    report = run_check(upstream, scenario, tmp_path, include_beta=False)
+
+    entry = entry_for(report, "gamma")
+    assert entry.latest_version == "0.9.0", "a pre-release was adopted as the newest build"
+    assert entry.release_channel == "release"
+    assert entry.status == STATUS_UPDATE_AVAILABLE
+
+
+def test_the_channel_filter_costs_one_batched_lookup_not_one_per_mod(tmp_path, upstream):
+    """A per-mod request inside the loop is the regression this pins.
+
+    Each project whose batched answer is a pre-release needs its version list to answer at all.
+    Asking for them one at a time would be fine for one mod and a stampede for thirty, so they
+    are collected and asked in a single batch, before the loop that consumes the answers.
+    """
+    scenario = Scenario(tmp_path, upstream)
+    for index in range(6):
+        mod = scenario.add_jar(
+            "chan{}.jar".format(index), id="chan{}".format(index), version="1.0.0",
+            name="Chan {}".format(index),
+        )
+        upstream.add_project(
+            FakeProject(
+                id="proj-chan{}".format(index),
+                slug="chan{}".format(index),
+                title="Chan {}".format(index),
+                versions=[
+                    _version("proj-chan{}".format(index), "c-100", "1.0.0", mod.sha1),
+                    _channel_version("proj-chan{}".format(index), "c-200", "2.0.0-beta.1",
+                                     str(index) * 40, "beta",
+                                     date="2026-02-01T00:00:00Z"),
+                ],
+            )
+        )
+
+    upstream.clear_requests()
+    run_check(upstream, scenario, tmp_path, include_beta=False)
+
+    per_project = [path for path in upstream.request_paths() if path.startswith("/v2/project/")]
+    assert len(per_project) == 6, per_project
+    assert len(per_project) <= 6, "the channel filter made more than one request per project"
+
+
+# --------------------------------------------------------------------------------------
 # Result caching
 # --------------------------------------------------------------------------------------
 
@@ -897,6 +1151,119 @@ def test_cache_is_disabled_cleanly(tmp_path):
     cache.put("a" * 40, {"resolved": False})
     assert cache.get("a" * 40) is None
     cache.save()
+
+
+@pytest.mark.parametrize("recorded_at", ["soon", [], {}, True, "0.0"])
+def test_a_record_whose_timestamp_is_unusable_is_ignored(tmp_path, recorded_at):
+    """One hand-edited row must not fail **every** run from then on.
+
+    ``float(record["at"])`` raises on anything that is not a number, and ``get`` is called once
+    per unidentified mod on every check — so a single bad row used to turn the whole plugin into
+    "check failed" until somebody deleted the cache by hand.
+    """
+    path = tmp_path / "resolve-cache.json"
+    path.write_text(
+        json.dumps(
+            {"version": ResolveCache.VERSION,
+             "records": {"a" * 40: {"resolved": False, "at": recorded_at}}}
+        ),
+        encoding="utf-8",
+    )
+
+    cache = ResolveCache(path, ttl_hours=24.0)
+    assert cache.get("a" * 40) is None
+
+
+def test_a_usable_record_beside_a_broken_one_still_works(tmp_path):
+    """Dropping the bad row is not the same as dropping the file."""
+    path = tmp_path / "resolve-cache.json"
+    path.write_text(
+        json.dumps(
+            {"version": ResolveCache.VERSION,
+             "records": {
+                 "a" * 40: {"resolved": False, "at": "yesterday"},
+                 "b" * 40: {"resolved": False, "at": time.time()},
+             }}
+        ),
+        encoding="utf-8",
+    )
+
+    cache = ResolveCache(path, ttl_hours=24.0)
+    assert cache.get("a" * 40) is None
+    assert cache.get("b" * 40) is not None
+
+
+def test_a_run_over_a_broken_cache_still_produces_a_report(tmp_path, upstream):
+    """The end-to-end version of the same thing: the check must not die on its own cache."""
+    scenario = build_scenario(tmp_path, upstream)
+    cache_path = tmp_path / "resolve-cache.json"
+    cache_path.write_text(
+        json.dumps(
+            {"version": ResolveCache.VERSION,
+             "records": {"a" * 40: {"resolved": False, "at": "soon"}}}
+        ),
+        encoding="utf-8",
+    )
+
+    checker = Checker(make_options(upstream, use_cache=True))
+    try:
+        report = checker.run(scenario.scan(), SERVER, cache_path=cache_path)
+    finally:
+        checker.close()
+
+    assert entry_for(report, "zeta").status == STATUS_UNRESOLVED
+    # And the bad row is gone from the file the run wrote back.
+    payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert all(
+        isinstance(item.get("at"), (int, float)) for item in payload["records"].values()
+    )
+
+
+def test_switching_modrinth_off_does_not_poison_the_cache(tmp_path, upstream, monkeypatch):
+    """Nothing was asked, so nothing was learned — and nothing may be written.
+
+    With Modrinth off, every jar ends up unresolved. Recording ``resolved: false`` for those
+    meant that turning the platform back on changed nothing for a whole TTL: the name search was
+    skipped from the cache and each entry claimed neither platform knew the jar, when in truth
+    the plugin had never asked. The outcome an admin sees is "these mods are not on Modrinth".
+    """
+    import mod_update_checker.checker as checker_module
+
+    scenario = build_scenario(tmp_path, upstream)
+    cache_path = tmp_path / "resolve-cache.json"
+
+    def refuse(_self, *_args, **_kwargs):
+        raise AssertionError("a request was made with Modrinth switched off")
+
+    monkeypatch.setattr(checker_module.HttpClient, "get_json", refuse)
+    monkeypatch.setattr(checker_module.HttpClient, "post_json", refuse)
+
+    report = run_check(upstream, scenario, tmp_path, use_modrinth=False,
+                       use_cache=True, cache_path=cache_path)
+
+    assert entry_for(report, "zeta").status == STATUS_UNRESOLVED
+    payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert payload["records"] == {}, "an unasked question was written to the cache"
+    assert "note.modrinth_disabled_by_config" in dict(report.upstream_notes)
+
+
+def test_a_stale_negative_verdict_does_not_block_a_name_search_when_modrinth_is_on(
+    tmp_path, upstream
+):
+    """The other direction: a genuine negative verdict *is* used, so the cache still works."""
+    scenario = build_scenario(tmp_path, upstream)
+    cache_path = tmp_path / "resolve-cache.json"
+
+    first = run_check(upstream, scenario, tmp_path, use_cache=True, cache_path=cache_path)
+    assert entry_for(first, "zeta").status == STATUS_UNRESOLVED
+
+    upstream.clear_requests()
+    second = run_check(upstream, scenario, tmp_path, use_cache=True, cache_path=cache_path)
+
+    assert entry_for(second, "zeta").status == STATUS_UNRESOLVED
+    assert "note.cached_unresolved" in dict(entry_for(second, "zeta").notes)
+    assert upstream.count_path("/v2/search") == 1, "only the resolving search should repeat"
+
     assert not (tmp_path / "unused.json").exists()
 
 

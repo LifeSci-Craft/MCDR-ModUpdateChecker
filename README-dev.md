@@ -281,7 +281,7 @@ aqua=可操作的东西（按钮、命令、字段名）。
 拒绝的时候不是干巴巴一句「不行」：它会报出选项名和**配置文件路径**（与 ``!!muc status`` 印的是
 同一条路径），读的人当场就能去改。
 
-**其二：``cleanup.is_backup_name``。** 它认的是插件自己写出来的名字（``<文件名>.jar.old`` /
+**其二：``cleanup.py`` 的 ``is_backup_name()``。** 它认的是插件自己写出来的名字（``<文件名>.jar.old`` /
 ``.jar.old.2`` …），别的什么都不认。``config.yml.old``、别人的 ``.bak``、一个恰好叫 ``old`` 的
 目录，全都不在射程里，``!!muc delete`` 会明确拒绝并说明原因。
 
@@ -330,7 +330,7 @@ aqua=可操作的东西（按钮、命令、字段名）。
 （``on_load`` 里其它每一步都包了 try/except——「a broken mods folder is not fatal」）。于是
 ``resolve-cache.json`` 里只要装着 ``[]`` 或 ``null``（手工改过、被别的工具写过、磁盘写坏的旧版本
 留下的），**插件就在启动时加载失败**。一行日志没有资格造成这种后果，现在它自己 ``isinstance`` 判断，
-并有回归测试 + 注入验证。
+并有回归测试 + 变异检查（`tools/mutation_check.py`）。
 
 ### 改：插件自己的 JSON 文件格式只留一处
 
@@ -409,13 +409,13 @@ aqua=可操作的东西（按钮、命令、字段名）。
 | 链接列按显示宽度对齐 | `test_the_link_column_is_measured_in_columns_not_characters`：两个**字符数相同、显示宽度不同**的名字（`AB` / `文本`），断言行内链接的起始显示列相同 |
 | 编号不补空格 | `test_the_listing_never_pads_the_number`：短列表与二十个 Mod 的列表都断言 `[1] ` 在、`[ 1]` 不在——这条被用户报过两次，所以钉两遍 |
 | 批量命令的集合语义 | `test_download_all_stages_one_plan_for_every_fetchable_mod`：计划点名的恰好是全部候选，没有可下载文件的那个被**数出来**而不是丢掉。`test_a_batch_confirmation_is_dropped_when_the_set_of_mods_changed` 证明集合一变整条作废——只跑对得上的那部分，会让「成功」的汇报盖住没做的那一半。`test_all_is_the_bulk_word_even_when_a_mod_answers_to_it` 钉住保留字：连 id、文件名、显示名三处都叫 `all` 的 Mod 也不能把它变成「指定那一个」 |
-| 批量安装仍是一条一条授权 | `test_install_all_authorises_every_downloaded_build`：从磁盘读回 ledger，核对恰好是那三个 key 被授权。注入验证里把循环改成 `entries[:1]`（只装第一个）时确实失败 |
+| 批量安装仍是一条一条授权 | `test_install_all_authorises_every_downloaded_build`：从磁盘读回 ledger，核对恰好是那三个 key 被授权。`tools/mutation_check.py` 里把循环改成 `entries[:1]`（只装第一个）时确实失败 |
 | 下载完成会通知，且不受 `report.in_game` 控制 | `test_a_finished_download_is_announced_to_the_console_and_to_admins`（控制台一行 + 权限够的管理员收到、权限不够的收不到）、`test_a_check_that_fetched_nothing_says_nothing`（非事件不发）、`test_a_join_check_keeps_the_completion_on_the_console_only`（`broadcast=False` 时只有控制台） |
 | 默认配置下什么都不会被删 | `test_the_shipped_default_forbids_deletion`（出厂值是 `False`）、`test_delete_is_refused_while_the_switch_is_off` / `test_cleanup_is_refused_while_the_switch_is_off`（拒绝 + **文件还在 + 没有摆计划** + 报出选项名与配置路径）、`test_a_locked_backup_gets_an_explanation_instead_of_a_button`（详情页那一行没有命令、没有链接） |
 | 提醒真的被 ``allow_delete`` 挡住了 | `test_the_reminder_needs_the_delete_switch_as_well`：``enabled: true`` + ``allow_delete: false`` 时控制台一个字不吐、槽位空着 |
 | 已经在等确认的计划也过不了关 | `test_a_plan_staged_before_the_switch_went_off_is_not_carried_out`：先摆计划、再把开关关掉、再 ``confirm`` —— 文件必须在，且计划被丢掉而不是留着 |
 | 只有插件自己造的备份会被删 | `tests/test_cleanup.py` 的 14 项：名字判定（含 `config.yml.old`、`notes.old`、目录、`None` 全部不许）、**删除时重新核对**（把 `config.yml` 交进去，文件必须原地不动）、`..` 拼出来的路径碰不到文件夹外面、文件已经不在时报 `already-gone` 而不是抛异常 |
-| 备份的年龄是「变成备份」的那一刻 | `test_installing_stamps_the_backup_with_the_moment_it_was_made`：把一个 500 天前的 jar 交给安装器，断言生成的 `.old` 的 mtime 就在现在。注入验证里撤掉那次 `utime` 就会失败 |
+| 备份的年龄是「变成备份」的那一刻 | `test_installing_stamps_the_backup_with_the_moment_it_was_made`：把一个 500 天前的 jar 交给安装器，断言生成的 `.old` 的 mtime 就在现在。`tools/mutation_check.py` 里撤掉那次 `utime` 就会失败 |
 | 提醒 → confirm 这条链真的能走通 | `test_an_expired_backup_is_announced_and_the_plan_is_ready`（提醒说过之后槽位里确实有一条计划、且 `requester` 是空哨兵）、`test_a_reminder_never_clobbers_a_plan_that_is_already_staged`（槽位被占时不覆盖） |
 | 删除是真的、而且只删该删的 | 矩阵里四项：`cleanup_reminded` / `cleanup_staged` / **`cleanup_deleted`**（跑完之后那个文件真的不在磁盘上）/ **`cleanup_left_the_jars_alone`**（同目录的 jar 一个没少）。只断言「文件不见了」不够——把整个目录删空的实现也能过 |
 | 备份是一类状态，不是一种 Mod | `test_a_backup_is_not_one_of_the_mods`（不进 `total_jars`、不进 `unidentified`、不进 `updates`）、`test_a_backup_in_the_mods_folder_becomes_an_entry`（**上游一次都没被问过它**）、`test_a_backup_entry_survives_the_round_trip`（新字段能被 `last_report.json` 读回来） |
@@ -432,8 +432,9 @@ aqua=可操作的东西（按钮、命令、字段名）。
 | 只可能在客户端用的依赖不算缺依赖 | `test_a_missing_dependency_that_cannot_run_on_a_server_is_not_reported`、`test_only_the_client_only_dependencies_are_taken_out_of_the_list`（排除的恰好是那一个，其余照报）、`test_a_dependency_on_a_server_capable_project_is_still_reported`（`optional` 与没标记的不排除）。三条合起来钉住「只有 `unsupported` 才排除」 |
 | 提醒按角色上色 | `test_an_install_notice_is_coloured_by_role_not_painted_one_colour`、`test_the_update_notice_gives_each_kind_of_line_its_role`；矩阵里读**发出去的 payload**核对标题段确实白、待办行确实黄——这是唯一能证明「游戏真的收到了这个颜色」的地方 |
 | README 里的样例屏就是插件画的那一屏 | `test_the_readme_sample_screens_start_with_the_bar_the_plugin_draws`：拿 `_title_line()` 的真输出跟 README 里每一条标题栏逐字比对。标题栏的 `=` 是按常量算出来的，而三条样例曾长期停在一个早已改掉的宽度上——只查版本号的话永远发现不了 |
+| 那些守卫真的在守着什么 | `tools/mutation_check.py`：把每条守卫逐个改坏（在临时副本里改，工作树不受影响），对应的用例必须失败。没被抓住的守卫会被点名，锚点挪走了也会被点名——「脚本过期」与「测试没牙」是两回事，分开报 |
 
-测试套件共 **725 项**（其中 2 项是真实 MCDR 端到端，慢约一分钟——本地发布前整跑一遍，CI 的快跑
+测试套件共 **827 项**（其中 2 项是真实 MCDR 端到端，慢约一分钟——本地发布前整跑一遍，CI 的快跑
 用 `-m "not e2e"` 跳过；当前数量用 `pytest --collect-only -q` 查；这一行是快照，
 所以上面那张表里的「54 项检查」才是被测试自动核对的那个数字），细节见 [`tests/README.md`](tests/README.md)。
 
@@ -445,16 +446,23 @@ aqua=可操作的东西（按钮、命令、字段名）。
 # 代码风格（规则见根目录 ruff.toml；target-version 是 3.8，因为插件要支持 MCDR 2.13.0）
 ruff check .
 
+# Python 下限：每个文件都必须能以 3.8 解析，且不用更新的注解写法或标准库名字
+python tools/check_python_floor.py
+
 # 测试
 python -m pip install --target .testlibs -r tests/requirements-test.txt
 PYTHONPATH=.testlibs python -m pytest -m "not e2e"     # 快
 PYTHONPATH=.testlibs python -m pytest                  # 含真实 MCDR 端到端
 
+# 变异检查：每条守卫被改坏都必须被测试抓到。
+# 它把仓库复制到临时目录再改，所以工作树不会被留在注入状态；MCDR_SKIP_E2E 设置时拒绝运行。
+python tools/mutation_check.py
+
 # 跨 MCDR 版本
 python tools/mcdr_matrix.py --current
 python tools/mcdr_matrix.py --current --with-install   # 额外验证关服安装
 
-# 打包 + 校验产物（可复现、换行归一、内容白名单、注释剥离、包内代码仍能编译）
+# 打包 + 校验产物（可复现、换行归一、内容白名单、注释剥离、包内 changelog 只留最新版、包内代码仍能编译）
 python pack.py
 python tools/check_artifact.py
 
@@ -472,7 +480,7 @@ python tools/probe_upstream.py
 
 | 项目 | 规则 | 由谁保证 |
 |---|---|---|
-| `CHANGELOG.md` | **只保留最新一个版本**的条目，更早的条目属于 GitHub Releases | 发版时手工替换（本文件开头已写明） |
+| `CHANGELOG.md` | 仓库文件可以保留历史；**包内只带最新一节**（更早的条目属于 GitHub Releases） | `pack.py` 的 `packaged_changelog()` 截取 + `check_artifact.py` 断言「只有一节且版本号与元数据一致」 |
 | `README.md` | **完全不进包**（MCDR 从不读它，发布页已经写了同样的内容） | `pack.py` 的白名单 + `check_artifact.py` 的 `FORBIDDEN_ROOTS` |
 | 代码注释与 docstring | **只留在仓库里**；进包的 `.py` 全部被清空（行号保留，堆栈仍能对上源文件） | `pack.py` 的 `packaged_source()` + `check_artifact.py` 的 `check_stripped()` |
 | 其它 | 只打包 `mcdreforged.plugin.json` / 插件包内的 `.py` / `lang/*.json` / `LICENSE` / `CHANGELOG.md` | 同上，白名单式打包 |
@@ -485,13 +493,18 @@ CHANGELOG 的 Releases 链接必须指向真实存在的仓库。四处是否**�
 `tests/test_docs.py` 自动核对，但「这个 owner 是不是对的」只有线上远端知道——
 曾经这四处一起指向一个 404 的仓库，测试全绿而链接全废。
 
+署名口径：`mcdreforged.plugin.json` 的 `authors` 只列**作者**（插件库与 `!!MCDR` 的插件信息页读的是
+它）；文档整理、审查意见这类贡献记在 `README.md` 的「贡献者」一节，不写进 `authors`。
+
 推送到 `main` 时会自动跑 CI（`.github/workflows/ci.yml`）：
 
 | 作业 | 内容 |
 |---|---|
+| `lint` | `ruff check .`（锁定版本 0.17.0，规则见根目录 `ruff.toml`） |
 | `unit` | Python 3.10 与 3.13 上跑单元与集成测试（3.10 无 `tomllib`，顺带覆盖 Forge 元数据的正则回退路径） |
+| `python-floor` | `tools/check_python_floor.py`：每个文件都必须能以 3.8 解析，且不用更新的注解写法或标准库名字（`ruff.toml` 里的 `target-version` 只是配置，这一条才是检查） |
 | `mcdr-matrix` | **2.13.0 / 2.14.1 / 2.15.0 / 2.15.7 / 2.16.0 各一个作业**，各自起真实 MCDR 跑完整流程 |
-| `artifact` | 连打两次产物比字节（可复现）、把源码临时改成 CRLF 再打一次要求字节一致（换行归一）、检查包内不含 tests/tools/README、确认包内 `.py` 已无注释与 docstring 且仍能编译 |
+| `artifact` | 连打两次产物比字节（可复现）、把源码临时改成 CRLF 再打一次要求字节一致（换行归一）、检查包内不含 tests/tools/README、确认包内 `.py` 已无注释与 docstring 且仍能编译、包内 changelog 只有一节 |
 
 目录结构：
 

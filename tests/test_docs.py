@@ -40,7 +40,10 @@ DEVELOPER_DOC = "README-dev.md"
 
 DOCS = (USER_DOC, DEVELOPER_DOC, "CHANGELOG.md", "tests/README.md")
 
-SECTIONS = ("server", "check", "report", "sources", "download", "network")
+#: Config sections whose ``section.option`` paths the prose is checked against. ``cleanup`` was
+#: missing here, so every ``cleanup.*`` name written in the documents went unchecked — the one
+#: hole in the "a dotted path in the prose must be a real option" guard.
+SECTIONS = ("server", "check", "report", "sources", "download", "cleanup", "network")
 
 #: A backticked token: ``like.this``. Only simple identifiers, so a path (``lang/zh_cn.json``)
 #: or a file with an extension (``report.py``) is never mistaken for an option.
@@ -93,6 +96,18 @@ def _legacy_names() -> set:
     return set(plugin._LEGACY_FLAT_OPTIONS)
 
 
+def _message_keys() -> set:
+    """Every key in the shipped catalogue.
+
+    Message keys share the section names (``cleanup.notice_confirm``), so a backticked key in the
+    prose is shaped exactly like a config path. Without this, naming a message key in the
+    changelog fails a guard that is about *options* — and the alternative, writing the key in a
+    form the reader cannot grep for, is worse than teaching the guard the difference.
+    """
+    path = PACKAGE / "lang" / "en_us.json"
+    return set(json.loads(path.read_text(encoding="utf-8")))
+
+
 @pytest.mark.parametrize("name", DOCS)
 def test_no_doc_names_a_flat_option_that_the_config_no_longer_has(name):
     """``ignored_mods`` and friends only belong where the rename itself is being explained.
@@ -122,11 +137,14 @@ def test_every_option_path_in_the_docs_exists(name):
     ``fabric.mod.json`` and ``latest.log`` are not swept in.
     """
     known = _config_paths()
+    messages = _message_keys()
     offenders = []
     for block, number in _asserting_blocks(name):
         for line in block.splitlines():
             for token in _BACKTICKED.findall(line):
                 if token.endswith(_FILE_SUFFIXES) or "." not in token:
+                    continue
+                if token in messages:
                     continue
                 if token.split(".")[0] not in SECTIONS or token in known:
                     continue
@@ -509,8 +527,9 @@ def test_no_source_file_is_left_in_an_injected_state():
     于是「备份的年龄」这条测试开始报 500 天——**看起来像一个真的回归**，而真相是上一轮工具
     没跑完。当时没有人喊一声，是我在下一轮跑全量时才撞见。
 
-    所以这个标记必须被扫出来：留在树里就失败，并指出是哪个文件。修复方式见那两个脚本里的
-    ``.inject-backup`` 自愈逻辑，或 ``git restore <路径>``。
+    所以这个标记必须被扫出来：留在树里就失败，并指出是哪个文件。修复方式是
+    ``tools/mutation_check.py``（它在临时副本里改，从不碰工作树因而不会留下注入状态），
+    或者 ``git restore <路径>``。
     """
     offenders = []
     for path in sorted((REPO / "mod_update_checker").rglob("*.py")):
