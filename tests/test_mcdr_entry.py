@@ -4958,7 +4958,12 @@ def test_the_status_page_is_built_off_the_command_thread(tmp_path, monkeypatch):
     monkeypatch.setattr(plugin, "_config", _config_with({"language": "zh_cn"}), raising=False)
     plugin._apply_language(server, plugin._config)
     seen_thread = []
-    scan_block = threading.Event()
+    started = threading.Event()
+    # The worker is held here until the test has looked at the acknowledgement. Without the
+    # gate this test is a race: the stub returns in microseconds, so the worker can finish and
+    # post the whole screen before the "one reply so far" assertion below runs — which is
+    # exactly how it failed once, on a CI runner, and passed everywhere else.
+    release = threading.Event()
 
     class _Scan:
         directory = "server/mods"
@@ -4967,7 +4972,8 @@ def test_the_status_page_is_built_off_the_command_thread(tmp_path, monkeypatch):
 
     def stub(*_args, **_kwargs):
         seen_thread.append(threading.current_thread().name)
-        scan_block.set()
+        started.set()
+        assert release.wait(5), "the test never released the worker"
         return (_Scan(), ServerContext(mc_version="26.3", mc_version_source="config",
                                        loader="fabric"))
 
@@ -4981,7 +4987,8 @@ def test_the_status_page_is_built_off_the_command_thread(tmp_path, monkeypatch):
     # 命令线程上先给一句回执，别让读者对着空屏等；真正的扫描不在这个线程上。
     assert len(source.replies) == 1, source.replies
     assert "正在读取服务端状态" in str(source.replies[0]), source.replies
-    assert scan_block.wait(5), "the worker never started"
+    assert started.wait(5), "the worker never started"
+    release.set()
     worker.join(timeout=5)
     assert not worker.is_alive()
     assert seen_thread == ["mod_update_checker_status"], seen_thread
