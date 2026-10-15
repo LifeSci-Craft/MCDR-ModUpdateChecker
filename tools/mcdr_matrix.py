@@ -48,6 +48,26 @@ from typing import Optional
 REPO = Path(__file__).resolve().parent.parent
 
 
+#: The ASCII marker MCDR prints for every plugin it loads, followed by the prefix this plugin's
+#: own messages carry. Deliberately **not** the Chinese "已加载" alone: the check for "did the
+#: plugin load" is the one decision this whole tool rests on, and it was being made by matching
+#: localized text that a mis-encoded console can turn into replacement characters. MCDR's own
+#: marker is ASCII and comes from MCDR, not from this repository's catalogues.
+LOADED_MARKER = "Loading plugin"
+
+
+def plugin_loaded(console: str) -> bool:
+    """Whether the plugin actually loaded, decided by an ASCII line rather than by prose.
+
+    Two markers, either of which is enough: MCDR's own ``Loading plugin ...`` line, and this
+    plugin's badge followed by its Chinese load message (which additionally proves
+    ``language: auto`` followed MCDR). The first is the one that survives an encoding accident.
+    """
+    if LOADED_MARKER in console and "mod_update_checker" in console:
+        return True
+    return plugin_badge() + " 已加载" in console
+
+
 def plugin_badge() -> str:
     """``[Mod Update Checker]`` — read from the plugin's own metadata.
 
@@ -411,8 +431,16 @@ def _child_env(python: str) -> dict:
 
     ``cwd`` is also why the path must be absolute: the children run in temporary instance
     directories, where a relative ``.testlibs`` does not resolve.
+
+    ``PYTHONIOENCODING`` is forced to UTF-8 for the child. MCDR prints the plugin's own messages,
+    this plugin's catalogue is Chinese and English, and a child that inherits a GBK console
+    encodes those bytes into replacement characters — which the parent then reads, because the
+    "did the plugin load" decision is made by matching text. Measured on a Chinese Windows
+    console: the failure detail the tool tried to print contained U+FFFD and the print itself
+    died with ``UnicodeEncodeError``, so a failing run left no usable evidence at all.
     """
     env = dict(os.environ)
+    env.setdefault("PYTHONIOENCODING", "utf-8")
     testlibs = REPO / ".testlibs"
 
     if not testlibs.is_dir() or _interpreter_has_own_mcdr(python):
@@ -1012,8 +1040,9 @@ def summarise(
         "mcdr": version,
         "python": python,
         "version_tuple": version_tuple(version),
-        # "已加载" proves both that the plugin loaded and that `language: auto` followed MCDR.
-        "loaded": "Mod Update Checker] 已加载" in console,
+        # ``plugin_loaded`` also accepts MCDR's own ASCII marker, so the decision does not rest
+        # on a localized string surviving a console that is not UTF-8.
+        "loaded": plugin_loaded(console),
         "refused_cleanly": "不满足版本约束" in console,
         "spoke_chinese": plugin_badge() + " 已加载" in console
         and "[Mod Update Checker] loaded" not in console,
@@ -1259,7 +1288,27 @@ def verdict(result: dict) -> str:
     return "FAIL (did not load)"
 
 
+def _make_output_utf8() -> None:
+    """Make this process able to print its own findings, whatever console it was started from.
+
+    The failure detail quoted from a child contains Chinese — the plugin's own messages — and a
+    GBK console cannot encode it. The result was not merely a mangled line: ``print`` raised
+    ``UnicodeEncodeError`` and the tool stopped *while reporting a failure*, so the run that most
+    needed evidence left none. ``errors="replace"`` is the second half: an unprintable character
+    costs one ``?`` instead of the whole report.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:  # pragma: no cover - only a stream replaced by a wrapper
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):  # pragma: no cover - a stream that refuses to change
+            pass
+
+
 def main() -> int:
+    _make_output_utf8()
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )

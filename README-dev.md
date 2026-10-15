@@ -424,7 +424,7 @@ aqua=可操作的东西（按钮、命令、字段名）。
 | 语言文件里没有「写进去过、现在没人用」的条目 | `tests/test_i18n.py` 三条守卫：每个键都必须在发布模块里作为**字符串常量**出现、五个运行时拼出来的族（`status.` / `matched_by.` / `explain.` / `install.reason.` / `download.reason.`）必须与常量表**完全一致**、两种语言的键集相同。再加一把更细的审计器 `bench/audit_language.py`（AST 只收「作为调用实参出现的字面量」，专抓只在**注释或 docstring** 里出现的键——正则扫全文看不出来） |
 | 渲染不是瓶颈 | `bench/bench_render.py`：20 / 200 个 Mod 的列表、汇总、整份报告（日志形态）、详情页各量一次。列表 **0.75 ms** 且**与总共多少个 Mod 基本无关**（只画一页）；唯一的重复劳动是每行重算格宽，现按语言缓存（195 µs → 0.8 µs / 10 行） |
 | 扫描不并行是有理由的 | `bench/scan_bench.py` 留有线程池那一路的数字：扫描跑在开服 60 秒之后的守护线程上，不在任何关键路径上，几百毫秒不值得多开线程。摘要按块读，内存不随文件增长（`tests/test_digests.py` 有断言） |
-| 服务端的负担有数字 | `bench/perf_v1.6.0.py` 与 `bench/bench_render.py`：导入 ~68 ms（宿主已加载 mcdreforged 与 requests 时）、命令树与语言 0.1 ms 级、20 jar 扫描 ~90 ms、100 Mod（100 MiB）扫描 ~0.2 s + 比对与报告 ~17 ms + 3 次请求、空闲线程 0 CPU、峰值分配 ~2 MiB；渲染见 `bench/bench_render.py`（列表 0.7 ms） |
+| 服务端的负担有数字 | `bench/perf_v1.6.0.py` 与 `bench/bench_render.py`：导入 ~68 ms（宿主已加载 mcdreforged 与 requests 时）、命令树与语言 0.1 ms 级、20 jar 扫描 ~90 ms、100 Mod（100 MiB）扫描 ~0.2 s + 比对与报告 ~17 ms + 3 次请求、空闲线程 0 CPU、峰值分配 ~2 MiB；渲染见 `bench/bench_render.py`（列表 0.7 ms）。采集条件：第 3 节的真实 `mods/` 目录要显式给（`--mods <目录>` 或 `MUC_BENCH_MODS`），否则该节跳过——它是「20 jar 扫描 ~90 ms」这类数字的来源，不给目录就没有数字可引用。其余各节用合成 Mod，任何机器上都能复现 |
 | 源码行末统一 LF | `test_no_source_file_carries_windows_line_endings`：扫工作区（跳过二进制与缓存），任何 `\r\n` 都失败。它守的是 Git 看不见的那一侧——`.gitattributes` 只在**提交时**归一，而「读文件再写回」的脚本会在 Windows 上把整份文件翻成 CRLF，内容一个字没改，diff 却全是警告 |
 | 前缀能匹配、且绝不比精确更宽 | `test_a_unique_prefix_of_a_name_is_enough`（唯一前缀命中）、`test_a_prefix_that_matches_two_mods_is_refused_and_lists_them`（多个就列出候选并拒绝）、`test_an_exact_match_is_never_widened_into_a_prefix_search`（有一个 Mod 就叫 `sod` 时，它就是 `sod`）、`test_a_prefix_is_matched_through_the_same_normalisation_as_everything_else`（前缀走与精确同一套归一化）。矩阵里另有一条：控制台的补全接口真的列出候选（`tree._entry_generate_suggestions`） |
 | 游戏内没有 Tab 补全可用 | 不是「没做」，是**做不到**：原版的补全只对 `/` 开头的命令生效，`!!` 命令是一条聊天消息。所以游戏内给的是 `suggest_command` 点击事件（点一下把命令填进输入框），矩阵断言候选那一行确实带那个事件 |
@@ -434,7 +434,7 @@ aqua=可操作的东西（按钮、命令、字段名）。
 | README 里的样例屏就是插件画的那一屏 | `test_the_readme_sample_screens_start_with_the_bar_the_plugin_draws`：拿 `_title_line()` 的真输出跟 README 里每一条标题栏逐字比对。标题栏的 `=` 是按常量算出来的，而三条样例曾长期停在一个早已改掉的宽度上——只查版本号的话永远发现不了 |
 | 那些守卫真的在守着什么 | `tools/mutation_check.py`：把每条守卫逐个改坏（在临时副本里改，工作树不受影响），对应的用例必须失败。没被抓住的守卫会被点名，锚点挪走了也会被点名——「脚本过期」与「测试没牙」是两回事，分开报 |
 
-测试套件共 **827 项**（其中 2 项是真实 MCDR 端到端，慢约一分钟——本地发布前整跑一遍，CI 的快跑
+测试套件共 **827 项**（其中 2 项是真实 MCDR 端到端，**实测约 2 分 20 秒**，全量约 146 s——本地发布前整跑一遍，CI 的快跑
 用 `-m "not e2e"` 跳过；当前数量用 `pytest --collect-only -q` 查；这一行是快照，
 所以上面那张表里的「54 项检查」才是被测试自动核对的那个数字），细节见 [`tests/README.md`](tests/README.md)。
 
@@ -455,7 +455,8 @@ PYTHONPATH=.testlibs python -m pytest -m "not e2e"     # 快
 PYTHONPATH=.testlibs python -m pytest                  # 含真实 MCDR 端到端
 
 # 变异检查：每条守卫被改坏都必须被测试抓到。
-# 它把仓库复制到临时目录再改，所以工作树不会被留在注入状态；MCDR_SKIP_E2E 设置时拒绝运行。
+# 它把仓库复制到临时目录再改，所以工作树不会被留在注入状态；MCDR_SKIP_E2E 设置时拒绝运行
+# （12 条 selector 全都由单测满足，拒绝是为了不让基线摘要少掉 e2e 那一半）。
 python tools/mutation_check.py
 
 # 跨 MCDR 版本
@@ -485,24 +486,43 @@ python tools/probe_upstream.py
 | 代码注释与 docstring | **只留在仓库里**；进包的 `.py` 全部被清空（行号保留，堆栈仍能对上源文件） | `pack.py` 的 `packaged_source()` + `check_artifact.py` 的 `check_stripped()` |
 | 其它 | 只打包 `mcdreforged.plugin.json` / 插件包内的 `.py` / `lang/*.json` / `LICENSE` / `CHANGELOG.md` | 同上，白名单式打包 |
 
-发版的顺序：**建分支 → 推分支 → 开 PR → 合并 → 再在合并后的 `main` 上打 tag 发 Release**。
-这样每个版本「新增/删除了什么」在 PR 页面里是逐行可见的。
+发版的顺序：**建分支 → 推分支 → 开 PR → 合并 → 等合并后的 `main` 全绿 → 再在 `main` 上打 tag 发
+Release**。这样每个版本「新增/删除了什么」在 PR 页面里是逐行可见的。
+
+「等合并后的 `main` 全绿」不是形式：PR 上的绿色是**合并前**那棵树跑出来的，两棵树不一样。v1.6.1
+就是这么发出去的——tag 指向的提交之后还有两个提交在修同一条竞态测试（提交信息自己写着「It passed
+on the pull request and locally, and failed on the merged main」），于是「套件全绿」这句话在 tag 上
+复现不出来。资产不受影响（两个提交只动测试，用 tag 的树重建 `.mcdr` 与仓库内那份字节相同），但
+**标签的意义**受影响：它本该是一个可复现的验证点。
+
+另外，另外两个仓库的开发者文档叫 docs/DEVELOPMENT.md，本仓库是根目录的 `README-dev.md`。改名会
+牵动 `tests/test_documented_paths.py` 与多处文档链接，所以维持现状——按「照另一个仓库做」时要记得
+它俩讲的是同一件事。
 
 发版前还要看一眼**仓库地址**：`mcdreforged.plugin.json` 的 `links`、`checker.py` 的 `USER_AGENT`、
 CHANGELOG 的 Releases 链接必须指向真实存在的仓库。四处是否**互相一致**由
 `tests/test_docs.py` 自动核对，但「这个 owner 是不是对的」只有线上远端知道——
 曾经这四处一起指向一个 404 的仓库，测试全绿而链接全废。
 
-署名口径：`mcdreforged.plugin.json` 的 `authors` 只列**作者**（插件库与 `!!MCDR` 的插件信息页读的是
-它）；文档整理、审查意见这类贡献记在 `README.md` 的「贡献者」一节，不写进 `authors`。
+署名口径：`mcdreforged.plugin.json` 的 `author` 只列**作者**（插件库与 `!!MCDR` 的插件信息页读的是
+它）；文档整理、审查意见这类贡献记在 `README.md` 的「贡献者」一节，不写进 `author`。
+
+这里用的是 legacy 拼写，是**核实过五个版本**的结果：2.13.0 / 2.14.1 / 2.15.0 / 2.15.7 的解析器只有
+`author`（字符串列表）与顶层 `link`，`authors` / `links` / `license` 是 2.16.0 才有的字段。原先写的
+`authors` + `links` + `authors[0].link` 在 2.13–2.15.7 上让作者与主页**整块消失**，而 2.16.0 又只有
+`Person(name/email/homepage)`——`link` 在任何版本上都不是合法字段。所以现在是 `author: ["Pau1am"]`
+加 `link`，`links` 保留给 2.16 读，并且**两套作者写法绝不同时出现**（2.16 会把它们合并成两个同名
+作者）。形状由 `tests/test_docs.py` 的两条测试钉住。
 
 推送到 `main` 时会自动跑 CI（`.github/workflows/ci.yml`）：
 
 | 作业 | 内容 |
 |---|---|
 | `lint` | `ruff check .`（锁定版本 0.17.0，规则见根目录 `ruff.toml`） |
-| `unit` | Python 3.10 与 3.13 上跑单元与集成测试（3.10 无 `tomllib`，顺带覆盖 Forge 元数据的正则回退路径） |
-| `python-floor` | `tools/check_python_floor.py`：每个文件都必须能以 3.8 解析，且不用更新的注解写法或标准库名字（`ruff.toml` 里的 `target-version` 只是配置，这一条才是检查） |
+| `unit` | Python 3.10 与 3.13 上跑单元与集成测试（3.10 无 `tomllib`，顺带覆盖 Forge 元数据的正则回退路径），`-m "not e2e"` |
+| `e2e` | 单独一个作业跑那两项真实 MCDR 端到端（`tests/test_e2e.py`，实测约 2 分 20 秒），失败时上传控制台。在此之前它们**在任何作业里都不执行**：`unit` 按标记排除、`mutation` 只跑 selector 点名的文件、`mcdr-matrix` 自己驱动场景而不走 pytest |
+| `mutation` | `tools/mutation_check.py`：12 条守卫逐个改坏，都必须被测试抓到 |
+| `python-floor` | `tools/check_python_floor.py`：每个文件都必须能以 3.8 解析，且不用更新的注解写法、标准库模块名或标准库**属性**名（`ruff.toml` 里的 `target-version` 只是配置，这一条才是检查）。属性表是这次补的：`importlib.resources` 在 3.8 存在，`importlib.resources.files` 是 3.9+，而原来只按模块名判断，于是恰好在它该管的那个案例上给出假通过 |
 | `mcdr-matrix` | **2.13.0 / 2.14.1 / 2.15.0 / 2.15.7 / 2.16.0 各一个作业**，各自起真实 MCDR 跑完整流程 |
 | `artifact` | 连打两次产物比字节（可复现）、把源码临时改成 CRLF 再打一次要求字节一致（换行归一）、检查包内不含 tests/tools/README、确认包内 `.py` 已无注释与 docstring 且仍能编译、包内 changelog 只有一节 |
 

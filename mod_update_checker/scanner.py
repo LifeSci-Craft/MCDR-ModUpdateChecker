@@ -29,7 +29,7 @@ import zipfile
 import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .digests import digests_of_file
 from .versioning import RangeSpec, normalize_spec
@@ -51,6 +51,12 @@ __all__ = [
 ]
 
 _LOGGER = logging.getLogger(__name__)
+
+#: How much of a metadata entry is decompressed per read. The limit is enforced on the bytes
+#: that actually arrive rather than on the size the entry declares, so a lying or hostile header
+#: cannot turn into a multi-megabyte allocation — the same shape the JSON and download paths
+#: already use.
+_METADATA_CHUNK = 65536
 
 #: Largest metadata entry this plugin will unpack. Real ``fabric.mod.json`` and ``mods.toml``
 #: files are a few kilobytes; the largest seen in the wild are well under a hundred. The limit
@@ -374,6 +380,32 @@ def _contact_links(contact: Any) -> Tuple[str, ...]:
     return tuple(ordered)
 
 
+def _coerce_range(value: Any) -> RangeSpec:
+    """Normalise a declared Minecraft version range to ``str``, ``list[str]`` or ``None``.
+
+    One funnel for all three metadata readers, because the value comes from a third-party jar
+    and its type is whatever the author typed. A number, a bool or a mapping is not a range —
+    it is a mistake — and the cost of the mistake used to be the whole check: a
+    ``{"depends": {"minecraft": 123}}`` reached :func:`versioning.parse_spec`, which iterated
+    it and raised ``TypeError``, so every mod's result was lost, not just that jar's. A mapping
+    is dropped as well rather than iterated, which would report its *keys* as versions.
+
+    List items are kept only when they are strings, and emptied ones are dropped: a version
+    range is text, and ``123`` in a list is a typo rather than a constraint — the point of
+    ``[123]`` ending up as "no constraint" is that the list form is not a loophole around the
+    scalar rule above. ``[">=1.21", 123, ""]`` keeps ``">=1.21"``, which is what the author
+    meant.
+    """
+    if isinstance(value, str):
+        text = value.strip()
+        return text or None
+    if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+        items = [item.strip() for item in value if isinstance(item, str)]
+        items = [item for item in items if item]
+        return items or None
+    return None
+
+
 def _metadata_from_fabric(data: Dict[str, Any], entry: str, loader: str) -> ModMetadata:
     depends = data.get("depends") if isinstance(data.get("depends"), dict) else {}
     # ``_string_list`` already flattens the bare-string form, so ``provides`` needs no
@@ -387,7 +419,7 @@ def _metadata_from_fabric(data: Dict[str, Any], entry: str, loader: str) -> ModM
         version=_first_string(data.get("version")),
         loader=loader,
         metadata_file=entry,
-        mc_range=depends.get("minecraft"),
+        mc_range=_coerce_range(depends.get("minecraft")),
         environment=_first_string(data.get("environment")) or None,
         authors=_string_list(data.get("authors")) or _string_list(data.get("author")),
         description=_first_string(data.get("description")) or None,
@@ -421,9 +453,9 @@ def _metadata_from_quilt(data: Dict[str, Any], entry: str) -> ModMetadata:
     if isinstance(depends, list):
         for dependency in depends:
             if isinstance(dependency, dict) and "minecraft" in dependency:
-                mc_range = dependency["minecraft"]
+                mc_range = _coerce_range(dependency["minecraft"])
     elif isinstance(depends, dict):
-        mc_range = depends.get("minecraft")
+        mc_range = _coerce_range(depends.get("minecraft"))
     provides = loader_block.get("provides")
     provided = _string_list(provides)
     return ModMetadata(
@@ -578,7 +610,7 @@ def _metadata_from_toml_parsed(
         version=str(first.get("version", "") or ""),
         loader=loader,
         metadata_file=entry,
-        mc_range=_minecraft_range_from_dependencies(parsed.get("dependencies")),
+        mc_range=_coerce_range(_minecraft_range_from_dependencies(parsed.get("dependencies"))),
         environment=None,
         authors=_string_list(first.get("authors")),
         description=str(first.get("description", "") or "") or None,
@@ -606,7 +638,7 @@ def _metadata_from_toml_regex(raw: str, entry: str, loader: str) -> ModMetadata:
         if target.lower() == "minecraft":
             # The first one wins, matching the strict parser's behaviour.
             if mc_range is None:
-                mc_range = _toml_value(body, "versionRange") or None
+                mc_range = _coerce_range(_toml_value(body, "versionRange"))
             continue
         if _toml_bool(body, "mandatory") is False:
             continue
@@ -643,6 +675,44 @@ def _count_nested_jars(names: Iterable[str]) -> int:
     return sum(1 for name in names if any(p.match(name) for p in _NESTED_JAR_PATTERNS))
 
 
+def _read_entry_capped(archive: zipfile.ZipFile, entry: str, limit: int) -> bytes:
+    """Read one archive entry without ever allocating its declared size.
+
+    ``ZipFile.read`` allocates ``file_size`` bytes up front, so until this existed the declared
+    size was an allocation an outside file got to ask for, and ``METADATA_SIZE_LIMIT`` only
+    refused the sizes that *said* they were too big. Measured: a 4209-byte jar made
+    ``fabric.mod.json`` declare 4194303 bytes and decompressed all of it. Streaming through
+    ``archive.open`` and counting the bytes as they arrive makes the limit the thing that stops
+    the read, whatever the entry claimed — the same shape the JSON and download paths use.
+
+    A ratio guard was tried first and is *not* the right primary defence: ``"d" * 262144`` is
+    legitimate metadata that compresses 520:1, so any threshold low enough to stop an
+    amplification case also drops honest files (the repository has a test for exactly that
+    quarter-megabyte file). Counting the bytes cannot make that trade, because the cap holds
+    whatever the ratio is.
+
+    Raises :class:`BadZipFile` — which both callers already treat as "cannot be read" — when the
+    entry turns out to be longer than the limit.
+    """
+    chunks = []
+    total = 0
+    declared = archive.getinfo(entry).file_size
+    with archive.open(entry) as stream:
+        while True:
+            chunk = stream.read(_METADATA_CHUNK)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > limit:
+                raise zipfile.BadZipFile(
+                    "{} declares {} bytes and passed the {} byte limit while being read".format(
+                        entry, declared, limit
+                    )
+                )
+            chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def read_metadata(archive: zipfile.ZipFile) -> Optional[ModMetadata]:
     """Extract mod metadata from an open jar, or ``None`` if nothing recognisable is there.
 
@@ -651,6 +721,15 @@ def read_metadata(archive: zipfile.ZipFile) -> Optional[ModMetadata]:
     tell them apart: the first is a library, the second is a broken file worth reporting.
     :func:`scan_jar` recovers the difference by asking :func:`read_metadata_error` afterwards,
     which is one extra ``namelist`` and no extra decompression.
+
+    This function does not raise, and the shapes a *zip* can be broken in are the reason it has
+    to say so: an entry with the encryption bit set (``RuntimeError``), a deflate stream that
+    does not decompress (``zlib.error``), a truncated central directory (``BadZipFile``), an
+    entry asking for a compression method the interpreter does not implement
+    (``NotImplementedError``, which is a ``RuntimeError`` and was missing here until a jar used
+    one), and an entry whose declared size is a lie (``BadZipFile`` from
+    :func:`_read_entry_capped`). All of them are "this file cannot be read", which is a fact to
+    report rather than a reason to produce no report at all.
     """
     names = archive.namelist()
     available = set(names)
@@ -666,12 +745,24 @@ def read_metadata(archive: zipfile.ZipFile) -> Optional[ModMetadata]:
                 # from the check thread, so an absurd entry is a memory spike that can stall or
                 # kill the server for a file nobody asked it to read.
                 continue
-            raw = archive.read(entry).decode("utf-8", errors="replace")
-        except (KeyError, OSError, RuntimeError, zipfile.BadZipFile, zlib.error):
+            raw = _read_entry_capped(archive, entry, METADATA_SIZE_LIMIT).decode(
+                "utf-8", errors="replace"
+            )
+        except (
+            KeyError,
+            OSError,
+            RuntimeError,
+            NotImplementedError,
+            zipfile.BadZipFile,
+            zlib.error,
+        ):
             # ``RuntimeError`` is what ``zipfile`` raises for an entry whose encryption bit is
-            # set, and ``zlib.error`` is a corrupt deflate stream — which is exactly what a jar
-            # copied while the download was still running looks like. ``BadZipFile`` covers
-            # neither, so without these two the "never raises" contract has a hole in it.
+            # set, and ``NotImplementedError`` (a ``RuntimeError`` subclass) is a compression
+            # method the interpreter does not implement; both are listed explicitly so the
+            # contract does not depend on that inheritance. ``zlib.error`` is a corrupt deflate
+            # stream — which is exactly what a jar copied while the download was still running
+            # looks like — and ``BadZipFile`` covers a truncated archive and the over-long entry
+            # caught by :func:`_read_entry_capped`.
             continue
 
         metadata: Optional[ModMetadata] = None
@@ -707,10 +798,21 @@ def read_metadata_error(archive: zipfile.ZipFile) -> str:
     present but unreadable, or one that declares a size past :data:`METADATA_SIZE_LIMIT`. A jar
     that simply carries no metadata file — a library, a datapack, a stray download — returns
     ``""``, which is not a failure.
+
+    The exceptions that count as "cannot be read" are the same set :func:`read_metadata` swallows,
+    deliberately: this function's whole job is to explain the difference between "unreadable" and
+    "absent", and two lists that disagree would attribute the same damage to two different causes
+    depending on which path reached it first.
     """
     try:
         available = set(archive.namelist())
-    except (OSError, RuntimeError, zipfile.BadZipFile, zlib.error) as error:
+    except (
+        OSError,
+        RuntimeError,
+        NotImplementedError,
+        zipfile.BadZipFile,
+        zlib.error,
+    ) as error:
         return "cannot list the archive contents ({}: {})".format(type(error).__name__, error)
 
     for entry, _loader in MOD_METADATA_ENTRIES:
@@ -725,8 +827,15 @@ def read_metadata_error(archive: zipfile.ZipFile) -> str:
                 entry, info.file_size, METADATA_SIZE_LIMIT
             )
         try:
-            archive.read(entry)
-        except (KeyError, OSError, RuntimeError, zipfile.BadZipFile, zlib.error) as error:
+            _read_entry_capped(archive, entry, METADATA_SIZE_LIMIT)
+        except (
+            KeyError,
+            OSError,
+            RuntimeError,
+            NotImplementedError,
+            zipfile.BadZipFile,
+            zlib.error,
+        ) as error:
             return "{} cannot be unpacked ({}: {})".format(entry, type(error).__name__, error)
     return ""
 

@@ -45,11 +45,25 @@ COMPARE_CASES = [
     # Fabric API's real scheme, and the MC-prefixed scheme some authors use.
     ("0.161.0+26.3", "0.162.0+26.3", -1),
     ("mc1.21.1-1.2.3", "mc1.21.1-1.2.4", -1),
-    # The "game version - mod version" scheme: the dash is a token separator, not a
-    # pre-release marker, so a version with more parts outranks a prefix of itself.
+    # The "game version - mod version" scheme. The dash is a token separator, and a suffix that
+    # is *only* numbers reads as a pre-release of the core — the same rule that ranks ``1.0.0-1``
+    # below ``1.0.0``. This is a deliberate change from the old behaviour, which had the
+    # three-component form outranking the core while the one-component form did not; a comparison
+    # used for sorting cannot depend on how many dots the suffix happens to contain.
     ("1.19.2-0.5.3", "1.19.2-0.5.4", -1),
-    ("1.19.2", "1.19.2-0.5.3", -1),
+    ("1.19.2", "1.19.2-0.5.3", 1),
     ("1.19.2-0.5.3", "1.19.2-0.5.2", 1),
+    # A *bare number* after the core is a sequence, so it ranks below the release it leads to —
+    # SemVer's rule for numeric pre-release identifiers. This is what makes the order transitive:
+    # before, ``1.0.0-1`` was newer than ``1.0.0`` while ``1.0.0-a`` was older, and no sort of the
+    # three agreed with every pairwise comparison.
+    ("1.0.0-1", "1.0.0", -1),
+    ("1.0.0", "1.0.0-1", 1),
+    ("1.0.0-a.1", "1.0.0-1", -1),
+    # ``a``/``b`` are no longer abbreviations of alpha/beta: a single letter is a sequence, so a
+    # version carrying one is a pre-release of the core and ranks below it.
+    ("1.0.0-a", "1.0.0-b", -1),
+    ("1.0.0", "1.0.0-a", 1),
     # Calendar versioning, now that Minecraft uses it.
     ("26.3", "26.3.1", -1),
     ("26.3", "26.2", 1),
@@ -105,6 +119,7 @@ def test_compare_is_a_consistent_order():
         "1.0.0-beta.1",
         "1.0.0-beta.2",
         "1.0.0-rc.1",
+        "1.0.0-1",
         "1.0.0",
         "1.0.1",
         "1.1.0",
@@ -114,6 +129,26 @@ def test_compare_is_a_consistent_order():
     for index, earlier in enumerate(versions):
         for later in versions[index + 1:]:
             assert compare(earlier, later) == -1, (earlier, later)
+
+
+def test_latest_of_does_not_depend_on_the_order_it_is_given():
+    """The property the transitivity bug actually broke, over every permutation.
+
+    ``latest_of`` is a sequential maximum, so it only agrees with "the maximum" when ``compare``
+    is transitive. The set below is the one that used to disagree: ``1.0.0-a.1`` was older than
+    ``1.0.0``, ``1.0.0`` was older than ``1.0.0-1``, and ``1.0.0-a.1`` was older than
+    ``1.0.0-1`` — three conclusions that cannot all hold in one order.
+    """
+    import itertools
+
+    versions = ["1.0.0-a.1", "1.0.0", "1.0.0-1", "1.0.0-rc.1", "1.0.0-2"]
+    results = {latest_of(list(order)) for order in itertools.permutations(versions)}
+
+    assert results == {"1.0.0"}, results
+
+    # And the answer every permutation agrees on is the one no other version outranks.
+    best = results.pop()
+    assert all(compare(best, other) >= 0 for other in versions)
 
 
 @pytest.mark.parametrize(
@@ -128,6 +163,9 @@ def test_compare_is_a_consistent_order():
         # The marker is in the core; the "+26.3" is the Minecraft version, not a channel.
         ("1.0.0-beta+26.3", True),
         ("1.19.2-0.5.3", False),
+        # A bare number is a sequence number, not a channel: calling it one would hide a real
+        # release behind ``check.include_alpha``.
+        ("1.0.0-1", False),
     ],
 )
 def test_is_prerelease(version, expected):

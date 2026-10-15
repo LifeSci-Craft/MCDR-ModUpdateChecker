@@ -588,7 +588,11 @@ class Report:
         if not text:
             return None, "empty"
 
-        if text.isdigit():
+        # ``isdecimal`` rather than ``isdigit``: ``isdigit`` is also true for superscripts and
+        # circled digits (``²``, ``⑨``), which ``int()`` then refuses — so ``!!muc info ²``
+        # raised out of a command callback that promises a readable reason. The two predicates
+        # agree on every character ``int()`` accepts.
+        if text.isdecimal():
             number = int(text)
             for index, entry in self.indexed_entries():
                 if index == number:
@@ -1123,11 +1127,13 @@ def chat_cell_widths(tr: Translator) -> Tuple[int, int]:
     attribute :func:`i18n.make_translator` puts on the callable it returns, and the no-cache
     fallback above for anything that does not carry one.
 
-    "Cannot change while the plugin runs" is the part that needs a qualification: MCDR reloads a
-    plugin by building a fresh copy of the *entry* module, while this sibling module stays in
-    ``sys.modules`` — so a new version of the plugin bringing a changed ``line.status_word`` for
-    the same language would keep the old measurement. :func:`reset_cell_width_cache` is the hook
-    that makes the reload visible here, and the entry module calls it on load.
+    "While this module run is alive" is the whole scope of the memo, and it survives a reload:
+    MCDR pops every ``mod_update_checker*`` module out of ``sys.modules`` while unloading
+    (``RegularPlugin._on_unload``), so this module is re-imported too and a fresh cache is built
+    with it. :func:`reset_cell_width_cache` is therefore *not* what makes a reload visible here —
+    the reload already did that. The entry module still calls it on load, which is harmless and
+    keeps the guarantee if MCDR's unload order ever changes, but "the cache would otherwise go
+    stale across a reload" is not why.
     """
     language = getattr(tr, "language", None)
     if language is None:
@@ -1302,7 +1308,8 @@ class SummarySection:
     status: str = ""
 
 
-def summarise(report: Report, tr: Translator, max_updates: int = 12):
+def summarise(report: Report, tr: Translator, max_updates: int = 12,
+              command: str = "!!modupdate"):
     """``(context, blocks, closing)`` — the summary, before it is laid out.
 
     Split rather than returned as one list of strings so the two renderers can decorate the
@@ -1313,6 +1320,10 @@ def summarise(report: Report, tr: Translator, max_updates: int = 12):
 
     A block is a :class:`SummarySection` or a plain line — the latter for the "nothing to do"
     sentence, which belongs where it was written: above the blocked group, not after it.
+
+    ``command`` is the alias named in the lines that tell the reader to type one. It defaults to
+    the first registered root, because the report *file* is rendered with no command context at
+    all and still has to read as a sentence.
     """
     context = tr("report.header", version=report.server.describe(),
                  source=report.server.mc_version_source)
@@ -1332,7 +1343,8 @@ def summarise(report: Report, tr: Translator, max_updates: int = 12):
         # "and N more" line then claimed N items had been shown and N were missing, right
         # above the section that lists all of them.
         if max_updates and len(ordered) > max_updates:
-            trailing.append(tr("report.and_more", count=len(ordered) - max_updates))
+            trailing.append(tr("report.and_more", count=len(ordered) - max_updates,
+                               command=command))
         if extra:
             trailing.append(extra)
         blocks.append(SummarySection(tr(header_key, count=len(ordered)),
@@ -1356,7 +1368,7 @@ def summarise(report: Report, tr: Translator, max_updates: int = 12):
     add_section(
         pending,
         "report.awaiting_install_found",
-        tr("report.awaiting_install_hint", folder=report.download_folder)
+        tr("report.awaiting_install_hint", folder=report.download_folder, command=command)
         if report.download_folder
         else None,
         STATUS_AWAITING_INSTALL,
@@ -1375,7 +1387,8 @@ def summarise(report: Report, tr: Translator, max_updates: int = 12):
     return context, blocks, closing
 
 
-def render_summary(report: Report, tr: Translator, max_updates: int = 12) -> List[str]:
+def render_summary(report: Report, tr: Translator, max_updates: int = 12,
+                   command: str = "!!modupdate") -> List[str]:
     """The short form as plain lines: what needs attention, plus a tally.
 
     The two groups are kept apart rather than merged into one "has an update" list, because the
@@ -1387,7 +1400,7 @@ def render_summary(report: Report, tr: Translator, max_updates: int = 12) -> Lis
     with the project url: a log line cannot be clicked, so the url is the only way to reach the
     page from there.
     """
-    context, blocks, closing = summarise(report, tr, max_updates)
+    context, blocks, closing = summarise(report, tr, max_updates, command=command)
     lines = [context]
     for block in blocks:
         if isinstance(block, SummarySection):
@@ -1400,9 +1413,9 @@ def render_summary(report: Report, tr: Translator, max_updates: int = 12) -> Lis
     return lines
 
 
-def render_full(report: Report, tr: Translator) -> List[str]:
+def render_full(report: Report, tr: Translator, command: str = "!!modupdate") -> List[str]:
     """The long form: every mod, its notes, and the diagnostics. Used by the command."""
-    lines = list(render_summary(report, tr, max_updates=0))
+    lines = list(render_summary(report, tr, max_updates=0, command=command))
 
     lines.append(tr("report.all_mods"))
     ordered = report.sorted_entries()
@@ -1495,7 +1508,8 @@ _INDEX_FIXED_LINES = 8
 
 
 def render_index(
-    report: Report, tr: Translator, entries=None, page: int = 1, budget: int = CHAT_PAGE_LINES
+    report: Report, tr: Translator, entries=None, page: int = 1, budget: int = CHAT_PAGE_LINES,
+    command: str = "!!modupdate",
 ):
     """``(rows, tail, page_info)`` for one page of the numbered listing.
 
@@ -1509,7 +1523,8 @@ def render_index(
     it in its own vocabulary — the screens use the same labelled field the status screen does.
     The rows and the tail are the part that must not be computed twice. The pager line is not
     returned either: it names commands, and the command spelling belongs to the caller that
-    knows which prefix the reader typed, so it is built by :func:`render_pager` there.
+    knows which prefix the reader typed, so it is built by :func:`render_pager` there. ``command``
+    carries that same spelling into the closing hint, which names one too.
 
     ``entries`` narrows the listing to a subset (the status filter) while keeping the numbers
     from the full list, so a number means one mod whichever command produced the row.
@@ -1533,7 +1548,7 @@ def render_index(
     tail = [
         tr("report.index_title", count=len(indexed)),
         render_tally(report, tr),
-        tr("report.index_hint"),
+        tr("report.index_hint", command=command),
     ]
     return rows, tail, (page, pages)
 

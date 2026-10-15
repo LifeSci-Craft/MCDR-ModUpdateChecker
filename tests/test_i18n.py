@@ -224,6 +224,46 @@ def test_available_languages_reads_the_package():
     assert i18n.available_languages() == ["en_us", "zh_cn"]
 
 
+def test_the_language_list_never_falls_below_what_the_package_ships(monkeypatch):
+    """The Python 3.8 floor, in the layout where it used to cost a language.
+
+    ``importlib.resources.files`` is 3.9+, and this plugin declares 3.8 as its floor. On 3.8 the
+    old call raised ``AttributeError``, the module's ``except Exception`` swallowed it, and the
+    ``os.listdir`` fallback then found nothing inside a packed ``.mcdr`` — so
+    ``available_languages()`` came back as ``['en_us']`` and a ``zh_cn`` admin was told, in
+    English, that their language did not exist. Simulated here by making the enumerator raise and
+    the package directory unlistable, which is exactly the 3.8-plus-zip combination.
+    """
+    def unavailable(_name):
+        raise AttributeError("module 'importlib.resources' has no attribute 'files'")
+
+    monkeypatch.setattr(i18n.importlib.resources, "contents", unavailable)
+    monkeypatch.setattr(i18n, "_filesystem_dir", lambda: "/nonexistent/inside/a/mcdr/zip")
+
+    assert i18n.available_languages() == sorted(i18n.SHIPPED_LANGUAGES)
+    assert "zh_cn" in i18n.available_languages()
+
+
+def test_a_shrunk_answer_is_widened_to_the_shipped_floor(monkeypatch):
+    """A partial listing is no better than none: the floor is what the package is known to hold."""
+    monkeypatch.setattr(i18n, "_list_lang_files", lambda: ["en_us.json"])
+
+    assert i18n.available_languages() == ["en_us", "zh_cn"]
+
+
+def test_a_language_added_to_the_package_is_still_picked_up(monkeypatch):
+    """The other direction: the floor must not become a ceiling."""
+    monkeypatch.setattr(i18n, "_list_lang_files", lambda: ["en_us.json", "zh_cn.json", "ja_jp.json"])
+
+    assert i18n.available_languages() == ["en_us", "ja_jp", "zh_cn"]
+
+
+def test_every_shipped_language_actually_has_a_catalogue():
+    """The floor is a claim about the package, so it has to be true of the package."""
+    for code in i18n.SHIPPED_LANGUAGES:
+        assert (PACKAGE / "lang" / "{}.json".format(code)).is_file(), code
+
+
 @pytest.mark.parametrize(
     "setting,mcdr_language,expected",
     [

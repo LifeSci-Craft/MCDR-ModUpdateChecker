@@ -358,9 +358,39 @@ def test_every_repository_url_names_the_same_repository():
     )
 
     # And the author is a person, not a repository: the metadata keeps ``Pau1am`` even though
-    # the repo lives under the org.
-    authors = {entry["name"] for entry in metadata["authors"]}
-    assert authors, "no author is declared"
+    # the repo lives under the org. Written in the legacy ``author``/``link`` spelling, which is
+    # the only one every MCDR release reads: ``authors``/``links`` arrived in 2.16.0, so on
+    # 2.13.0-2.15.7 both the author and the homepage were silently absent from
+    # ``!!MCDR plugin list``. ``test_the_metadata_is_readable_on_every_supported_mcdr`` pins the
+    # whole shape.
+    assert metadata["author"] == ["Pau1am"], metadata["author"]
+    assert metadata["link"] == metadata["links"]["homepage"]
+
+
+def test_the_metadata_is_readable_on_every_supported_mcdr():
+    """The declared minimum is 2.13.0, and 2.13.0 understands a *different* set of keys.
+
+    Measured by reading each release's own parser: 2.13.0/2.14.1/2.15.0/2.15.7 have only
+    ``author`` (a list of strings) and a top-level ``link``; ``authors``/``links``/``license``
+    are 2.16.0 additions. So a plugin declaring 2.13.0 support must use the legacy pair or lose
+    its author and homepage on the versions it claims — and must **not** use both, because 2.16.0
+    merges them into two authors with the same name.
+
+    This is asserted as a property of the file rather than as a version-by-version matrix: the
+    legacy keys are present, the modern ones are only the ones 2.16 reads *in addition* (never
+    ``authors``), and no field is one that no release has ever accepted.
+    """
+    metadata = json.loads((REPO / "mcdreforged.plugin.json").read_text(encoding="utf-8"))
+
+    assert isinstance(metadata.get("author"), list)
+    assert all(isinstance(name, str) for name in metadata["author"])
+    assert isinstance(metadata.get("link"), str) and metadata["link"].startswith("https://")
+    assert "authors" not in metadata, "2.16 would merge this with author into two authors"
+    # ``links`` is kept because 2.16 reads it, but only with keys 2.16 actually defines.
+    assert set(metadata.get("links", {})) <= {"homepage", "source", "issues"}
+    # ``author`` entries are names, not objects: ``{"name": ..., "link": ...}`` inside the legacy
+    # list is not a field on any version (2.16's Person has name/email/homepage).
+    assert all(isinstance(name, str) for name in metadata["author"])
 
 
 # --------------------------------------------------------------------------------------

@@ -25,6 +25,7 @@ import importlib.resources
 import json
 import os
 import pkgutil
+import warnings
 from typing import Any, Dict, List, NamedTuple, Optional, Sequence
 
 #: Last resort for every fallback chain: the one language the docs assume is present.
@@ -34,6 +35,21 @@ FALLBACK_LANGUAGE = "en_us"
 AUTO = "auto"
 
 LANG_DIR_NAME = "lang"
+
+#: The catalogues this plugin ships, as a claim it can be held to.
+#:
+#: Two jobs, both about the same failure: at least one of these files is always in the package,
+#: so ``available_languages()`` must never answer with less. The listing below is what makes
+#: that true when the *enumerating* API is missing — which is a real configuration here, not a
+#: hypothetical: ``importlib.resources.files`` is Python 3.9+, this plugin's declared floor is
+#: 3.8 (``ruff.toml``, ``tools/check_python_floor.py``, the CI ``python-floor`` job), and inside
+#: a packed ``.mcdr`` there is no directory to fall back to either. Measured on that
+#: combination: ``available_languages()`` returned ``['en_us']`` and a ``zh_cn`` admin was told,
+#: in English, that their language did not exist.
+#:
+#: A code listed here that is *not* shipped is harmless — it is only ever used as a fallback
+#: floor, and a code with no catalogue falls back to English exactly as it always did.
+SHIPPED_LANGUAGES: Sequence[str] = ("en_us", "zh_cn")
 
 #: Catalogue key of the warning raised when the configured language is not one we ship.
 UNSUPPORTED_KEY = "language.unsupported"
@@ -90,10 +106,29 @@ def _resource_bytes(relative: str) -> Optional[bytes]:
 
 
 def _list_lang_files() -> List[str]:
-    """File names in the package's ``lang`` folder, empty if it cannot be listed."""
+    """File names in the package's ``lang`` folder, empty if it cannot be listed.
+
+    Three ways, in order of how much they need from the import system, because the combination
+    that matters is "old interpreter **and** packed plugin":
+
+    * ``importlib.resources.contents`` — the enumerator that exists from 3.7, and the one that
+      works for a zip as well as a directory. ``files()`` is 3.9+ and used to be what stood
+      here, which meant the declared 3.8 floor silently degraded to English-only.
+    * ``os.listdir`` on the module's own directory — the unpacked case, and what is left if
+      even ``contents`` is unavailable or a custom loader refuses it.
+    * :data:`SHIPPED_LANGUAGES` in :func:`available_languages`, which is the floor rather than a
+      fourth strategy.
+    """
     try:
-        folder = importlib.resources.files(__package__).joinpath(LANG_DIR_NAME)
-        return sorted(entry.name for entry in folder.iterdir())
+        # Can only ever fire on 3.11+, where a replacement exists; on 3.8-3.10 ``contents`` is
+        # the only enumerator there is, and a deprecation notice on a server console is noise
+        # about a version that has no alternative.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            entries = importlib.resources.contents(
+                "{}.{}".format(__package__, LANG_DIR_NAME)
+            )
+        return sorted(entry for entry in entries if entry.endswith(".json"))
     except Exception:  # noqa: BLE001 - any loader quirk falls back to the plain path
         pass
     try:
@@ -106,11 +141,19 @@ def available_languages() -> List[str]:
     """Every shipped language code, sorted.
 
     Read from the package rather than hardcoded: dropping in a ``<code>.json`` is enough to
-    make it selectable.
+    make it selectable. The one hardcoded part is the *floor* — a package always contains the
+    catalogues in :data:`SHIPPED_LANGUAGES`, so if enumeration comes back with less than that
+    (an interpreter without the listing API, a zip the loader will not enumerate, a shrunken
+    package) the answer is the union instead of the truncated list. Under-reporting here is not
+    a cosmetic failure: the configured language is checked against this list, so a missing entry
+    turns a working catalogue into ``language.unsupported`` and an English console.
     """
     codes = sorted(
         os.path.splitext(name)[0] for name in _list_lang_files() if name.endswith(".json")
     )
+    missing = [code for code in SHIPPED_LANGUAGES if code not in codes]
+    if missing:
+        codes = sorted(set(codes) | set(SHIPPED_LANGUAGES))
     return codes or [FALLBACK_LANGUAGE]
 
 

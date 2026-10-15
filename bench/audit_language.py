@@ -9,10 +9,15 @@
 
 这一份用 AST 只收「作为调用实参出现的字符串」，再逐键比对占位符与调用处传的关键字。
 
-用法（仓库根目录）：``python bench/audit_language.py``
+**第 2 节不再靠猜调用点。** 它原来把「任何调用实参里出现的字符串常量」当成消息键，再在那次
+调用上取关键字——于是键经变量传递时（`tr(header_key, count=...)`、`tr(key, **args)`、
+`tr(choice.note_key, **choice.note_args)`）它看不到真正的实参，实测 15 条输出全是误报，而真丢了
+占位符的模板会被这些噪音淹掉。现在改成**运行时**用真正的 `Catalog` 对每个键做一次 format 断言：
+传进去的参数由模板自己的 `{...}` 决定，所以「这个键能不能被填满」是可判定的，不再依赖调用点长什么样。
 """
 
 import ast
+import importlib.util
 import json
 import pathlib
 import re
@@ -56,6 +61,37 @@ def calls_with_key(path: pathlib.Path):
     return out
 
 
+def _load_i18n():
+    """``mod_update_checker.i18n`` without importing MCDR.
+
+    The package's ``__init__`` pulls in ``mcdreforged.api.all``, and this script is documented to
+    run from a plain interpreter (``tests/README.md`` calls it a language-file audit, not a
+    plugin entry point). Loading the module file by path keeps the one thing this needs — the
+    real :class:`Catalog`, so the format check cannot drift from the runtime — and nothing else.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "audit_language_i18n", str(PACKAGE / "i18n.py")
+    )
+    module = importlib.util.module_from_spec(spec)
+    # ``__package__`` is what ``pkgutil.get_data`` uses to find the language files.
+    module.__package__ = "mod_update_checker"
+    spec.loader.exec_module(module)
+    return module
+
+
+i18n = _load_i18n()
+
+
+def _dummy_args(template: str) -> dict:
+    """Argument values to format ``template`` with, one per placeholder it declares.
+
+    Taken from the template rather than from any call site, which is the whole point: it makes
+    "is this template fillable?" a property of the template, so a key passed through a variable
+    (or through ``**args``) is checked exactly like a literal one.
+    """
+    return {name: "x" for name in _PLACEHOLDER.findall(template)}
+
+
 def main() -> int:
     languages = sorted(PACKAGE.glob("lang/*.json"))
     catalogues = {
@@ -86,24 +122,29 @@ def main() -> int:
 
     print()
     print("=" * 78)
-    print("2. 模板里的占位符，从来没有人传过")
+    print("2. 模板里的占位符，用真正的 Catalog 填一遍看能不能填满")
     print("=" * 78)
-    orphan_placeholders = []
-    for key in sorted(chinese):
-        if key.startswith(DYNAMIC_PREFIXES):
-            continue
-        wanted = set(_PLACEHOLDER.findall(chinese[key]))
-        if not wanted:
-            continue
-        given = set()
-        for keywords, _name, _line in passed.get(key, []):
-            given |= keywords
-        missing = sorted(char for char in wanted if char not in given)
-        if missing:
-            orphan_placeholders.append((key, missing, chinese[key]))
-    for key, missing, text in orphan_placeholders:
-        print("  {:<34} 没人传 {}  ← {}".format(key, missing, text))
-    if not orphan_placeholders:
+    unfillable = []
+    for language in sorted(catalogues):
+        catalog = i18n.get_catalog(language)
+        for key in sorted(catalogues[language]):
+            template = catalog.messages.get(key)
+            if template is None:
+                continue
+            args = _dummy_args(template)
+            try:
+                rendered = template.format(**args)
+            except (KeyError, IndexError, ValueError, AttributeError, TypeError) as error:
+                # The same exceptions ``translate`` swallows, reported instead of swallowed: a
+                # template that cannot be filled is the bug this section exists to name.
+                unfillable.append((language, key, "{}: {}".format(type(error).__name__, error)))
+                continue
+            leftover = _PLACEHOLDER.search(rendered)
+            if leftover:
+                unfillable.append((language, key, rendered))
+    for language, key, result in unfillable:
+        print("  {:<6} {:<34} ← {}".format(language, key, result.replace("\n", "\\n")))
+    if not unfillable:
         print("  （无）")
 
     print()
@@ -136,7 +177,7 @@ def main() -> int:
 
     print()
     print("键数：zh_cn {} / en_us {}".format(len(chinese), len(english)))
-    return 1 if (suspicious or orphan_placeholders) else 0
+    return 1 if (suspicious or unfillable) else 0
 
 
 if __name__ == "__main__":

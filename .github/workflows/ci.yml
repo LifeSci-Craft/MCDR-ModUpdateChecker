@@ -23,10 +23,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
         with:
           python-version: "3.13"
+          cache: pip
+          cache-dependency-path: tests/requirements-test.txt
       - name: Install ruff
         run: python -m pip install "ruff==0.17.0"
       - name: Lint
@@ -41,17 +43,50 @@ jobs:
       matrix:
         python-version: ["3.10", "3.13"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
         with:
           python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: tests/requirements-test.txt
       - name: Install test dependencies
         run: python -m pip install --target .testlibs -r tests/requirements-test.txt
       # Python 3.10 has no tomllib, so this matrix also exercises the plugin's regex reader
       # for Forge/NeoForge metadata instead of only the parser every 3.11+ interpreter takes.
-      # The real-MCDR end-to-end is excluded here and covered by the matrix job below.
+      # The real-MCDR end-to-end is excluded here because it needs a real MCDR boot (about 2 m
+      # 20 s on its own) and is run by the `e2e` job below — not by the matrix job, which does
+      # not invoke pytest at all and therefore never ran these two cases.
       - name: Run the suite
         run: PYTHONPATH=.testlibs python -m pytest -m "not e2e"
+
+  e2e:
+    # The two end-to-end cases are in no other job: `unit` excludes them by marker, `mutation`
+    # only runs the files its selectors name, and `mcdr-matrix` drives its own scenario without
+    # pytest. So "827 passed, including 2 end-to-end" was a claim CI never checked. This job is
+    # that check — one real MCDR boot, the packed plugin, the whole flow.
+    name: end-to-end (real MCDR)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: tests/requirements-test.txt
+      - name: Install test dependencies
+        run: python -m pip install --target .testlibs -r tests/requirements-test.txt
+      - name: Boot a real MCDR and drive the plugin through it
+        run: PYTHONPATH=.testlibs python -m pytest tests/test_e2e.py -q
+      - name: Upload the console when it fails
+        if: failure()
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: e2e-console
+          path: |
+            /tmp/pytest-of-*/**
+            /tmp/muc_e2e_*/**
+          if-no-files-found: ignore
 
   python-floor:
     # `ruff.toml` sets target-version = py38 because that is MCDR 2.13.0's floor, but a config
@@ -61,8 +96,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
         with:
           python-version: "3.13"
       - name: Every file still runs on the declared floor
@@ -75,10 +110,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
         with:
           python-version: "3.13"
+          cache: pip
+          cache-dependency-path: tests/requirements-test.txt
       - name: Install test dependencies
         run: python -m pip install --target .testlibs -r tests/requirements-test.txt
       - name: Every mutation must be caught by at least one test
@@ -97,17 +134,19 @@ jobs:
       matrix:
         mcdr: ["2.13.0", "2.14.1", "2.15.0", "2.15.7", "2.16.0"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
         with:
           python-version: "3.13"
+          cache: pip
+          cache-dependency-path: tests/requirements-test.txt
       - name: Install MCDR ${{ matrix.mcdr }} and pytest
         run: python -m pip install --target .testlibs "mcdreforged==${{ matrix.mcdr }}" pytest
       - name: Load the packed plugin, run a check, and drive every command
         run: PYTHONPATH=.testlibs python tools/mcdr_matrix.py --current
       - name: Upload the MCDR console when it fails
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         with:
           name: mcdr-${{ matrix.mcdr }}-console
           path: /tmp/muc_matrix_work_*/**
@@ -121,8 +160,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
         with:
           python-version: "3.13"
       - name: Pack twice, compare, and inspect
