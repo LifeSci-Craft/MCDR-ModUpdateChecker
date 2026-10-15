@@ -48,7 +48,7 @@
 游戏内列表效果：
 
 ```
-============  Mod Update Checker v1.6.1  ============
+============  Mod Update Checker v1.6.2  ============
 服务端: 26.3 / Fabric(版本来源：server_info)
 [1] Lithium                 [版本]  [状态: ↑]  [详细信息]
 [2] Sodium                 [版本]  [状态: ↑]  [详细信息]

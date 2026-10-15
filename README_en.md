@@ -57,7 +57,7 @@ kept as a backup. No API key, no extra dependencies.
 A listing in game looks like this (the Chinese screenshot form is in [`README.md`](README.md)):
 
 ```
-============  Mod Update Checker v1.6.1  ============
+============  Mod Update Checker v1.6.2  ============
 server: 26.3 / Fabric (version source: server_info)
 [1] Lithium                 [version]  [status: up]  [details]
 [2] Sodium                 [version]  [status: up]  [details]
