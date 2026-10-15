@@ -195,6 +195,66 @@ def test_eight_threads_writing_one_file_always_succeed(tmp_path):
     )
 
 
+def test_writes_to_one_target_never_overlap(tmp_path, monkeypatch):
+    """同一目标路径的写入必须真的串行——而且这一点要在任何操作系统上都测得出来。
+
+    上面那条测试是**反推**的：靠「并发的改名会不会失败」与「有没有走重试」判断锁在不在。
+    那是 Windows 的替换语义——Linux 上两个并发的 ``os.replace`` 指向同一目标并不会失败，
+    于是把锁删掉以后那里既不会有异常、也不会有重试，变异检查会如实报「存活」（CI 就跑在
+    Linux 上）。这条测试改成正着量：在写路径里套一层计数包装，只要锁不在，两个写者就会同时
+    处在临界区内。
+    """
+    import mod_update_checker.jsonfile as jsonfile_module
+
+    target = tmp_path / "download-manifest.json"
+    write_json(target, {"version": 1, "mods": {}})
+
+    real_replace = jsonfile_module._replace_with_retry
+    counter_lock = threading.Lock()
+    state = {"inside": 0, "peak": 0}
+
+    def counting_replace(temporary, destination):
+        with counter_lock:
+            state["inside"] += 1
+            state["peak"] = max(state["peak"], state["inside"])
+        try:
+            # 把重叠窗口放大到调度器一定会撞上的量级；串行化之后这段时间在锁内，
+            # 所以整条测试的耗时仍然是可接受的（8 × 20 × 5 ms）。
+            time.sleep(0.005)
+            return real_replace(temporary, destination)
+        finally:
+            with counter_lock:
+                state["inside"] -= 1
+
+    monkeypatch.setattr(jsonfile_module, "_replace_with_retry", counting_replace)
+
+    threads = 8
+    rounds = 20
+    ready = threading.Barrier(threads)
+    errors = []
+
+    def writer(index):
+        ready.wait()
+        for round_index in range(rounds):
+            try:
+                write_json(target, {"writer": index, "round": round_index})
+            except OSError as error:  # noqa: PERF203 - the failure is the observation
+                errors.append("{}: {}".format(type(error).__name__, error))
+                return
+
+    workers = [threading.Thread(target=writer, args=(index,)) for index in range(threads)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join()
+
+    assert errors == [], errors
+    assert state["peak"] == 1, (
+        "{} writers were inside the write path of one target at the same time, so writes to "
+        "one file were not serialised".format(state["peak"])
+    )
+
+
 def test_a_rename_that_fails_once_is_retried(tmp_path, monkeypatch):
     """被别的写者挡了一下的改名是可重试错误，重试一次就该过去。"""
     import mod_update_checker.jsonfile as jsonfile_module
