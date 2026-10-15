@@ -1,0 +1,31 @@
+# Keep the workflow's actions current, as reviewable pull requests.
+#
+# Every `uses:` in .github/workflows/ is pinned to a commit SHA with the tag spelled out in a
+# comment, which is what makes an upstream moving a *tag* harmless — but a pin also stops
+# receiving fixes, silently, until somebody looks. This file is that somebody: GitHub's own
+# updater opens a PR for each new release, so the pin moves on a schedule and the diff (SHA plus
+# the comment) is the review.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+    labels:
+      - dependencies
+
+  # The test dependencies are pinned in tests/requirements-test.txt for reproducibility, and
+  # `pip` is what actually installs them into .testlibs; the language packages themselves are
+  # not declared with their own requirement files, so only this one matters.
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "test"
+    labels:
+      - dependencies

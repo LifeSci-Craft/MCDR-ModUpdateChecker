@@ -6,12 +6,10 @@
     "en_us": "Check and update server-side mods from Modrinth.",
     "zh_cn": "从 Modrinth 检查和更新服务端 Mod"
   },
-  "authors": [
-    {
-      "name": "Pau1am",
-      "link": "https://github.com/Pau1am"
-    }
+  "author": [
+    "Pau1am"
   ],
+  "link": "https://github.com/LifeSci-Craft/MCDR-ModUpdateChecker",
   "links": {
     "homepage": "https://github.com/LifeSci-Craft/MCDR-ModUpdateChecker",
     "source": "https://github.com/LifeSci-Craft/MCDR-ModUpdateChecker",

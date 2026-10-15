@@ -13,8 +13,14 @@ Usage::
 
     python tools/mutation_check.py
 
-It refuses to run when ``MCDR_SKIP_E2E`` is set: at least one mutation is only caught by the
-end-to-end suite, so a skipped ``e2e`` would turn a caught mutation into a reported survivor.
+It refuses to run with e2e skipped, and the honest reason is narrower than the old text claimed.
+That text said "at least one mutation is only caught by the end-to-end suite"; measured, **every
+one of the twelve selectors is satisfied by a unit test**, and none of them references
+``tests/test_e2e.py``. So the guard is not protecting a particular mutation. It is protecting the
+*baseline*: the run reports one summary over the suite, and a suite that quietly lost its
+end-to-end half would make that summary a weaker claim than it reads as. For a tool whose whole
+argument is "this suite has teeth", that is worth refusing over — but it is a statement about the
+baseline, not about any single mutation, and writing it as the latter is what made it unverifiable.
 
 A mutation that changes nothing is reported as a **stale anchor** rather than a pass: the code
 moved and the mutation has to be rewritten, which is a different problem from a test without teeth.
@@ -90,10 +96,11 @@ def mutations():
         "    return True  # mutation",
         ["tests/test_cleanup.py"])
 
-    add("JSON is written through a shared temporary name",
+    add("JSON writes to one target are no longer serialised",
         JSONFILE,
-        '        "{}.{}.{}.tmp".format(target.suffix, os.getpid(), threading.get_ident())',
-        '        "{}.tmp".format(target.suffix)  # mutation: shared by every writer',
+        "    payload_text = json_text(payload, sort_keys)\n    with _write_lock_for(target):",
+        "    payload_text = json_text(payload, sort_keys)\n"
+        "    if True:  # mutation: no lock, so two renames race for one destination",
         ["tests/test_jsonfile.py"])
 
     add("the ledger writes only what one instance remembers",
@@ -186,8 +193,9 @@ def run_pytest(workdir, args):
 
 def main() -> int:
     if os.environ.get("MCDR_SKIP_E2E"):
-        print("MCDR_SKIP_E2E is set: the end-to-end suite would be skipped, and at least one")
-        print("mutation is only caught there. Unset it and run again.")
+        print("MCDR_SKIP_E2E is set: the end-to-end suite would be skipped, so the baseline")
+        print("summary below would cover less than the suite this repository claims to run.")
+        print("Unset it and run again.")
         return 2
     if not (REPO / ".testlibs").is_dir():
         print("run the tests/README.md setup first (.testlibs is missing)")

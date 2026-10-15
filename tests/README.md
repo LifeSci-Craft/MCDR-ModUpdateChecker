@@ -17,8 +17,9 @@ python -m pip install --target .testlibs -r tests/requirements-test.txt
 ## 跑测试
 
 ```bash
-PYTHONPATH=.testlibs python -m pytest          # 全量（827 项，含端到端；端到端本身约 1 分钟）
+PYTHONPATH=.testlibs python -m pytest          # 全量（827 项，含端到端；实测约 146 s）
 PYTHONPATH=.testlibs python -m pytest -m "not e2e"   # 跳过端到端，约 25 秒
+# 全量（含 2 项 e2e）：实测约 146 s，其中 e2e 两项约 2 分 20 秒
 ```
 
 `pytest.ini` 里已把 `tests/` 设为测试根，`conftest.py` 负责把仓库根和 `tests/` 放进 `sys.path`；
@@ -87,8 +88,9 @@ MCDR_TEST_PYTHON=/path/to/mcdr-2.14/python PYTHONPATH=.testlibs python -m pytest
 python tools/mutation_check.py
 ```
 
-它拒绝在设了 `MCDR_SKIP_E2E` 的环境里运行——至少有一条守卫只有端到端套件能抓到，跳过了 e2e 就等于
-把「被抓住」误报成「存活」。CI 里有独立的 `mutation` 作业跑它。
+它拒绝在设了 `MCDR_SKIP_E2E` 的环境里运行，理由比原来写的那条窄：**现在 12 条 selector 里没有一条
+引用 `tests/test_e2e.py`**，「至少一条守卫只有 e2e 能抓到」这个前提实测不成立。守卫真正护的是
+**基线**——脚本报的是整套测试的摘要，悄悄少了端到端那一半，摘要就比它读起来的样子弱。CI 里有独立的 `mutation` 作业跑它。
 
 ## 无法在仓库内闭环的部分
 

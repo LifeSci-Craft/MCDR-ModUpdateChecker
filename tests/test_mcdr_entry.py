@@ -87,6 +87,12 @@ class _FakeServer:
         would be describing a state a real server cannot produce. This mirrors MCDR's
         ``load_config_simple``: load, deserialize with the missing-field callback, and save
         exactly when the file was unreadable or something was missing.
+
+        The ``failure_policy='regen'`` branch is part of that mirror, and it used to be missing:
+        MCDR catches whatever ``deserialize`` raises and **overwrites the file with defaults**
+        (``plugin/si/plugin_server_interface.py``). Without it here, a type mistake raised
+        straight through the fake and the whole path was untestable — which is exactly how the
+        plugin came to reset a user's config in silence.
         """
         from mcdreforged.plugin.si._simple_config_handler import SimpleConfigHandler
 
@@ -104,9 +110,17 @@ class _FakeServer:
             handler.save(config.serialize(), encoding="utf8")
             return config
 
-        config = target_class.deserialize(
-            raw, missing_callback=note_missing, redundancy_callback=note_missing
-        )
+        try:
+            config = target_class.deserialize(
+                raw, missing_callback=note_missing, redundancy_callback=note_missing
+            )
+        except Exception as error:  # noqa: BLE001 - this is MCDR's own ``except Exception``
+            self.logger.debug(
+                "config regeneration: {}: {}".format(type(error).__name__, error)
+            )
+            config = target_class.get_default()
+            handler.save(config.serialize(), encoding="utf8")
+            return config
         if incomplete:
             handler.save(config.serialize(), encoding="utf8")
         return config
@@ -192,22 +206,96 @@ def test_event_handlers_are_not_registered_explicitly_as_well():
     )
 
 
-def test_load_stops_the_previous_modules_scheduler():
-    """A reload hands the old module to ``on_load`` and never fires ``on_unload``.
+def test_load_stops_the_previous_modules_scheduler(tmp_path, monkeypatch):
+    """A reload must stop the outgoing module's interval thread — for real, not in the source.
 
-    Verified in MCDR's own ``plugin_manager``: ``__reload_plugin`` calls ``plugin.reload()``
-    directly, with no ``PLUGIN_UNLOADED`` dispatch and no ``__unload_plugin``. So the outgoing
-    module's scheduler thread is still alive, and if ``on_load`` does not stop it, every
-    reload leaves one more thread running checks against this server forever.
+    This used to be an ``ast.dump`` assertion that the names ``_stop_scheduler`` and
+    ``prev_module`` appeared somewhere in ``on_load``. Deleting the call and leaving the names in
+    a string literal kept it green, which is the shape of a test that cannot fail. So the
+    previous module here is a real object whose stop function records that it ran.
     """
-    tree = ast.parse(_entry_source())
-    loader = next(
-        node for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and node.name == "on_load"
-    )
-    body = ast.dump(loader)
-    assert "_stop_scheduler" in body, "on_load does not call into the previous module"
-    assert "prev_module" in body, "on_load ignores the previous module handed to it"
+    import mod_update_checker as plugin
+
+    server = _FakeServer(tmp_path)
+    calls = []
+
+    class _Previous:
+        _last_report = None
+        _online_players = set()
+
+        @staticmethod
+        def _stop_scheduler():
+            calls.append("stopped")
+
+    monkeypatch.setattr(plugin, "_register_commands", lambda _server: None, raising=False)
+    monkeypatch.setattr(plugin, "reset_cell_width_cache", lambda: None, raising=False)
+    monkeypatch.setattr(plugin, "_log_cache_summary", lambda *_a, **_k: None, raising=False)
+    monkeypatch.setattr(plugin, "_start_interval_scheduler", lambda *_a, **_k: None, raising=False)
+    monkeypatch.setattr(plugin.Config, "enabled", False, raising=False)
+
+    plugin._stop_event.clear()
+    plugin.on_load(server, _Previous())
+
+    assert calls == ["stopped"], calls
+
+
+def test_load_keeps_a_live_report_from_a_genuinely_reloaded_module(tmp_path, monkeypatch):
+    """The reload carry-over, against the module identity a real reload produces.
+
+    MCDR unloads before it reloads: ``__reload_ready_plugins`` calls ``__unload_plugin``, which
+    dispatches ``PLUGIN_UNLOADED`` and calls ``plugin.unload()``; ``RegularPlugin._on_unload``
+    then pops every ``mod_update_checker*`` module from ``sys.modules``. The replacement module
+    therefore has a **different** ``Report`` class object, so ``isinstance(carried, Report)`` —
+    which is what ``on_load`` used to ask — is false no matter which report is handed over. The
+    live report was dropped on every ``!!MCDR reload plugin`` and the admin was shown "no check
+    has run yet" until a whole new check finished.
+
+    Reproduced here the way MCDR does it (import a second copy, then hand the first one over),
+    rather than by monkeypatching ``_last_report`` on the new module — which is what the old
+    version of this test did, and which never entered the ``prev_module`` branch at all.
+    """
+    import importlib
+    import sys
+
+    plugin = importlib.import_module("mod_update_checker")
+    server = _FakeServer(tmp_path)
+    live = _report(updates=1)
+
+    saved = {
+        name: module
+        for name, module in list(sys.modules.items())
+        if name == "mod_update_checker" or name.startswith("mod_update_checker.")
+    }
+    for name in saved:
+        del sys.modules[name]
+    fresh = importlib.import_module("mod_update_checker")
+    try:
+        assert fresh.Report is not plugin.Report, (
+            "the reload simulation did not produce a second module"
+        )
+
+        previous = type("_PreviousModule", (), {
+            "_last_report": live,
+            "_online_players": set(),
+            "_stop_scheduler": staticmethod(lambda: None),
+        })()
+
+        monkeypatch.setattr(fresh, "_load_config", lambda _server: _config_with(), raising=False)
+        monkeypatch.setattr(fresh, "_register_commands", lambda _server: None, raising=False)
+        monkeypatch.setattr(fresh, "reset_cell_width_cache", lambda: None, raising=False)
+        monkeypatch.setattr(fresh, "_log_cache_summary", lambda *_a, **_k: None, raising=False)
+        monkeypatch.setattr(fresh, "_start_interval_scheduler", lambda *_a, **_k: None, raising=False)
+        monkeypatch.setattr(fresh.Config, "enabled", False, raising=False)
+
+        fresh._stop_event.clear()
+        fresh.on_load(server, previous)
+
+        assert fresh._last_report is live, "the live report was dropped by the reload"
+    finally:
+        for name in [name for name in sys.modules if name == "mod_update_checker"
+                     or name.startswith("mod_update_checker.")]:
+            del sys.modules[name]
+        sys.modules.update(saved)
 
 
 def test_the_stop_event_is_cleared_before_a_new_scheduler_starts(tmp_path, monkeypatch):
@@ -294,6 +382,75 @@ def test_on_load_counts_jars_without_hashing_them(tmp_path, monkeypatch):
     assert {prefix for prefix, _m, _p in server.help_messages} == {"!!modupdate", "!!muc"}
 
     plugin._stop_scheduler()
+
+
+def test_the_help_entry_states_the_level_instead_of_filtering_on_it(tmp_path):
+    """``!!help`` must not be able to disagree with the gate that actually runs the command.
+
+    MCDR stores a help message's permission level as a value and filters on it when ``!!help`` is
+    rendered, while this plugin's gate reads the config every time a command runs. Registering the
+    entry at ``command_permission_level`` therefore pinned the two apart: after lowering the level
+    and running ``!!muc reload`` the command worked and ``!!help`` did not mention it, and after
+    raising it ``!!help`` offered an entry that could not be clicked.
+
+    So the entry is registered at 0 and carries the number in its text — asserted here by
+    changing the level, re-reading the config, and checking both halves.
+    """
+    import mod_update_checker as plugin
+
+    server = _FakeServer(tmp_path)
+    plugin._stop_event.clear()
+    monkeypatch_config = _config_with({"command_permission_level": 0})
+    plugin._config = monkeypatch_config
+
+    plugin._register_commands(server)
+
+    assert {prefix for prefix, _m, _p in server.help_messages} == {"!!modupdate", "!!muc"}
+    assert {perm for _p, _m, perm in server.help_messages} == {0}
+    assert all("0" in str(message) for _p, message, _perm in server.help_messages)
+
+    # Raising the level later must be reflected in what a reader is told, without a reload of
+    # anything: nothing was filtered on the level, so there is no stale copy of it anywhere.
+    server.help_messages.clear()
+    plugin._config = _config_with({"command_permission_level": 4})
+    plugin._register_commands(server)
+
+    assert all("4" in str(message) for _p, message, _perm in server.help_messages), \
+        [str(m) for _p, m, _perm in server.help_messages]
+
+
+def test_the_report_files_are_written_atomically(tmp_path, monkeypatch):
+    """``last_report.json`` is read back at startup, so a half-written one costs the report.
+
+    It was the last file in the plugin written with a bare ``open(path, "w")``: killed mid-write,
+    ``Report.from_json`` answers ``None`` for the truncated file, and the admin's report becomes
+    "no check has run yet" — the failure the temp-then-rename helper exists to prevent. Asserted
+    by making every rename fail: the old content must survive, in both files.
+    """
+    import mod_update_checker as plugin
+
+    server = _FakeServer(tmp_path)
+    report = _report(updates=1)
+
+    plugin._write_report_files(server, report)
+    folder = Path(server.get_data_folder())
+    json_path = folder / plugin.REPORT_FILE_NAME
+    text_path = folder / plugin.REPORT_TEXT_FILE_NAME
+    json_before = json_path.read_text(encoding="utf-8")
+    text_before = text_path.read_text(encoding="utf-8")
+
+    def explode(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(plugin.os, "replace", explode)
+    plugin._write_report_files(server, _report(updates=3), announce=False)
+
+    assert json_path.read_text(encoding="utf-8") == json_before
+    assert text_path.read_text(encoding="utf-8") == text_before
+    # And the failure left no temporary file behind in either case.
+    assert sorted(path.name for path in folder.iterdir()) == sorted(
+        [plugin.REPORT_FILE_NAME, plugin.REPORT_TEXT_FILE_NAME]
+    ), sorted(path.name for path in folder.iterdir())
 
 
 def test_on_load_warns_when_the_mods_folder_is_missing(tmp_path):
@@ -565,6 +722,71 @@ def test_an_incomplete_config_file_is_healed_and_the_added_options_are_named(tmp
     assert "download.install_on_stop" in joined, joined
     assert "sources.manual_map" in joined, joined
     assert str(path) in joined, joined
+
+
+def test_a_type_mistake_in_the_config_is_reported_instead_of_silently_reset(tmp_path):
+    """The other half of "unparseable", and the one that cost the admin everything.
+
+    A legal JSON file with one string where a number belongs does not trip the plugin's own
+    ``json.load``; it trips ``Config.deserialize``, and MCDR's default ``failure_policy='regen'``
+    then replaces the whole file with defaults. Measured before this was fixed, on a 36-option
+    file with only ``network.timeout_seconds`` wrong: ``language`` went back to ``auto``,
+    ``interval_hours`` to 0, the ignore list emptied, no backup was written and nothing was said.
+
+    Three things are asserted, because all three were missing: the admin's file survives as a
+    backup, the console says the file was *rejected* (rather than "missing options, filled in"),
+    and the message names the option.
+    """
+    import mod_update_checker as plugin
+
+    server = _FakeServer(tmp_path)
+    payload = plugin.Config.get_default().serialize()
+    payload["check"]["interval_hours"] = 6
+    payload["check"]["ignored_mods"] = ["sodium"]
+    payload["network"]["timeout_seconds"] = "45"
+    path = _write_config(server, payload)
+
+    config = plugin._load_config(server)
+
+    # The file itself was rebuilt from defaults by MCDR, but not before being preserved.
+    backups = sorted(p.name for p in path.parent.iterdir() if ".broken." in p.name)
+    assert len(backups) == 1, backups
+    kept = json.loads((path.parent / backups[0]).read_text(encoding="utf-8"))
+    assert kept["check"]["ignored_mods"] == ["sodium"], "the user's values were not preserved"
+    assert kept["check"]["interval_hours"] == 6
+    assert kept["network"]["timeout_seconds"] == "45"
+
+    # And the config object is MCDR's regenerated one, which is the point of the warning.
+    assert config.network.timeout_seconds == plugin.Config.get_default().network.timeout_seconds
+
+    joined = "\n".join(server.logger.messages)
+    assert "配置无法解析" in joined, joined
+    assert "network.timeout_seconds" in joined, joined
+    assert "已按默认值补上" not in joined, "a rejected file was reported as merely incomplete"
+    assert "已按默认值创建" not in joined
+
+
+def test_a_rejected_config_does_not_get_the_incomplete_file_report_afterwards(tmp_path):
+    """Two different events, two different lines — and only one of them per load.
+
+    After regeneration the file has every option, so the leaf-path comparison sees nothing
+    added and nothing missing; that silence is right, but it must not come *with* a claim that
+    the file was merely completed. The two reports are asserted against each other here.
+    """
+    import mod_update_checker as plugin
+
+    server = _FakeServer(tmp_path)
+    payload = plugin.Config.get_default().serialize()
+    payload["network"]["retries"] = "many"
+    _write_config(server, payload)
+
+    plugin._load_config(server)
+
+    joined = "\n".join(server.logger.messages)
+    assert "配置无法解析" in joined, joined
+    assert "network.retries" in joined, joined
+    assert "缺少" not in joined, joined
+    assert "没有被更新" not in joined, joined
 
 
 def test_a_config_file_that_was_not_updated_is_warned_about_with_its_path(tmp_path):
@@ -1228,6 +1450,12 @@ def test_the_report_records_what_was_downloaded(tmp_path):
     """The note is what makes the report file the place to look afterwards."""
     import mod_update_checker as plugin
     from mod_update_checker.downloads import DownloadOutcome
+
+    # The language is pinned rather than inherited: ``_translator`` is module state that survives
+    # between tests, and the assertion below quotes Chinese wording — so without this the test
+    # passes or fails on which test ran first, and this file's own convention is to say so
+    # explicitly (see ``_manual_env``).
+    plugin._apply_language(None, _config_with({"language": "zh_cn"}))
 
     server = _FakeServer(tmp_path)
     report = _report(updates=2)
@@ -2010,6 +2238,44 @@ def _last_reply_with(source, marker):
     """
     replies = getattr(source, "raw", None) or source.replies
     return next(reply for reply in reversed(replies) if marker in str(reply))
+
+
+def test_every_line_in_one_screen_names_the_alias_that_was_typed(tmp_path, monkeypatch):
+    """``!!muc`` must not answer with ``!!modupdate`` in the same screenful as its own buttons.
+
+    Both aliases are registered, so naming the wrong one is not broken — it is a reader who
+    typed ``!!muc list`` being told, by the buttons and the closing hint at once, that the
+    command is called something else. The hint lines had ``!!modupdate`` written into their
+    templates; the ones that are also produced outside a command (the join notice, the report
+    file) take the alias from the module-level reply context, which the command tree records.
+    """
+    plugin, _server = _one_screen_setup(tmp_path, monkeypatch, _listing_entries(14))
+    source = _PlayerSource("Admin")
+
+    plugin._show_list(source, "", "!!muc")
+
+    body = source.body
+    assert "!!muc" in body, body
+    assert "!!modupdate" not in body, "the screen answered with the other alias:\n" + body
+
+
+def test_a_command_with_no_report_names_the_alias_that_was_typed(tmp_path, monkeypatch):
+    """The "no check has run yet" line is a command hint too, and takes the same treatment.
+
+    The alias is recorded by the command tree's gate rather than passed in, because the same
+    lines are produced from event handlers that have no command context; the recording is
+    reproduced here with the same call the gate makes.
+    """
+    import mod_update_checker as plugin
+
+    monkeypatch.setattr(plugin, "_last_report", None, raising=False)
+    source = _PlayerSource("Admin")
+    plugin._set_reply_command("!!muc")
+
+    plugin._show_list(source, "", "!!muc")
+
+    assert "!!muc check" in source.body, source.body
+    assert "!!modupdate" not in source.body, source.body
 
 
 def test_the_listing_pages_with_clickable_buttons(tmp_path, monkeypatch):
@@ -4943,6 +5209,98 @@ def test_a_second_download_of_the_same_mod_is_not_started(tmp_path, monkeypatch)
 
     assert fetches == ["sodium.jar"], fetches
     assert "正在下载中" in source.body, source.body
+
+
+def test_a_second_batch_does_not_start_the_same_downloads_again(tmp_path, monkeypatch):
+    """``download all`` has to take the same claims the single form does.
+
+    The claim exists because two connections for one build fight over the same temporary file and
+    the same ledger record — and the batch path took none, so a second ``download all`` (or a
+    ``download <number>`` alongside the first) ran the same transfers concurrently. Measured on
+    Windows before this changed: one of the two reported ``could not put the file in place:
+    [WinError 32]`` although the file was on disk, and the summary line said ``failed=1``.
+    """
+    import threading
+
+    plugin, _server, source, entry, _ledger = _manual_env(tmp_path, monkeypatch)
+    fetches = []
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_fetch(entries):
+        fetches.extend(item.file_name for item in entries)
+        started.set()
+        release.wait(5)
+        return None
+
+    monkeypatch.setattr(plugin, "_perform_manual_downloads", slow_fetch, raising=False)
+
+    plugin._confirmed_download_all(source, [entry], "!!muc")
+    assert started.wait(5), "the first batch never started"
+    source.replies.clear()
+    source.raw.clear()
+    plugin._confirmed_download_all(source, [entry], "!!muc")
+    release.set()
+    for _ in range(200):
+        if not plugin._inflight_downloads:
+            break
+        time.sleep(0.01)
+
+    assert fetches == ["sodium.jar"], fetches
+    assert "都正在下载" in source.body, source.body
+    assert not plugin._inflight_downloads, plugin._inflight_downloads
+
+
+def test_a_batch_skips_only_what_is_already_in_flight(tmp_path, monkeypatch):
+    """A partial overlap reports the overlap and still starts the rest.
+
+    Dropping the whole batch on any overlap would be the easy reading and the wrong one: the
+    admin asked for everything waiting, and one already-running transfer is not a reason to
+    refuse the other four.
+    """
+    import threading
+
+    from mod_update_checker.report import UpdateEntry
+
+    plugin, _server, source, entry, _ledger = _manual_env(tmp_path, monkeypatch)
+    other = UpdateEntry(
+        mod_id="lithium",
+        name="Lithium",
+        file_name="lithium.jar",
+        local_version="1.0.0",
+        latest_version="1.1.0",
+        status="update_available",
+        download_url="https://cdn.example/lithium-1.1.0.jar",
+        download_filename="lithium-fabric-1.1.0.jar",
+        download_sha1="b" * 40,
+        download_size=1024,
+    )
+
+    started = threading.Event()
+    release = threading.Event()
+    batches = []
+
+    def slow_fetch(entries):
+        batches.append([item.file_name for item in entries])
+        started.set()
+        release.wait(5)
+        return None
+
+    monkeypatch.setattr(plugin, "_perform_manual_downloads", slow_fetch, raising=False)
+
+    plugin._confirmed_download_all(source, [entry], "!!muc")
+    assert started.wait(5), "the first batch never started"
+    source.replies.clear()
+    source.raw.clear()
+    plugin._confirmed_download_all(source, [entry, other], "!!muc")
+    release.set()
+    for _ in range(200):
+        if not plugin._inflight_downloads:
+            break
+        time.sleep(0.01)
+
+    assert batches == [["sodium.jar"], ["lithium.jar"]], batches
+    assert "只开始了其余" in source.body, source.body
     assert not plugin._inflight_downloads, "占用的名字没有被放回去"
 
 
@@ -5202,6 +5560,15 @@ def test_a_caption_too_wide_for_the_bar_is_cut_not_fitted_around(tmp_path, monke
         ("check.start_delay_seconds", 0, 3600),
         ("check.interval_hours", 0, 720),
         ("download.max_size_mb", 1, 8192),
+        # The four that were missing from the table (MUC-B-04 / DOC-02). Every one of them is
+        # read with ``int()``/``max()`` somewhere, so a typo used to be silently truncated:
+        # ``network.retries: 1000000000`` holds the check lock for as long as the server runs
+        # (``range(retries + 1)`` with a 20 s backoff cap), and ``cache.ttl_hours: -1`` flips
+        # "expire immediately" into "never expire" because ``ResolveCache`` reads 0 as the off
+        # switch.
+        ("download.retries", 0, 10),
+        ("network.retries", 0, 10),
+        ("network.cache.ttl_hours", 0, 8760),
         ("network.concurrent_requests", 1, 32),
         ("network.requests_per_minute", 0, 1000),
         ("network.timeout_seconds", 1, 300),
@@ -5209,6 +5576,7 @@ def test_a_caption_too_wide_for_the_bar_is_cut_not_fitted_around(tmp_path, monke
         ("command_permission_level", 0, 4),
         ("report.admin_permission", 0, 4),
         ("report.in_game_permission", 0, 4),
+        ("report.reuse_report_minutes", 0, 43200),
     ],
 )
 def test_an_out_of_range_number_is_clamped_and_reported(tmp_path, path, low, high):
@@ -5220,11 +5588,61 @@ def test_an_out_of_range_number_is_clamped_and_reported(tmp_path, path, low, hig
         config = _config_with({path: value})
         changed = plugin._clamp_and_report(server, config)
 
-        section, name = path.split(".", 1) if "." in path else (None, path)
-        target = getattr(config, section) if section else config
-        assert getattr(target, name) == used, (path, value)
+        # Walk the dotted path, not just the first segment: ``network.cache.ttl_hours`` is two
+        # sections deep.
+        target = config
+        for part in path.split(".")[:-1]:
+            target = getattr(target, part)
+        assert getattr(target, path.split(".")[-1]) == used, (path, value)
         assert path in changed, changed
         assert any(path in line for line in server.logger.messages), server.logger.messages
+
+
+def test_every_numeric_option_the_code_reads_is_in_the_clamp_table():
+    """The table is hand-maintained, so it drifts — and drift here is invisible.
+
+    README promises "a numeric option outside its range is clamped to the boundary and said
+    once". That promise is only true for the paths in ``_NUMERIC_RANGES``, and four real ones
+    were missing for exactly this reason: nothing connected the table to the code that reads the
+    options. This does, in two directions:
+
+    * every ``int``/``float`` option of the config class must be in the table, unless it is on the
+      explicit exclusion list below;
+    * every path in the table must name a real option — a renamed option would otherwise leave
+      the table clamping nothing at all, silently.
+
+    A new numeric option therefore has to be added to the table *and* to this test in one step,
+    which is the only kind of guard that works on a list maintained by hand.
+    """
+    import mod_update_checker as plugin
+    from support import option_paths
+
+    #: Numeric-looking options that are deliberately NOT clamped, with the reason. Empty is the
+    #: right state for this: every number the plugin reads has a range that means something.
+    EXCLUDED: dict = {}
+
+    numeric = set()
+    for path in option_paths(plugin.Config):
+        target = plugin.Config
+        for part in path.split(".")[:-1]:
+            target = getattr(target, part)
+        annotation = target.get_field_annotations().get(path.split(".")[-1])
+        if annotation in (int, float):
+            numeric.add(path)
+
+    assert numeric, "no numeric options were found, so this test proves nothing"
+
+    declared = {path for path, _low, _high in plugin._NUMERIC_RANGES}
+    missing = sorted(numeric - declared - set(EXCLUDED))
+    assert missing == [], "numeric options the clamp table does not cover: {}".format(missing)
+
+    unknown = sorted(declared - option_paths(plugin.Config))
+    assert unknown == [], "the clamp table names options that do not exist: {}".format(unknown)
+
+    # And the table has to stay ordered by range, because a typo like (10, 0) would clamp every
+    # value up to the minimum and then back down again.
+    for path, low, high in plugin._NUMERIC_RANGES:
+        assert low <= high, (path, low, high)
 
 
 def test_a_number_inside_its_range_is_left_alone(tmp_path):

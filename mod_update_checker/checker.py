@@ -35,6 +35,7 @@ while a stale positive would be a claim about bytes that may have been replaced 
 """
 
 import logging
+import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -153,6 +154,31 @@ class ResolveCache:
 
     VERSION = 1
 
+    #: One lock for the whole process, and one lock per file path inside that table. The
+    #: instances are the problem rather than the solution: the entry layer builds several (the
+    #: check thread, ``!!muc`` commands, the status page) and each takes its own snapshot of the
+    #: file at construction, so whoever saves last used to win and the other run's freshly
+    #: learned negative answers were silently dropped — a search plus a version lookup paid
+    #: again, within the TTL. :meth:`save` therefore merges into what is on disk under the file's
+    #: lock and writes back only *this* instance's changes, the same discipline
+    #: :class:`~mod_update_checker.downloads.DownloadLedger` already follows; its
+    #: ``_LEDGER_LOCK`` is the pattern being copied here.
+    _LOCKS: Dict[str, threading.RLock] = {}
+    _LOCKS_GUARD = threading.Lock()
+
+    @classmethod
+    def _lock_for(cls, path: Path) -> threading.RLock:
+        try:
+            key = os.path.normcase(str(path.resolve()))
+        except OSError:  # pragma: no cover - resolve() on a path that cannot be resolved
+            key = os.path.normcase(os.path.abspath(str(path)))
+        with cls._LOCKS_GUARD:
+            lock = cls._LOCKS.get(key)
+            if lock is None:
+                lock = threading.RLock()
+                cls._LOCKS[key] = lock
+            return lock
+
     def __init__(
         self, path: Union[str, Path, None], ttl_hours: float, enabled: bool = True
     ) -> None:
@@ -166,6 +192,11 @@ class ResolveCache:
         self.enabled = enabled and self.path is not None
         self._lock = threading.Lock()
         self._data: Dict[str, Any] = self._load()
+        #: Records this instance added or replaced since it was built. Only these are written
+        #: back by :meth:`save`, so a save cannot revert what another instance learned in the
+        #: meantime. A delete is recorded as an explicit ``None`` so that "removed here" is
+        #: distinguishable from "not touched here".
+        self._dirty: Dict[str, Any] = {}
 
     def _load(self) -> Dict[str, Any]:
         if not self.enabled or not self.path or not self.path.is_file():
@@ -214,16 +245,50 @@ class ResolveCache:
         record["at"] = time.time()
         with self._lock:
             self._data[sha1] = record
+            self._dirty[sha1] = record
 
     def save(self) -> None:
+        """Write this instance's new records back, merging with what is on disk.
+
+        Read-modify-write rather than "write what I have": the file is shared by every instance
+        in the process, and a whole-file write from an instance holding an older snapshot is how
+        one run's answers get thrown away by the next one's.
+
+        It writes even when this instance learned nothing, because that is what it did before and
+        something depends on it: the cross-version matrix and the end-to-end test read
+        ``resolve-cache.json`` back after a run to prove the cache is on disk and parses, and a
+        run where every mod resolved from the batched lookup legitimately has no new records. An
+        "always write" is also the honest reading of the option — ``network.cache.enabled`` says
+        the cache is in use, so the file is the evidence of that.
+        """
         if not self.enabled or not self.path:
             return
-        with self._lock:
-            payload = {"version": self.VERSION, "records": self._data}
         try:
-            write_json(self.path, payload)
+            with self._lock_for(self.path):
+                payload = self._merged_payload()
+                write_json(self.path, payload)
+            with self._lock:
+                self._dirty.clear()
         except OSError as error:
             _LOGGER.warning("could not write resolve cache %s: %s", self.path, error)
+
+    def _merged_payload(self) -> Dict[str, Any]:
+        """The file's records with this instance's changes layered on top."""
+        merged: Dict[str, Any] = {}
+        on_disk = read_json(self.path) if self.path else None
+        if isinstance(on_disk, dict) and on_disk.get("version") == self.VERSION:
+            records = on_disk.get("records")
+            if isinstance(records, dict):
+                for key, record in records.items():
+                    if isinstance(record, dict) and _cache_timestamp(record) is not None:
+                        merged[str(key)] = record
+        with self._lock:
+            for key, record in self._dirty.items():
+                if record is None:
+                    merged.pop(key, None)
+                else:
+                    merged[key] = record
+        return {"version": self.VERSION, "records": merged}
 
 
 def _now_iso() -> str:

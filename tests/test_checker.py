@@ -261,6 +261,18 @@ def run_check(upstream, scenario, tmp_path, map_path=None, cache_path=None, **ov
         checker.close()
 
 
+def cached_payload(cache_path):
+    """The cache file's parsed contents, with a missing file read as an empty cache.
+
+    ``ResolveCache.save`` writes back only what the instance learned, so a run that learned
+    nothing — nothing was asked, or nothing could be proven — leaves **no file at all** rather
+    than an empty one. "No record was written" is what these tests mean either way.
+    """
+    if not cache_path.is_file():
+        return {"version": ResolveCache.VERSION, "records": {}}
+    return json.loads(cache_path.read_text(encoding="utf-8"))
+
+
 def entry_for(report, mod_id):
     """The single entry for a mod id.
 
@@ -867,7 +879,7 @@ def test_a_failed_search_is_not_cached_as_a_negative_verdict(tmp_path, upstream)
     assert entry.status == STATUS_UNRESOLVED
     assert "note.search_incomplete" in dict(entry.notes)
 
-    payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    payload = cached_payload(cache_path)
     assert payload["records"] == {}, "an unproven verdict was written to the cache"
 
     # And the same run with the search reachable again resolves the mod.
@@ -1114,6 +1126,32 @@ def test_unresolved_verdicts_are_cached_between_runs(tmp_path, upstream):
     assert payload["records"]
 
 
+def test_two_cache_instances_do_not_erase_each_other(tmp_path):
+    """两个实例各学到一个键，两次保存之后两个键都必须在。
+
+    入口层同时活着好几个 ``ResolveCache``（检查线程、``!!muc`` 命令线程、状态页），每个都在
+    构造时取一次快照。整份回写等于「谁后保存谁赢」，先保存者这一轮花掉一次 search 加一次版本
+    查询换来的负缓存会被静默丢掉，而负缓存正是这个类存在的理由。所以 ``save`` 只回写本实例
+    改过的键——这条测试是那个性质的护栏，旧实现下第二次 ``save`` 会让第一个键消失。
+    """
+    path = tmp_path / "resolve-cache.json"
+    first = ResolveCache(path, ttl_hours=24.0)
+    second = ResolveCache(path, ttl_hours=24.0)
+
+    first.put("a" * 40, {"resolved": False})
+    first.save()
+    second.put("b" * 40, {"resolved": False})
+    second.save()
+
+    reloaded = ResolveCache(path, ttl_hours=24.0)
+    assert reloaded.get("a" * 40) is not None, "the first instance's record was overwritten"
+    assert reloaded.get("b" * 40) is not None
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["version"] == ResolveCache.VERSION
+    assert sorted(payload["records"]) == ["a" * 40, "b" * 40]
+
+
 def test_the_cache_entry_expires_after_the_ttl(tmp_path):
     path = tmp_path / "resolve-cache.json"
     cache = ResolveCache(path, ttl_hours=1.0)
@@ -1242,7 +1280,7 @@ def test_switching_modrinth_off_does_not_poison_the_cache(tmp_path, upstream, mo
                        use_cache=True, cache_path=cache_path)
 
     assert entry_for(report, "zeta").status == STATUS_UNRESOLVED
-    payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    payload = cached_payload(cache_path)
     assert payload["records"] == {}, "an unasked question was written to the cache"
     assert "note.modrinth_disabled_by_config" in dict(report.upstream_notes)
 
@@ -1367,10 +1405,10 @@ def test_the_full_listing_does_not_claim_rows_were_held_back():
     summary = "\n".join(render_summary(report, tr))
     full = "\n".join(render_full(report, tr))
 
-    hidden_line = tr("report.and_more", count=len(entries) - 12)
+    hidden_line = tr("report.and_more", count=len(entries) - 12, command="!!modupdate")
     assert hidden_line in summary, "the summary must say what it left out"
     assert hidden_line not in full, "nothing is left out of the full listing"
-    assert tr("report.and_more", count=len(entries)) not in full
+    assert tr("report.and_more", count=len(entries), command="!!modupdate") not in full
     # And every mod is there, which is what makes the line above a lie rather than a warning.
     assert all("Mod {}".format(index) in full for index in range(13))
 
@@ -2018,6 +2056,34 @@ def test_the_reason_a_handle_failed_is_told_apart():
     assert report.resolve_handle("") == (None, "empty")
     assert report.resolve_handle("99") == (None, "out-of-range")
     assert report.resolve_handle("no such mod") == (None, "unknown")
+
+
+@pytest.mark.parametrize("handle", ["\u00b2", "\u2468", "1\u00b2", "\u00bd"])
+def test_a_digit_like_character_is_not_a_number(handle):
+    """``isdigit`` is true for digits ``int()`` refuses, and that used to be a silent crash.
+
+    ``²`` (U+00B2), ``⑨`` (U+2468) and ``½`` are all ``isdigit``, and none of them converts:
+    ``resolve_handle`` raised ``ValueError`` out of a command callback, and MCDR logs a callback
+    exception **without replying to its source** — so the player typed a command and saw nothing
+    at all. Pasted text makes this easy to hit by accident.
+    """
+    report = _index_report(_many(actionable=2))
+
+    entry, reason = report.resolve_handle(handle)
+
+    assert entry is None, (handle, entry)
+    assert reason in ("out-of-range", "unknown"), (handle, reason)
+
+
+def test_arabic_indic_digits_are_still_a_number():
+    """The other direction, so the fix is not "refuse anything unusual".
+
+    ``٣`` (U+0663) is ``isdecimal`` **and** ``int() -> 3``, so it stays a number; the difference
+    between it and ``²`` is exactly what the predicate has to track.
+    """
+    report = _index_report(_many(actionable=2))
+
+    assert report.resolve_handle("\u0663") == (None, "out-of-range")
 
 
 def test_an_entry_can_be_looked_up_by_number_or_by_name():

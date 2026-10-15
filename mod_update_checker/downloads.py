@@ -109,6 +109,27 @@ _RETRY_BACKOFF_CAP = 2.0
 #: :meth:`DownloadLedger.save` is also called from paths that already hold it.
 _LEDGER_LOCK = threading.RLock()
 
+#: Counter behind the per-writer ``.part`` names, guarded by :data:`_PART_LOCK`. Together with the
+#: pid it replaces ``<target>.part``, which was derived from the target name alone: the check
+#: thread's download phase and a manual ``!!muc download all`` are two different
+#: :class:`Downloader` objects pointed at one folder, and a fixed name meant the second writer's
+#: ``_discard`` could delete the first one's half-written file (Windows refuses the delete while
+#: it is open, which is why the symptom was a mysterious hash mismatch rather than a clean error).
+_PART_LOCK = threading.Lock()
+_PART_COUNTER = 0
+
+
+def _unique_part_name(target: Path) -> Path:
+    """A ``.part`` path for ``target`` that no other writer in this process will pick."""
+    global _PART_COUNTER
+    with _PART_LOCK:
+        _PART_COUNTER += 1
+        serial = _PART_COUNTER
+    return target.with_name(
+        "{}.{}.{}.part".format(target.name, os.getpid(), serial)
+    )
+
+
 
 def _safe_stem(raw: str, fallback: str) -> str:
     """A bare, writable stem with no separators and no directory meaning.
@@ -432,6 +453,22 @@ class DownloadLedger:
     def forget(self, key: str) -> None:
         self._mark_deleted(key)
 
+    def update(self, key: str, **fields: Any) -> bool:
+        """Add or replace fields on a record. ``False`` when there is no such record.
+
+        For annotations the *install* stage makes about a record it will not act on again — a
+        permanent skip reason and when it was decided. Kept here rather than as a second write
+        path so the read-modify-write discipline of :meth:`save` covers it too: several
+        instances are alive at once, and one that edited a record directly would lose the
+        others' changes when it saved.
+        """
+        record = self._records.get(key)
+        if record is None:
+            return False
+        record.update(fields)
+        self._mark_changed(key, record)
+        return True
+
     def save(self) -> None:
         """Merge this instance's changes into the file and write it back.
 
@@ -572,6 +609,12 @@ class Downloader:
     API calls are small and latency-bound; downloads are large and bandwidth-bound, and
     running twenty of them at once would be a worse citizen than letting them queue. It also
     keeps the "is this name taken?" decision single-threaded, which is what makes it correct.
+
+    Sequential *within this instance* — the entry layer keeps more than one alive at a time (the
+    check thread's download phase, a manual ``download all``), which is exactly why the temporary
+    file name is unique per writer rather than derived from the target. Two instances pointed at
+    one folder can still race for the same *target* name; :meth:`_choose_target` already refuses
+    to overwrite a file whose bytes differ instead of trusting that they cannot.
     """
 
     def __init__(
@@ -787,7 +830,6 @@ class Downloader:
         attempt produced.
         """
         attempts = max(1, int(self.options.retries) + 1)
-        part = target.with_name(target.name + ".part")
         outcome = None
         #: How many attempts were really made, which is not the same as how many were allowed:
         #: a 404 or a write error is not retried, so the log must not claim four tries for one.
@@ -801,7 +843,9 @@ class Downloader:
                     ),
                 )
             made = attempt
-            outcome, retryable = self._transfer_once(entry, target, part)
+            # A fresh name per attempt, so a retry can never touch a partial file another writer
+            # (or the previous attempt of this one) still has open.
+            outcome, retryable = self._transfer_once(entry, target, _unique_part_name(target))
             if outcome.status == STATUS_DOWNLOADED:
                 return outcome
             if not retryable or attempt == attempts:
@@ -904,13 +948,20 @@ class Downloader:
             detail=detail,
         )
 
-    @staticmethod
-    def _discard(path: Path) -> None:
-        """Remove a partial file. A half-written jar is worse than none: it looks complete."""
+    def _discard(self, path: Path) -> None:
+        """Remove a partial file. A half-written jar is worse than none: it looks complete.
+
+        A failure to remove it is logged rather than passed over. It cannot be made to matter
+        here — the file is a ``.part`` and nothing reads one — but "the leftover is still there"
+        is the fact that explains a later hash mismatch, and a silent ``pass`` is what turns that
+        into a mystery.
+        """
         try:
             path.unlink()
-        except OSError:
-            pass
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            self._log("debug", "could not remove the partial file {}: {}".format(path, error))
 
     # -- entry point -------------------------------------------------------------------
 

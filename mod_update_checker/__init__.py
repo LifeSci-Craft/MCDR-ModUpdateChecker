@@ -87,7 +87,7 @@ from mcdreforged.api.all import (
 )
 
 from . import i18n
-from .jsonfile import read_json, write_json
+from .jsonfile import read_json, write_json, write_text
 from .checker import USER_AGENT, CheckOptions, Checker
 from .installer import (
     STATUS_INSTALLED as INSTALL_INSTALLED,
@@ -154,7 +154,7 @@ from .report import (
 )
 from .cleanup import Backup, expired, list_backups, remove_backups, total_bytes
 from .report import format_size as _format_size
-from .upstream import HttpClient
+from .upstream import HttpClient, RateLimiter
 from .projectmap import MAP_FILE_NAME, ProjectMap, resolve_map_file
 from .scanner import (
     ScanResult,
@@ -789,32 +789,58 @@ def _load_config(server: PluginServerInterface) -> Config:
     defaults. Silent is the problem: an admin who fat-fingered a comma would see their
     settings vanish with no explanation, so the old file is preserved and the reason logged.
 
-    The same silence covers the other two things MCDR does to this file — creating it when it
-    is missing, and filling in options it does not have and writing the result back. Both are
-    reported here (see :func:`_report_config_file_state`); the language is applied first so
-    that report is written in the language the file just asked for.
+    "Unparseable" is not only a syntax error. ``load_config_simple`` catches whatever
+    ``Serializable.deserialize`` raises and regenerates the file for that too, so a **type**
+    mistake — ``network.timeout_seconds: "45"``, valid JSON with the wrong type — reset the whole
+    file just as thoroughly and just as quietly. Measured before this was fixed: a 36-option file
+    with one string where a number belonged came back with ``language=auto``, ``interval_hours=0``
+    and an empty ignore list, no ``.broken`` backup, and not one line on the console. That is why
+    the file is deserialised here first (see :func:`_precheck_config`): the same call MCDR is
+    about to make, without MCDR's regeneration behind it, so a rejection can be described and
+    quarantined *before* the settings are lost.
+
+    The same silence covers the other things MCDR does to this file — creating it when it is
+    missing, and filling in options it does not have and writing the result back. The first is
+    reported here; the second is reported by :func:`_report_config_file_state`, as a *different*
+    line from a rejection, because "your file was missing options" and "your file was thrown
+    away" call for different reactions. The language is applied before either report so they are
+    written in the language the file just asked for.
     """
     path = _config_path(server)
     existed = os.path.isfile(path)
     leaves_before: Optional[List[str]] = None
     legacy_rebuilt = False
+    rejected: Optional[str] = None
     if existed:
         try:
-            with open(path, "r", encoding="utf-8") as handle:
+            with open(path, "r", encoding="utf-8-sig") as handle:
                 raw = json.load(handle)
             if not isinstance(raw, dict):
                 raise ValueError("config root must be a JSON object")
-            leaves_before = _leaf_paths(raw)
-            legacy_rebuilt = _warn_about_flat_legacy_options(server, raw)
+            rejected = _precheck_config(raw)
+            if rejected is None:
+                leaves_before = _leaf_paths(raw)
+                legacy_rebuilt = _warn_about_flat_legacy_options(server, raw)
         except (OSError, ValueError) as error:
-            backup = "{}.broken.{}".format(path, time.strftime("%Y%m%d-%H%M%S"))
-            try:
-                os.replace(path, backup)
-            except OSError:
-                backup = path
-            server.logger.warning(
-                tr("console.config_invalid", backup=backup) + " ({})".format(error)
-            )
+            rejected = "{}: {}".format(type(error).__name__, error)
+
+    if rejected is not None:
+        # Quarantined *before* MCDR is given the file, so the admin's settings survive on disk —
+        # and in a form the next load will not mistake for the current config. Two messages, not
+        # one: this one says the file was *refused*, while ``console.config_completed`` says it
+        # was merely incomplete and has been topped up. They call for different reactions, and
+        # ``console.config_invalid`` is the one that already means "refused, old file kept" —
+        # from the branch that handles a file the plugin cannot even parse. The reason goes in
+        # as a value rather than into a second copy of the sentence, which is what keeps the
+        # sentence translatable.
+        backup = "{}.broken.{}".format(path, time.strftime("%Y%m%d-%H%M%S"))
+        try:
+            os.replace(path, backup)
+        except OSError:
+            backup = path
+        server.logger.warning(
+            tr("console.config_invalid", backup=backup) + " ({})".format(rejected)
+        )
 
     config = server.load_config_simple(
         CONFIG_FILE_NAME, target_class=Config, echo_in_console=False
@@ -822,13 +848,84 @@ def _load_config(server: PluginServerInterface) -> Config:
     if not isinstance(config, Config):
         config = Config.get_default()
 
-    # Applying the language lives here rather than at the two call sites because the report
-    # below is the first thing on the console that has to be readable, and the language
+    # Applying the language lives here rather than at the two call sites because the reports
+    # below are the first thing on the console that has to be readable, and the language
     # setting is part of what was just read.
     _apply_language(server, config)
     _clamp_and_report(server, config)
-    _report_config_file_state(server, config, path, existed, leaves_before, legacy_rebuilt)
+    if rejected is None:
+        _report_config_file_state(server, config, path, existed, leaves_before, legacy_rebuilt)
     return config
+
+
+def _precheck_config(raw: Dict[str, Any]) -> Optional[str]:
+    """Why MCDR would refuse this config, or ``None`` when it will accept it.
+
+    ``Config.deserialize`` is the same call ``load_config_simple`` makes, made here instead of
+    there: without MCDR's ``failure_policy='regen'`` behind it, a rejection is something to
+    report rather than something that replaces the file. The parsed dict is not modified
+    (``Serializable.deserialize`` reads it and builds a new object), which is what makes the
+    pre-check safe to run before the real load.
+
+    The message names the field where it can be worked out. It usually can: MCDR's own
+    ``Serializable.deserialize`` builds the object field by field, so removing a field from a
+    *copy* of the parsed dict and retrying is enough to find the one it refused — see
+    :func:`_first_bad_option`. That matters because the exception itself carries no path:
+    measured, ``Config.deserialize`` on a file with ``network.timeout_seconds: "45"`` raises
+    ``TypeError: Mismatched input type: expected class <class 'int'> but found data with class
+    <class 'str'>``, which names neither the option nor where it lives.
+    """
+    try:
+        Config.deserialize(raw)
+    except Exception as error:  # noqa: BLE001 - any type or value mismatch is the same outcome
+        detail = "{}: {}".format(type(error).__name__, error)
+        field = _first_bad_option(raw, Config)
+        if field:
+            return "{} ({})".format(detail, field)
+        return detail
+    return None
+
+
+def _first_bad_option(raw: Dict[str, Any], target_class: Any) -> str:
+    """Which option MCDR refuses in ``raw``, as ``option: <path>``, or ``""`` when unknown.
+
+    Narrowed by removal rather than by parsing the exception: "does this subset still raise?"
+    is answerable without knowing anything about how MCDR words its errors, and it is exact.
+    Sections first — a nested model is one field of its parent, but the admin needs the path
+    *inside* it — then a two-way split within the offending section, which is ``O(k log n)``
+    deserialisations for ``k`` mistakes and ``n`` options. The dict passed in is never modified:
+    each attempt works on a shallow copy with the keys taken out, because deserialising the real
+    config object's own data is what the caller is about to do for real.
+    """
+    if not isinstance(raw, dict):  # pragma: no cover - the caller checked this already
+        return ""
+
+    def refuses(candidate: Dict[str, Any]) -> bool:
+        try:
+            target_class.deserialize(candidate)
+        except Exception:  # noqa: BLE001 - the same gate :func:`_precheck_config` uses
+            return True
+        return False
+
+    # 1. A section: keeping only that section still fails, so the mistake is inside it.
+    for key, value in raw.items():
+        if not isinstance(value, dict) or not refuses({key: value}):
+            continue
+        # 2. The option within it. Each candidate is tried alongside the *rest* of the file —
+        #    other sections included — and with only its siblings in this section removed. A
+        #    leaf on its own is not enough to decide: MCDR fills a missing required field and
+        #    says so through the callback, so an isolated leaf can fail for a reason that has
+        #    nothing to do with the mistake being hunted.
+        others = {name: item for name, item in raw.items() if name != key}
+        for name in value:
+            candidate = dict(others)
+            candidate[key] = {name: value[name]}
+            if refuses(candidate):
+                return "option: {}.{}".format(key, name)
+        # Several mistakes at once, or one that only shows up in context: name the section,
+        # which is still enough to send the admin to the right part of their file.
+        return "option: {}.*".format(key)
+    return ""
 
 
 #: Every numeric option the plugin is willing to use, with the range it is willing to use it in.
@@ -844,17 +941,30 @@ def _load_config(server: PluginServerInterface) -> Config:
 #: a month between checks, a month of startup delay, an 8 GB download, 32 parallel requests
 #: (the front ends start refusing well before that), 1000 requests/minute, five minutes per
 #: request, MCDR's whole permission range, and ten years of backups.
+#:
+#: Every numeric option the plugin reads must be in here, not only the ones that looked risky.
+#: The four below were the gap: ``network.retries`` and ``download.retries`` feed
+#: ``range(retries + 1)``, so a mistyped 10^9 holds the check lock (or a download thread) for
+#: as long as the server runs; ``network.cache.ttl_hours: -1`` reads as "never expire" because
+#: :class:`ResolveCache` treats ``0`` as the off switch, which is the opposite of the "immediately
+#: stale" an admin writing a negative number usually means; and ``report.reuse_report_minutes``
+#: silently became 0. ``tests/test_mcdr_entry.py`` reflects over the config class so the table
+#: cannot fall behind again.
 _NUMERIC_RANGES: Tuple[Tuple[str, int, int], ...] = (
     ("check.start_delay_seconds", 0, 3600),
     ("check.interval_hours", 0, 720),
     ("download.max_size_mb", 1, 8192),
+    ("download.retries", 0, 10),
     ("network.concurrent_requests", 1, 32),
     ("network.requests_per_minute", 0, 1000),
+    ("network.retries", 0, 10),
     ("network.timeout_seconds", 1, 300),
+    ("network.cache.ttl_hours", 0, 8760),
     ("cleanup.max_age_days", 0, 3650),
     ("command_permission_level", 0, 4),
     ("report.admin_permission", 0, 4),
     ("report.in_game_permission", 0, 4),
+    ("report.reuse_report_minutes", 0, 43200),
 )
 
 
@@ -876,15 +986,19 @@ def _clamp_and_report(server: PluginServerInterface, config: Config) -> List[str
     """
     changed: List[str] = []
     for path, minimum, maximum in _NUMERIC_RANGES:
-        # Both shapes are needed: the permission levels and the level the command needs sit at
-        # the root of the config, everything else is one section down.
+        # Walk the dotted path rather than splitting once: most options are one section down,
+        # but ``network.cache.ttl_hours`` is two, and the permission levels sit at the root.
+        parts = path.split(".")
         target: Any = config
-        name = path
-        if "." in path:
-            section, name = path.split(".", 1)
-            target = getattr(config, section, None)
+        missing = False
+        for part in parts[:-1]:
+            target = getattr(target, part, None)
             if target is None:
-                continue
+                missing = True
+                break
+        if missing:
+            continue
+        name = parts[-1]
         try:
             value: Any = getattr(target, name)
         except AttributeError:
@@ -1213,17 +1327,27 @@ def _write_report_files(server: PluginServerInterface, report: Report,
     ``announce=False`` for the write that follows a deletion: the "报告已写入" line belongs to
     "a check just finished", and printing it after a command makes it read as though something
     was checking behind the admin's back.
+
+    Both files go through :mod:`mod_update_checker.jsonfile`'s writers, and were the last two
+    writers in the plugin opening a file by hand. That matters most for the JSON one, which is
+    read back at startup: a process killed mid-write used to leave a truncated
+    ``last_report.json``, ``Report.from_json`` then answers ``None`` for it, and the admin's
+    report silently became "no check has run yet" — the exact failure the atomic-write helper
+    exists to prevent, on the one file it was not applied to. The text rendering is written the
+    same way, so the two cannot disagree about which of them is safe.
     """
     folder = server.get_data_folder()
     targets = (
-        (REPORT_FILE_NAME, report.to_json()),
-        (REPORT_TEXT_FILE_NAME, "\n".join(render_full(report, tr)) + "\n"),
+        (REPORT_FILE_NAME, "json", report.to_dict()),
+        (REPORT_TEXT_FILE_NAME, "text", "\n".join(render_full(report, tr)) + "\n"),
     )
-    for name, content in targets:
+    for name, kind, content in targets:
         path = os.path.join(folder, name)
         try:
-            with open(path, "w", encoding="utf-8") as handle:
-                handle.write(content)
+            if kind == "json":
+                write_json(path, content)
+            else:
+                write_text(path, content)
         except OSError as error:
             server.logger.warning("could not write {}: {}".format(path, error))
     if announce:
@@ -1240,7 +1364,7 @@ def _notify(
     broadcast: bool = True,
 ) -> None:
     """Print the result to the console, to the invoker, and optionally into the game."""
-    lines = render_summary(report, tr)
+    lines = render_summary(report, tr, command=_reply_command)
 
     # The console is the primary channel: an automatic check the admin did not trigger still
     # has to be visible in the log. When the check is configured to speak up only about
@@ -1381,7 +1505,7 @@ def _announce_download_complete(
         Notice(
             tr("download.complete_in_game_automatic")
             if _config.download.install_on_stop
-            else tr("download.complete_in_game_manual"),
+            else tr("download.complete_in_game_manual", command=_reply_command),
             "hint",
         )
     )
@@ -1514,7 +1638,7 @@ def _install_summary_lines(data: Dict[str, Any]) -> List[Notice]:
         )
     if len(installed) > NOTIFY_MAX_UPDATES:
         lines.append(
-            Notice(tr("report.and_more", count=len(installed) - NOTIFY_MAX_UPDATES), "hint")
+            Notice(tr("report.and_more", count=len(installed) - NOTIFY_MAX_UPDATES, command=_reply_command), "hint")
         )
     skipped = data.get("skipped") or []
     if skipped:
@@ -1611,6 +1735,31 @@ def resolve_download_folder(
     return resolve_download_folder_path(base, config.download.folder_name)
 
 
+#: The limiter the *download* path spends from, one per configured rate.
+#:
+#: ``network.requests_per_minute`` reads as "how fast this plugin talks to the upstream", and
+#: the download clients used to be built without a limiter at all — so the option governed the
+#: JSON checks and nothing else, and a ``!!muc download all`` over forty jars could put a
+#: hundred requests on the wire at whatever rate sockets allowed (``download.retries`` turns a
+#: failure into a burst, which is when it is most visible). Sharing one limiter per rate is what
+#: makes the budget a *process* budget rather than a per-client one: the automatic check's
+#: downloads and a manual ``download all`` are two different :class:`HttpClient` objects in two
+#: different threads, and they would otherwise each spend the full allowance.
+_DOWNLOAD_LIMITERS: Dict[int, RateLimiter] = {}
+_DOWNLOAD_LIMITERS_LOCK = threading.Lock()
+
+
+def _download_rate_limiter(per_minute: int) -> RateLimiter:
+    """The shared limiter for ``per_minute`` requests a minute, creating it on first use."""
+    rate = max(0, int(per_minute))
+    with _DOWNLOAD_LIMITERS_LOCK:
+        limiter = _DOWNLOAD_LIMITERS.get(rate)
+        if limiter is None:
+            limiter = RateLimiter(rate)
+            _DOWNLOAD_LIMITERS[rate] = limiter
+        return limiter
+
+
 def _make_http_client(config: Config) -> HttpClient:
     """A client for the download host, mirroring the checker's settings.
 
@@ -1621,11 +1770,16 @@ def _make_http_client(config: Config) -> HttpClient:
     ``retries=0`` because :meth:`HttpClient.download` cannot retry a half-written stream. The
     retrying is done by :class:`Downloader`, where the hash accumulator and the partial file can
     be reset per attempt; see its ``_fetch``.
+
+    The rate limiter is the point of :func:`_download_rate_limiter`: :meth:`HttpClient.download`
+    takes a token when one is set, and without it the only requests the configured rate limited
+    were the JSON ones.
     """
     return HttpClient(
         user_agent=USER_AGENT,
         timeout=max(30.0, float(config.network.timeout_seconds)),
         retries=0,
+        rate_limiter=_download_rate_limiter(config.network.requests_per_minute),
         logger=None,
     )
 
@@ -1958,7 +2112,7 @@ def _reply_index(
     """
     is_player = getattr(source, "is_player", False)
     rows, tail, page_info = render_index(
-        report, tr, entries=entries, page=page, budget=CHAT_PAGE_LINES
+        report, tr, entries=entries, page=page, budget=CHAT_PAGE_LINES, command=prefix
     )
     _title(source)
     source.reply(_context_field(report))
@@ -2044,7 +2198,11 @@ def _reply_summary(source: CommandSource, report: Report,
     the log line and in ``last_report.json``, which is where something that fetches files
     automatically would look for it.
     """
-    _context, blocks, closing = summarise(report, tr)
+    # ``prefix`` is passed down rather than left at its default: this screen's own buttons say
+    # ``!!muc info 1`` when that is what the reader typed, and the trailing lines used to answer
+    # with ``!!modupdate`` — two aliases in one screenful, one of them a command the reader had
+    # not used. The default stays for the callers with no command context.
+    _context, blocks, closing = summarise(report, tr, command=prefix)
     numbers = {id(entry): number for number, entry in report.indexed_entries()}
     is_player = getattr(source, "is_player", False)
 
@@ -2114,7 +2272,7 @@ def _notification_lines(report: Report) -> List[Notice]:
             # notification and the listing agree about what blue means.
             lines.append(Notice(entry_line_text(entry, tr), "update"))
         if len(updates) > NOTIFY_MAX_UPDATES:
-            lines.append(Notice(tr("report.and_more",
+            lines.append(Notice(tr("report.and_more", command=_reply_command,
                                    count=len(updates) - NOTIFY_MAX_UPDATES), "hint"))
         # The list is the same every start until the admin acts on it, so the one thing worth
         # adding is which part of it just appeared.
@@ -2128,7 +2286,7 @@ def _notification_lines(report: Report) -> List[Notice]:
         for entry in pending[:NOTIFY_MAX_UPDATES]:
             lines.append(Notice(entry_line_text(entry, tr), "update"))
         if len(pending) > NOTIFY_MAX_UPDATES:
-            lines.append(Notice(tr("report.and_more",
+            lines.append(Notice(tr("report.and_more", command=_reply_command,
                                    count=len(pending) - NOTIFY_MAX_UPDATES), "hint"))
         lines.append(Notice(tr("check.in_game_awaiting_where"), "hint"))
 
@@ -2137,7 +2295,7 @@ def _notification_lines(report: Report) -> List[Notice]:
     elif updates or pending:
         # A truncated list with no way onward is a dead end, so the notification says which
         # command carries the rest.
-        lines.append(Notice(tr("check.in_game_more_hint"), "hint"))
+        lines.append(Notice(tr("check.in_game_more_hint", command=_reply_command), "hint"))
     return lines
 
 
@@ -2269,7 +2427,7 @@ def _admin_join_worker(server: PluginServerInterface, player: str) -> None:
     lines.extend(_notification_lines(report))
     if reused:
         lines.append(
-            Notice(tr("check.admin_join_reused", minutes=int((age or 0) // 60)), "hint")
+            Notice(tr("check.admin_join_reused", minutes=int((age or 0) // 60), command=_reply_command), "hint")
         )
     _tell_player(server, player, lines)
 
@@ -2390,6 +2548,14 @@ def _schedule_startup_check(server: PluginServerInterface) -> None:
 
 
 def _stop_scheduler() -> None:
+    """Ask the interval thread to finish, and wait briefly for it.
+
+    Safe to call twice, and safe when nothing is running — which a reload needs, because it
+    reaches here twice: MCDR's ``__reload_ready_plugins`` calls ``__unload_plugin`` first (which
+    dispatches ``PLUGIN_UNLOADED`` and calls ``plugin.unload()``) and then hands the old module
+    to the new one's ``on_load``, which stops it again. The second call finds the event already
+    set and the thread already joined.
+    """
     global _scheduler_thread
     _stop_event.set()
     thread = _scheduler_thread
@@ -2425,7 +2591,28 @@ def _resume_after_stop(server: PluginServerInterface) -> None:
 # commands (stage a plan, re-derive it at ``confirm``) and the two-step download / install
 # actions. The permission gate reads the config **when the command is typed**, not when it was
 # registered, so changing the level takes effect without a reload.
+#
+# ``!!help`` needs no such treatment, and that is deliberate rather than an omission: the entry
+# is registered at permission 0 and states the required level in its own text, so re-reading the
+# config cannot make it stale. See ``_register_commands``.
 # --------------------------------------------------------------------------------------
+
+
+#: The alias to name when a message tells the reader to type a command.
+#:
+#: Two aliases are registered (``ROOT_LITERALS``), so every message that spells one out is
+#: telling half the readers about a command they did not type — ``!!muc list`` replied with
+#: ``!!modupdate info 1``, in the same screenful as its own ``!!muc`` buttons. Messages that
+#: already took a ``command`` parameter were fixed one at a time; these are the ones whose
+#: producers are shared between the command path and the event paths (the join notice, the
+#: post-download broadcast, the rendered report), which have no ``prefix`` to pass down.
+#:
+#: A module-level "which alias is being answered" is the honest shape for that: it is set by the
+#: command dispatcher from the literal that was actually typed, and everything rendered while
+#: that command runs picks it up. Event-driven messages run with whatever was last typed, which
+#: is harmless — they are pointers, not identifiers — and keeps this from turning into a
+#: ``prefix`` parameter threaded through a dozen unrelated helpers.
+_reply_command: str = ROOT_LITERALS[0]
 
 
 def _has_permission(source: CommandSource) -> bool:
@@ -2433,6 +2620,27 @@ def _has_permission(source: CommandSource) -> bool:
         return source.has_permission(max(0, int(_config.command_permission_level)))
     except Exception:  # noqa: BLE001 - a source without permissions is denied
         return False
+
+
+def _set_reply_command(prefix: str) -> None:
+    """Remember which alias is being answered, for the messages that name one.
+
+    Called from the command tree's ``requires`` hook, which MCDR runs once per command before the
+    callback — so the value is in place for everything the callback renders, including the
+    helpers that have no ``prefix`` of their own.
+    """
+    global _reply_command
+    _reply_command = prefix
+
+
+def _permit(source: CommandSource, prefix: str) -> bool:
+    """The gate on the command tree: record the alias, then check the permission level.
+
+    Wrapped in one function so every command — including the bare ``!!muc`` — passes through the
+    recording, and so ``_has_permission`` stays a plain predicate that a test can call.
+    """
+    _set_reply_command(prefix)
+    return _has_permission(source)
 
 
 def _denied(_source: CommandSource) -> str:
@@ -2446,9 +2654,24 @@ def _show_summary(source: CommandSource) -> None:
     project convention), this is how the stored result is read back on demand.
     """
     if _last_report is None:
-        source.reply(tr("command.no_report_yet"))
+        source.reply(tr("command.no_report_yet", command=_reply_command))
         return
     _reply_summary(source, _last_report)
+
+
+def _is_page_number(text: str) -> bool:
+    """Whether ``text`` is a page number — that is, whether ``int()`` will accept it.
+
+    ``str.isdecimal``, not ``str.isdigit``. ``isdigit`` is also true for characters that look
+    like digits and are not: ``²`` (U+00B2), ``⑨`` (U+2468), ``½``. ``int()`` refuses all of
+    them, so ``!!muc list ²`` raised ``ValueError`` inside a command callback — and MCDR logs a
+    callback exception without replying to its source, so the player got silence and the only
+    record was a traceback on the console. Pasted text makes this easy to hit by accident.
+
+    The two predicates agree on everything ``int()`` accepts, which is why the check can be
+    stated as "is this convertible" rather than as a list of exceptions.
+    """
+    return bool(text) and text.isdecimal()
 
 
 def _show_list(source: CommandSource, raw: str = "", prefix: str = ROOT_LITERALS[0]) -> None:
@@ -2465,7 +2688,11 @@ def _show_list(source: CommandSource, raw: str = "", prefix: str = ROOT_LITERALS
     """
     tokens = (raw or "").split()
     page = 1
-    if tokens and tokens[-1].isdigit():
+    # ``isdecimal`` rather than ``isdigit``: ``²`` and ``⑨`` are digits to ``isdigit`` and not to
+    # ``int()``, so the callbacks below raised ``ValueError`` out of a command — and MCDR logs a
+    # callback exception without replying, so the player saw nothing at all. See
+    # ``_page_number``, which every paginated command goes through.
+    if tokens and _is_page_number(tokens[-1]):
         page = int(tokens.pop())
     status_text = " ".join(tokens).strip()
     wanted = status_text.lower()
@@ -2477,7 +2704,7 @@ def _show_list(source: CommandSource, raw: str = "", prefix: str = ROOT_LITERALS
         )
         return
     if _last_report is None:
-        source.reply(tr("command.no_report_yet"))
+        source.reply(tr("command.no_report_yet", command=_reply_command))
         return
 
     entries = _last_report.by_status(wanted) if wanted else None
@@ -2550,11 +2777,11 @@ def _reply_ambiguous(
 def _show_info(source: CommandSource, target: str, prefix: str = ROOT_LITERALS[0]) -> None:
     """``info <编号|Mod 名|mod id|文件名>`` — one mod's version change, links and notes."""
     if _last_report is None:
-        source.reply(tr("command.no_report_yet"))
+        source.reply(tr("command.no_report_yet", command=_reply_command))
         return
     text = (target or "").strip()
     if not text:
-        source.reply(tr("command.info.usage"))
+        source.reply(tr("command.info.usage", command=_reply_command))
         return
     entry = _resolve_handle(source, _last_report, text, prefix=prefix, action="info")
     if entry is None:
@@ -2704,7 +2931,7 @@ def _manual_delete(source: CommandSource, handle: str, prefix: str) -> None:
 
     report = _last_report
     if report is None:
-        source.reply(tr("command.no_report_yet"))
+        source.reply(tr("command.no_report_yet", command=_reply_command))
         return
     text = (handle or "").strip()
     if not text:
@@ -3138,7 +3365,7 @@ def _manual_download(source: CommandSource, handle: str, prefix: str) -> None:
     """
     report = _last_report
     if report is None:
-        source.reply(tr("command.no_report_yet"))
+        source.reply(tr("command.no_report_yet", command=_reply_command))
         return
     text = (handle or "").strip()
     if not text:
@@ -3193,7 +3420,7 @@ def _manual_download_all(source: CommandSource, prefix: str) -> None:
     """``download all`` — stage one fetch covering every mod that has something to fetch."""
     report = _last_report
     if report is None:
-        source.reply(tr("command.no_report_yet"))
+        source.reply(tr("command.no_report_yet", command=_reply_command))
         return
 
     candidates, blocked = _download_all_candidates(report)
@@ -3216,7 +3443,7 @@ def _manual_download_all(source: CommandSource, prefix: str) -> None:
     for entry in candidates[:BULK_PLAN_ROWS]:
         lines.append(entry_line_text(entry, tr))
     if len(candidates) > BULK_PLAN_ROWS:
-        lines.append(tr("report.and_more", count=len(candidates) - BULK_PLAN_ROWS))
+        lines.append(tr("report.and_more", count=len(candidates) - BULK_PLAN_ROWS, command=_reply_command))
     if blocked:
         lines.append(tr("command.download.all_skipped", count=len(blocked)))
     lines.append(_confirm_ask(prefix))
@@ -3256,7 +3483,7 @@ def _manual_install(source: CommandSource, handle: str, prefix: str) -> None:
     """
     report = _last_report
     if report is None:
-        source.reply(tr("command.no_report_yet"))
+        source.reply(tr("command.no_report_yet", command=_reply_command))
         return
     text = (handle or "").strip()
     if not text:
@@ -3299,7 +3526,7 @@ def _manual_install_all(source: CommandSource, prefix: str) -> None:
     """``install all`` — stage the authorisation of every downloaded build."""
     report = _last_report
     if report is None:
-        source.reply(tr("command.no_report_yet"))
+        source.reply(tr("command.no_report_yet", command=_reply_command))
         return
 
     pending = report.awaiting_install
@@ -3313,7 +3540,7 @@ def _manual_install_all(source: CommandSource, prefix: str) -> None:
                         new=safe_jar_name(entry.download_filename,
                                           entry.fallback_file_name())))
     if len(pending) > BULK_PLAN_ROWS:
-        lines.append(tr("report.and_more", count=len(pending) - BULK_PLAN_ROWS))
+        lines.append(tr("report.and_more", count=len(pending) - BULK_PLAN_ROWS, command=_reply_command))
     if _config.download.install_on_stop:
         lines.append(tr("command.install.plan_already_automatic"))
     lines.append(_confirm_ask(prefix))
@@ -3403,12 +3630,29 @@ def _confirmed_download_all(
 
     One transfer at a time inside that thread: the downloader is sequential by design, and a
     batch is exactly the case where twenty parallel connections would be a worse neighbour.
+
+    A batch takes the same claims the single form does, and it did not use to. The comment on
+    :data:`_inflight_downloads` says why the claims exist — a second download of one build opens
+    a second connection for the same bytes and fights its own ledger record — and ``download all``
+    was the one path that took none, so two batches, or a batch plus ``download <number>``,
+    wrote the same temporary file at once. Measured on Windows before this changed: one of the
+    two transfers failed with ``could not put the file in place: [WinError 32]`` while the file
+    itself was fine, so the batch summary said ``failed=1`` about a build that was on disk.
     """
-    source.reply(tr("command.download.batch_started", count=len(entries)))
+    claimed, busy = _begin_batch_download(entries)
+    if not claimed:
+        _reply_to(source, tr("command.download.batch_all_in_flight",
+                             names=", ".join(entry.name for entry in busy[:5])))
+        return
+    if busy:
+        _reply_to(source, tr("command.download.batch_in_flight", count=len(busy),
+                             names=", ".join(entry.name for entry in busy[:5])))
+
+    source.reply(tr("command.download.batch_started", count=len(claimed)))
 
     def run() -> None:
         try:
-            outcomes = _perform_manual_downloads(entries)
+            outcomes = _perform_manual_downloads(claimed)
         except Exception as error:  # noqa: BLE001 - a failure must not take the server down
             server = _server
             if server is not None:
@@ -3416,6 +3660,10 @@ def _confirmed_download_all(
             _reply_to(source, tr("command.download.batch_failed", reason="{}: {}".format(
                 type(error).__name__, error)))
             return
+        finally:
+            # Released whatever happened, and before the outcome is reported, so a retry is
+            # possible the moment the reader is told it failed.
+            _release_batch_download(claimed)
         if outcomes is None:
             _reply_to(source, tr("command.download.batch_failed",
                                  reason=tr("command.download.bad_folder")))
@@ -3466,6 +3714,36 @@ def _end_download(file_name: str) -> None:
     """Release a claim taken by :func:`_begin_download`, whatever happened to the transfer."""
     with _inflight_lock:
         _inflight_downloads.discard(file_name)
+
+
+def _begin_batch_download(
+    entries: Sequence[UpdateEntry],
+) -> Tuple[List[UpdateEntry], List[UpdateEntry]]:
+    """Claim every entry in ``entries`` that nobody holds. ``(claimed, busy)``.
+
+    Taken in one pass under the lock rather than one entry at a time, because a batch is a unit:
+    deciding per entry would let a second batch interleave with this one and each end up with
+    half of the set. ``busy`` is returned rather than dropped, because "which of them" is what
+    makes the message useful — a bare "some of that was already running" leaves the admin to
+    guess.
+    """
+    claimed: List[UpdateEntry] = []
+    busy: List[UpdateEntry] = []
+    with _inflight_lock:
+        for entry in entries:
+            if entry.file_name in _inflight_downloads:
+                busy.append(entry)
+                continue
+            _inflight_downloads.add(entry.file_name)
+            claimed.append(entry)
+    return claimed, busy
+
+
+def _release_batch_download(entries: Sequence[UpdateEntry]) -> None:
+    """Release claims taken by :func:`_begin_batch_download`."""
+    with _inflight_lock:
+        for entry in entries:
+            _inflight_downloads.discard(entry.file_name)
 
 
 def _confirmed_download(
@@ -4294,7 +4572,7 @@ def _command_tree(prefix: str):
     """
     return (
         Literal(prefix)
-        .requires(_has_permission, _denied)
+        .requires(lambda source, _prefix=prefix: _permit(source, _prefix), _denied)
         # Bare command = the help page, by project convention: an invocation with no arguments
         # is a reader asking what the commands are. The summary moved to its own word when this
         # changed — it is still one keystroke away, and it is no longer what an explorer gets.
@@ -4319,7 +4597,7 @@ def _command_tree(prefix: str):
         )
         .then(
             Literal("info")
-            .runs(lambda source: source.reply(tr("command.info.usage")))
+            .runs(lambda source: source.reply(tr("command.info.usage", command=_reply_command)))
             .then(
                 GreedyText("target").suggests(
                     _suggest_handles(lambda report: report.entries)
@@ -4377,9 +4655,27 @@ def _command_tree(prefix: str):
 
 
 def _register_commands(server: PluginServerInterface) -> None:
+    """Register the command tree and the ``!!help`` line, once, at load.
+
+    The help entry's permission is **0**, not ``command_permission_level``, and that is the fix
+    for a mismatch MCDR's design creates: a help message carries its permission as a *value*
+    (``HelpMessage.permission``) and MCDR filters on that value when ``!!help`` is rendered, so
+    an entry keeps the level it was registered with while the command gate below reads the config
+    every time it runs. Switching the level and then ``!!muc reload`` therefore left the command
+    working and ``!!help`` either silent about it (level 3 -> 0) or advertising an entry nobody
+    could click (0 -> 3).
+
+    Registering at 0 and stating the required level **in the text** removes the whole class:
+    there is nothing left to refresh, so nothing to get wrong on reload, and the entry cannot
+    become a lie. The alternative — re-registering help on every config reload — was rejected
+    because MCDR *appends* help messages, so a second registration with the same prefix shows the
+    line twice rather than replacing it.
+    """
     for prefix in ROOT_LITERALS:
         server.register_help_message(
-            prefix, tr("help.modupdate"), permission=_config.command_permission_level
+            prefix,
+            tr("help.modupdate", level=_config.command_permission_level),
+            permission=0,
         )
         server.register_command(_command_tree(prefix))
 
@@ -4407,16 +4703,28 @@ def on_load(server: PluginServerInterface, prev_module: Any) -> None:
     #
     #   * the last report, because the admin is probably looking at it;
     #   * which players are online, because join/leave events are not replayed;
-    #   * the previous module's scheduler thread. MCDR's reload path calls ``plugin.reload()``
-    #     without dispatching the unloaded event (verified in MCDR's plugin_manager), so
-    #     ``on_unload`` never runs and the old thread would otherwise keep firing checks
-    #     against this server forever, once more on every reload.
+    #   * the previous module's scheduler thread, because it would otherwise keep firing checks
+    #     against this server forever, once more on every reload. ``on_unload`` does run on a
+    #     reload — MCDR's ``__reload_ready_plugins`` calls ``__unload_plugin`` first, which
+    #     dispatches ``PLUGIN_UNLOADED`` and calls ``plugin.unload()`` — but calling the old
+    #     module's stop function here as well is what makes "the old thread is gone" true even
+    #     if a future MCDR changes that order. It is idempotent; the second call is a no-op.
     if prev_module is not None:
         carried = getattr(prev_module, "_last_report", None)
-        if isinstance(carried, Report):
+        # Duck-typed rather than ``isinstance(carried, Report)``, which can never be true across
+        # a reload: unloading pops every ``mod_update_checker*`` module from ``sys.modules``
+        # (MCDR's ``RegularPlugin._on_unload``), so the new module has a *different* ``Report``
+        # class object and the isinstance check was always false. The live report was therefore
+        # dropped on every ``!!MCDR reload plugin`` and replaced by whatever ``last_report.json``
+        # held — nothing at all when ``report.write_file`` is off — leaving the admin with "no
+        # check has run yet" and paying for a full check to get back to where they were.
+        if carried is not None and hasattr(carried, "entries") and hasattr(carried, "generated_at"):
             _last_report = carried
         previous_players = getattr(prev_module, "_online_players", None)
-        if isinstance(previous_players, set):
+        # Same reasoning: an old module's ``set`` is still a set, but a subclass or a frozenset
+        # from a future version would not pass the old ``isinstance`` either.
+        if previous_players is not None and hasattr(previous_players, "add") \
+                and hasattr(previous_players, "__iter__"):
             _online_players = previous_players
         previous_stop = getattr(prev_module, "_stop_scheduler", None)
         if callable(previous_stop):

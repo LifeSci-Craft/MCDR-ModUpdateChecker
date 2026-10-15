@@ -11,6 +11,8 @@ import struct
 import zipfile
 from pathlib import Path
 
+import pytest
+
 from mod_update_checker.scanner import (
     METADATA_SIZE_LIMIT,
     _metadata_from_toml_regex,
@@ -19,6 +21,7 @@ from mod_update_checker.scanner import (
     iter_mod_jars,
     missing_dependencies,
     read_metadata,
+    read_metadata_error,
     resolve_mods_directory,
     scan_jar,
     scan_mods,
@@ -34,6 +37,10 @@ def _set_central_directory_sizes(path: Path, uncompressed: int) -> None:
     allocate against, so this is how a small jar claims to hold a huge metadata file — the shape
     of the memory spike the size limit exists for. Walked record by record rather than searched
     for, because the file *contents* may contain the signature bytes.
+
+    The *compressed* size in the same record is deliberately left alone: it is what a
+    compression-ratio guard would divide by to decide the declaration is a lie, and this fixture
+    has to say "declared huge" without saying "declared by a bomb".
     """
     raw = bytearray(path.read_bytes())
     start = raw.find(b"PK\x01\x02")
@@ -43,6 +50,23 @@ def _set_central_directory_sizes(path: Path, uncompressed: int) -> None:
         start = raw.find(
             b"PK\x01\x02", start + 46 + name_length + extra_length + comment_length
         )
+    path.write_bytes(bytes(raw))
+
+
+def _set_compression_method(path: Path, method: int) -> None:
+    """Set the compression method on every entry — in both copies of the header.
+
+    ``zipfile`` reads the central-directory record when an entry is opened and the local header
+    when its bytes are decoded, so a method the interpreter does not implement has to be written
+    in both places to be seen at all. Method 99 is not in ``zipfile``'s table and is not one
+    zlib can do: the shape of an archive built by something newer than the reader.
+    """
+    raw = bytearray(path.read_bytes())
+    for signature, offset in ((b"PK\x03\x04", 8), (b"PK\x01\x02", 10)):
+        start = raw.find(signature)
+        while start != -1:
+            struct.pack_into("<H", raw, start + offset, method)
+            start = raw.find(signature, start + 4)
     path.write_bytes(bytes(raw))
 
 
@@ -740,3 +764,101 @@ def test_a_jar_with_no_metadata_contributes_nothing(tmp_path):
     write_plain_file(directory / "library.jar")
 
     assert missing_dependencies(scan_mods(directory)) == {"gone": ["needs.jar"]}
+
+
+# --------------------------------------------------------------------------------------
+# Malformed metadata must not cost the whole check
+#
+# A ``depends.minecraft`` value is third-party data, and the four shapes below are what a typo
+# looks like. Each one used to reach ``versioning.parse_spec``, which iterated the value — for a
+# number that is a ``TypeError``, for a mapping it is a silent ``"any"`` reported as a game
+# version. Either way the damage escaped the scanner and took the report with it, for a value
+# that is pure local data and needs no network at all.
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("declared", [123, {}, True, [123]])
+def test_a_nonsense_minecraft_range_does_not_break_the_scan(tmp_path, declared):
+    """``123`` / ``{}`` / ``true`` / ``[123]`` all scan, and none of them becomes a version."""
+    path = write_jar(
+        tmp_path / "typo.jar",
+        fabric=fabric_metadata(id="typo", depends={"minecraft": declared}),
+    )
+
+    mod = scan_jar(path)
+
+    assert mod.identified is True
+    assert mod.mod_id == "typo"
+    assert mod.metadata.mc_range is None, "a non-string range was kept as if it were one"
+    assert mod.metadata.mc_range_text == "*"
+
+
+def test_a_list_of_numbers_is_read_as_the_strings_it_holds(tmp_path):
+    """A list with a usable entry in it still counts; the unusable ones are dropped."""
+    path = write_jar(
+        tmp_path / "mixed.jar",
+        fabric=fabric_metadata(id="mixed", depends={"minecraft": [">=26.3", 123, ""]}),
+    )
+
+    mod = scan_jar(path)
+
+    assert mod.metadata.mc_range == [">=26.3"]
+    assert mod.metadata.mc_range_text == ">=26.3"
+
+
+def test_a_mapping_range_is_dropped_rather_than_iterated():
+    """The MUC-A-08 half: iterating a dict yields its *keys*, and ``"any"`` reached the report."""
+    from mod_update_checker.versioning import covers, normalize_spec, parse_spec
+
+    assert normalize_spec({"any": "1.21"}) == "*"
+    assert parse_spec({"any": "1.21"})[0]("26.3") is True
+    assert covers({"any": "1.21"}, "26.3") is True
+    # A string that is a path through the mapping is still read as a version.
+    assert normalize_spec([">=1.21"]) == ">=1.21"
+
+
+def test_a_compression_method_zipfile_cannot_do_is_a_metadata_failure(tmp_path):
+    """``NotImplementedError`` is not a ``ValueError``; it used to escape the "never raises" claim.
+
+    Method 99 is what an archive written by a newer tool looks like to an older interpreter. The
+    contract is the point: :func:`read_metadata` promises not to raise, and the *reason* it
+    returns ``None`` has to be reportable rather than a difference in attribution between two
+    entry points.
+    """
+    path = write_jar(tmp_path / "method99.jar", fabric=fabric_metadata(id="odd"))
+    _set_compression_method(path, 99)
+
+    with zipfile.ZipFile(path) as archive:
+        assert read_metadata(archive) is None
+        assert read_metadata_error(archive) != ""
+
+    mod = scan_jar(path)
+    assert mod.identified is False
+    assert mod.error is not None
+
+
+def test_a_declared_gigabyte_of_metadata_is_never_allocated(tmp_path, monkeypatch):
+    """The other half of the size limit: the bytes that arrive are counted, not the declared size.
+
+    ``_set_central_directory_sizes`` leaves the compressed size alone, so the entry is a *lie*
+    rather than a bomb — declared 8 MiB, storing a few hundred bytes — and the reader must still
+    not grow that allocation. The declared size is refused before the read, so what this pins is
+    that the refusal happens without opening the entry at all.
+    """
+    path = write_jar(tmp_path / "liar.jar", fabric=fabric_metadata(id="liar"))
+    _set_central_directory_sizes(path, 8 * 1024 * 1024)
+
+    opened = []
+    original = zipfile.ZipFile.open
+
+    def watching(self, name, *args, **kwargs):
+        opened.append(name)
+        return original(self, name, *args, **kwargs)
+
+    monkeypatch.setattr(zipfile.ZipFile, "open", watching)
+
+    mod = scan_jar(path)
+
+    assert [_name for _name in opened if _name == "fabric.mod.json"] == []
+    assert mod.error is not None
+

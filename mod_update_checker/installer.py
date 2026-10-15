@@ -30,6 +30,8 @@ opposite of the point.
 import os
 import re
 import shutil
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -65,6 +67,23 @@ REASON_HASH_MISMATCH = "hash-mismatch"
 REASON_NOT_IN_MODS = "not-in-mods"
 REASON_NAME_TAKEN = "name-taken"
 REASON_BACKUP_NAMES_TAKEN = "backup-names-taken"
+
+#: Reasons a later run would reach again and again with the same answer — an admin who deleted
+#: the old jar, a name something else holds, a file whose bytes no longer match the hash that was
+#: verified. Kept on the record as ``failed_at``/``failed_reason`` so :func:`pending_records`
+#: stops offering them and the log stops repeating one line per stop cycle, while the ledger still
+#: shows what was attempted and why. The rest (a missing download, a failed copy) can genuinely
+#: change between runs and stay pending.
+_PERMANENT_REASONS = frozenset(
+    (REASON_NOT_IN_MODS, REASON_NAME_TAKEN, REASON_BACKUP_NAMES_TAKEN, REASON_HASH_MISMATCH)
+)
+
+#: One install at a time, per process. Two installs racing over one ``mods/`` folder is what the
+#: backup-name reservation below exists to survive, but serialising them is the cheaper guarantee:
+#: the ``.old`` name is chosen and taken in one step, and no second installer can slip between the
+#: two halves of that step.
+_INSTALL_LOCK = threading.RLock()
+
 
 #: Leading bracket groups on a file name — where an admin puts their own note. Both the ASCII
 #: and the full-width bracket, because a Chinese-language admin uses either.
@@ -106,14 +125,32 @@ def backup_name(path: Union[str, Path]) -> Optional[Path]:
 
     An existing backup is never overwritten: it is the previous version of a mod, which is
     exactly the file somebody would want back. Numbering means a second update keeps both.
+
+    **The name is taken, not merely chosen.** The loop creates each candidate with
+    ``open(..., "x")`` and returns the one that succeeds, so another installer — or an admin
+    renaming a file by hand in the same moment — cannot be handed the same name. Bare
+    ``exists()`` probing followed by a later ``os.replace`` was a TOCTOU window, and the loser of
+    that race overwrote a backup that the docstring promised was never overwritten. The
+    placeholder file is what the caller renames the old jar onto.
     """
     base = Path(path).with_name(Path(path).name + _BACKUP_SUFFIX)
-    if not base.exists():
-        return base
-    for index in range(2, _BACKUP_ATTEMPTS + 2):
-        candidate = base.with_name("{}.{}".format(base.name, index))
-        if not candidate.exists():
-            return candidate
+    for candidate in [base] + [
+        base.with_name("{}.{}".format(base.name, index))
+        for index in range(2, _BACKUP_ATTEMPTS + 2)
+    ]:
+        try:
+            # ``os.O_CREAT | os.O_EXCL``: atomic claim, and a no-op rather than a window when two
+            # callers reach the same name at once. ``open()`` rather than ``Path.touch`` because
+            # only the exclusive flag makes the claim itself the test.
+            descriptor = os.open(str(candidate), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            continue
+        except OSError:
+            # A folder we cannot create in, or a name the filesystem refuses: not a name to hand
+            # out. The next candidate may still work, so this is a ``continue`` like the clash.
+            continue
+        os.close(descriptor)
+        return candidate
     return None
 
 
@@ -185,9 +222,20 @@ def pending_records(ledger: DownloadLedger, approved_only: bool) -> List[str]:
     Separated from :func:`install_pending` so the caller can ask "is there anything to do?"
     without doing it — the install runs from the stop event, and a stop with nothing to install
     must not write an install report claiming otherwise.
+
+    A record closed out by a reason that cannot improve (``failed_reason``; see
+    :data:`_PERMANENT_REASONS`) is not a pending record. Without this, a mod whose old jar the
+    admin deleted was re-attempted and re-logged on every single stop, which is also why the
+    log could never be used to tell "waiting" from "given up". Editing ``failed_reason`` out of
+    the ledger — or deleting the record — is how an admin asks for another try.
     """
     keys = ledger.approved_keys() if approved_only else sorted(ledger.records())
-    return [key for key in keys if str((ledger.get(key) or {}).get("file") or "")]
+    return [
+        key
+        for key in keys
+        if str((ledger.get(key) or {}).get("file") or "")
+        and not (ledger.get(key) or {}).get("failed_reason")
+    ]
 
 
 @dataclass
@@ -262,8 +310,27 @@ def _remove_temporary(temporary: Path) -> bool:
     return False
 
 
+def _release_reserved_name(backup: Path) -> None:
+    """Give back the placeholder :func:`backup_name` created, when the rename onto it failed.
+
+    Without this an aborted install leaves a zero-byte ``x.jar.old`` behind, which the next run
+    would treat as a real backup (and the cleanup feature would eventually delete as if it were
+    one). Missing is not a problem: the rename may have succeeded before the call that failed.
+    """
+    try:
+        backup.unlink()
+    except OSError:
+        pass
+
+
 def _install_one(record: Dict[str, Any], options: InstallOptions) -> InstallResult:
     """Install one recorded download, or explain why it was not installed."""
+    with _INSTALL_LOCK:
+        return _install_one_locked(record, options)
+
+
+def _install_one_locked(record: Dict[str, Any], options: InstallOptions) -> InstallResult:
+    """The install itself. Callers hold :data:`_INSTALL_LOCK`, so the backup decision is final."""
     name = str(record.get("name") or record.get("local") or "")
     version = str(record.get("version") or "")
 
@@ -315,6 +382,7 @@ def _install_one(record: Dict[str, Any], options: InstallOptions) -> InstallResu
     try:
         os.replace(installed, backup)
     except OSError as error:
+        _release_reserved_name(backup)
         return InstallResult(name=name, status=STATUS_FAILED, version=version,
                              detail="could not set the old jar aside: {}".format(error))
 
@@ -367,19 +435,140 @@ def install_pending(
     Which records those are is :func:`pending_records`' decision, and it is the same list the
     caller used to decide whether to run at all — an admin who authorised one mod must not get
     the other four instalments as a side effect of the others merely being downloaded.
+
+    Two things happen to a record that is done with. On success the **consumed download is
+    deleted**: the build now lives in ``mods/`` and the previous version beside it as ``.old``,
+    so a third copy in the download folder is one nothing will ever read again, and leaving it
+    there made the folder grow by one jar per update forever — the note in the code said as much
+    while ``forget`` only dropped the bookkeeping. On a reason that cannot improve (see
+    :data:`_PERMANENT_REASONS`) the record is *closed* rather than retried, so
+    ``download.install_on_stop`` does not re-attempt it and re-log it on every stop.
     """
     results: List[InstallResult] = []
+    installed = False
     for key in pending_records(ledger, options.approved_only):
         record = ledger.get(key) or {}
         result = _install_one(record, options)
         results.append(result)
         if result.status == STATUS_INSTALLED:
-            # The file now lives in mods/, and the previous version is kept beside it as
-            # ``.old``. Keeping a third copy in the download folder would grow forever.
+            installed = True
+            _remove_consumed_download(ledger, options, record, logger)
             ledger.forget(key)
             ledger.save()
+        elif result.status == STATUS_SKIPPED and result.detail in _PERMANENT_REASONS:
+            ledger.update(
+                key,
+                failed_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                failed_reason=result.detail,
+            )
+            ledger.save()
         _log(logger, result)
+    if installed:
+        # Once per run rather than once per jar, and only when something was actually installed:
+        # a stop with nothing to do must not go walking the folder.
+        _sweep_consumed_downloads(ledger, options, logger)
     return results
+
+
+def _remove_consumed_download(
+    ledger: DownloadLedger,
+    options: InstallOptions,
+    record: Dict[str, Any],
+    logger: Optional[Any],
+) -> None:
+    """Delete the download an install just consumed. A failure is a debug line, not an error."""
+    name = str(record.get("file") or "")
+    if not name:
+        return
+    ok, _reason = is_safe_component(name)
+    if not ok:
+        return
+    path = options.downloads_folder / name
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        # Windows refuses while another handle is open, which is exactly the case for a jar the
+        # server is reading. The directory sweep below gets it on a later run.
+        _debug(logger, "could not remove the installed download {}: {}".format(path, error))
+
+
+def _sweep_consumed_downloads(
+    ledger: DownloadLedger, options: InstallOptions, logger: Optional[Any] = None
+) -> List[str]:
+    """Delete leftover downloads this plugin provably wrote, once nothing claims them.
+
+    The other half of the same promise. A crash between the install and the ledger save, or a
+    ``forget`` whose file was locked on Windows, leaves a jar in the download folder with no
+    record — and a file with no record is invisible to every other code path here, so it stays
+    forever. Two conditions are required before one is deleted, and both matter:
+
+    * it must be a bare ``.jar``/``.part`` name inside the folder (never a path, and never
+      something the admin keeps there by hand);
+    * its SHA-1 must be one the ledger recorded for a download, so the file is *self-proving* to
+      have come from this plugin. A jar whose bytes this plugin has no record of is left alone:
+      deleting a file that might be the admin's own is the one mistake this module must not make.
+
+    Returns the names removed, for the tests and the log.
+    """
+    folder = options.downloads_folder
+    if not folder.is_dir():
+        return []
+    tracked = set()
+    known: Dict[str, str] = {}
+    for key in ledger.records():
+        item = ledger.get(key) or {}
+        name = str(item.get("file") or "")
+        if not name:
+            continue
+        ok, _reason = is_safe_component(name)
+        if ok:
+            tracked.add(name)
+        digest = str(item.get("sha1") or "").lower()
+        if digest:
+            known[digest] = name
+
+    if not known:
+        return []
+
+    removed: List[str] = []
+    try:
+        candidates = sorted(folder.iterdir())
+    except OSError as error:
+        _debug(logger, "could not list the download folder {}: {}".format(folder, error))
+        return []
+    for path in candidates:
+        if not path.is_file() or path.name in tracked:
+            continue
+        if path.suffix.lower() not in (".jar", ".part"):
+            continue
+        try:
+            digest = _sha1_of(path)
+        except OSError:
+            continue
+        if digest not in known:
+            continue
+        try:
+            path.unlink()
+        except OSError as error:
+            _debug(logger, "could not remove the leftover download {}: {}".format(path, error))
+            continue
+        removed.append(path.name)
+    if removed:
+        _debug(
+            logger,
+            "removed {} leftover download(s) this plugin had already installed: {}".format(
+                len(removed), ", ".join(removed)
+            ),
+        )
+    return removed
+
+
+def _debug(logger: Optional[Any], message: str) -> None:
+    handler = getattr(logger, "debug", None) if logger else None
+    if handler is not None:
+        handler(message)
 
 
 def _log(logger: Optional[Any], result: InstallResult) -> None:

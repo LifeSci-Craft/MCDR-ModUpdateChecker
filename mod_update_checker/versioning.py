@@ -37,15 +37,22 @@ __all__ = [
 #: Pre-release markers and how they rank against each other. Lower is older. A version
 #: whose *extra* trailing segment is one of these is therefore older than the same version
 #: without it, which is what makes ``1.0.0`` newer than ``1.0.0-rc.1``.
+#:
+#: Only the spelled-out markers are here. ``a`` and ``b`` used to be in the table as
+#: abbreviations of ``alpha`` and ``beta``, and that made the order incoherent: ``1.0.0-a`` was
+#: *older* than ``1.0.0`` while ``1.0.0-1`` — the same suffix spelled as a number — was *newer*,
+#: because the rule below only recognises a marker in the text table. Two strings that differ
+#: only in how the author spelled the sequence number cannot compare on opposite sides of the
+#: same release, so the abbreviations go and the numeric rule covers them. Real pre-releases
+#: spell the marker out (``alpha``/``beta``/``rc``/``pre``); a bare ``-a`` is read as a
+#: sequence, like every other non-marker suffix.
 _PRERELEASE_RANK = {
     "snapshot": -40,
     "dev": -35,
     "nightly": -34,
     "test": -30,
     "alpha": -20,
-    "a": -20,
     "beta": -10,
-    "b": -10,
     "pre": -6,
     "prerelease": -6,
     "preview": -6,
@@ -55,10 +62,16 @@ _PRERELEASE_RANK = {
 
 #: Splits a version string into segments. Every separator mod authors use in practice.
 _SEPARATORS = re.compile(r"[.\-_]+")
+#: The same split with the separators kept, so :func:`_tokenize` can tell ``1.0.0-1`` from
+#: ``1.0.0.1``: the first is a pre-release sequence, the second a fourth version component.
+_SEPARATORS_WITH_SEPARATORS = re.compile(r"([.\-_]+)")
 #: Splits a segment into alternating text / digit runs, so ``rc11`` == ``rc`` + ``11``.
 _ALNUM = re.compile(r"(\d+)")
 
-Token = Tuple[int, str, str]  # (kind, digit string, text); kind 0 = numeric, 1 = text
+#: ``(kind, digit string, text, dashed)``. Kind 0 is numeric, 1 is text; ``dashed`` says the
+#: token came from a ``-``-separated segment, which is what tells a pre-release apart from a
+#: dotted extension (``1.0.0-1`` versus ``1.0.0.1``).
+Token = Tuple[int, str, str, bool]
 
 
 def _normalise_digits(digits: str) -> str:
@@ -86,6 +99,10 @@ def _tokenize(text: str) -> List[Token]:
 
     A leading ``v`` is dropped (``v1.2.3`` is ``1.2.3``), and every digit run becomes its
     own numeric token, so ``rc11`` sorts after ``rc2`` rather than before it.
+
+    Each token also remembers whether its segment was introduced by a ``-``. That is the only
+    difference between ``1.0.0-1`` (a pre-release sequence) and ``1.0.0.1`` (a fourth version
+    component), and once the cores are equal it is the difference between older and newer.
     """
     text = text.strip()
     if not text:
@@ -93,16 +110,21 @@ def _tokenize(text: str) -> List[Token]:
     if len(text) > 1 and text[0] in "vV" and text[1].isdigit():
         text = text[1:]
     tokens: List[Token] = []
-    for segment in _SEPARATORS.split(text):
-        if not segment:
+    dashed = False
+    for piece in _SEPARATORS_WITH_SEPARATORS.split(text):
+        if not piece:
             continue
-        for piece in _ALNUM.split(segment):
-            if not piece:
+        if piece[0] in ".-_":
+            # The separator itself, kept by the capturing group so the flag can be set from it.
+            dashed = "-" in piece
+            continue
+        for run in _ALNUM.split(piece):
+            if not run:
                 continue
-            if piece.isdigit():
-                tokens.append((0, _normalise_digits(piece), ""))
+            if run.isdigit():
+                tokens.append((0, _normalise_digits(run), "", dashed))
             else:
-                tokens.append((1, "", piece.lower()))
+                tokens.append((1, "", run.lower(), dashed))
     return tokens
 
 
@@ -138,18 +160,60 @@ def _compare_tokens(left: Sequence[Token], right: Sequence[Token]) -> int:
 
     longer = left if len(left) > len(right) else right
     extra = longer[min(len(left), len(right)):]
-    # A trailing segment that *starts* with a pre-release marker makes a version older, not
-    # newer: ``1.0.0`` beats ``1.0.0-rc.1``. Only the first extra token is consulted, since
-    # the rest of a pre-release identifier is its sequence number (``-rc.1`` -> ``rc`` + 1)
-    # and would otherwise mask the marker.
+    # What an extra trailing segment means, stated as one rule because two rules is how this
+    # went wrong before:
     #
-    # Anything else extra is a genuine extension, so the longer side wins: ``1.0.1`` beats
-    # ``1.0``, and ``1.19.2-0.5.3`` beats a bare ``1.19.2``. That last one is a judgement
-    # call — the dash there separates a game version from a mod version rather than
-    # introducing a pre-release — but it is the reading that matches what authors mean.
-    if extra and _is_prerelease_token(extra[0]):
+    # * a **pre-release marker** makes the version older — ``1.0.0`` beats ``1.0.0-rc.1``. Only
+    #   the first extra token is consulted, since the rest of a pre-release identifier is its
+    #   sequence number (``-rc.1`` -> ``rc`` + 1) and would otherwise mask the marker.
+    # * a **pre-release suffix** makes it older: ``1.0.0`` beats ``1.0.0-rc.1``, and also beats
+    #   ``1.0.0-1`` and ``1.0.0-a``. SemVer's rule is that everything after the first ``-`` is a
+    #   pre-release identifier, and its *numeric* form ranks lowest — which is exactly why this
+    #   cannot be decided one token at a time. Doing that made ``1.0.0-a.1 < 1.0.0``,
+    #   ``1.0.0 < 1.0.0-1`` and ``1.0.0-a.1 < 1.0.0-1`` all hold at once, so "sort and take the
+    #   last" depended on the order the strings arrived in. What decides it is the extra
+    #   segments *as a whole*: a marker anywhere in them, or nothing but numbers.
+    # * a number after a **dot** is another component, so the longer side wins: ``26.3.1`` beats
+    #   ``26.3`` and ``1.0.1`` beats ``1.0``. Reading that as a pre-release sequence would invert
+    #   a whole class of ordinary version numbers.
+    # * **anything else** is a genuine extension, so the longer side wins: ``1.19.2-0.5.3`` beats
+    #   a bare ``1.19.2``. That is a judgement call — the dash there separates a game version
+    #   from a mod version rather than introducing a pre-release — but it is the reading that
+    #   matches what authors mean, and it stays transitive because the pre-release test above
+    #   looks at the same "extra segments" for every pair of strings.
+    if extra and _looks_like_prerelease(extra):
         return -1 if longer is left else 1
     return 1 if longer is left else -1
+
+
+def _looks_like_prerelease(tokens: Sequence[Token]) -> bool:
+    """Whether a run of extra trailing tokens is a pre-release identifier.
+
+    True when it carries a spelled-out marker anywhere (``rc.1``, ``beta.2``) or is introduced by
+    a dash and is nothing but numbers (``-1``, ``-2.3``) — SemVer's numeric pre-release
+    identifiers, which rank below the release they lead to.
+
+    The dash matters: ``1.0.0-1`` is a pre-release sequence while ``1.0.0.1`` is a fourth version
+    component, and reading the second as a pre-release would invert ``26.3`` against ``26.3.1``.
+    It matters for the *first* extra token only, because the dash that introduces a pre-release
+    is the one that separates it from the core.
+
+    Something that starts with a letter is a pre-release however it is spelled — that is what
+    replaces the ``a``/``b`` abbreviations the rank table used to carry, and it keeps a bare
+    ``-a`` (a sequence number, not a channel) on the *older* side of its core. The all-numbers
+    case after a dash is also a pre-release, which makes ``1.19.2-0.5.3`` read as "0.5.3 of
+    1.19.2" rather than "1.19.2 plus more": a deliberate change from the old behaviour, and what
+    keeps the order consistent, because the alternative lets a three-component suffix outrank
+    the core while a one-component one does not.
+    """
+    if not tokens:
+        return False
+    if any(_is_prerelease_token(token) for token in tokens):
+        return True
+    if tokens[0][0] == 1 and tokens[0][3]:
+        # ``-a``, ``-a.1``, ``-snapshot2``: a word after the dash, whatever the word is.
+        return True
+    return tokens[0][3] and all(token[0] == 0 for token in tokens)
 
 
 def _split_build(text: str) -> Tuple[str, str]:
@@ -164,6 +228,13 @@ def compare(left: str, right: str) -> int:
     Build metadata (after ``+``) is only consulted when the cores are equal, so
     ``0.162.0+26.3`` ranks above a bare ``0.162.0`` — for mod jars that suffix normally
     encodes the Minecraft version the build targets, which is genuine information.
+
+    When one side is a prefix of the other, the extra trailing segments decide it, and the rule
+    is stated in one place in :func:`_compare_tokens`: a pre-release marker or a number makes the
+    longer version **older** (``1.0.0`` beats both ``1.0.0-rc.1`` and ``1.0.0-1``), anything else
+    makes it **newer** (``1.0.1`` beats ``1.0``). The rule is deliberately total and transitive,
+    because callers sort with it: ``latest_of`` and the report's "newest build" both take a
+    maximum, and a comparison that is not transitive makes that maximum depend on input order.
 
     The function never raises: junk in becomes a lexicographic answer out.
     """
@@ -184,6 +255,11 @@ def is_prerelease(version: str) -> bool:
 
     Build metadata is dropped first: in ``1.0.0-beta+26.3`` the marker is in the core, and
     the ``26.3`` after the ``+`` is the Minecraft version, not a release channel.
+
+    ``1.0.0-1`` is **not** a pre-release by this test, and that is the intended reading: a bare
+    number is a sequence number with no channel in it, and calling it one would gate a genuine
+    release behind ``check.include_alpha``. It still ranks below ``1.0.0`` in :func:`compare`,
+    because there it is a suffix rather than a channel.
     """
     core, _ = _split_build(str(version))
     return any(_is_prerelease_token(token) for token in _tokenize(core))
@@ -334,6 +410,12 @@ def parse_spec(spec: RangeSpec) -> List[Callable[[str], bool]]:
     A list means the alternatives the metadata allows — Fabric treats a list as *any of*,
     so this follows suit. Empty alternatives (``[""]``, seen in the wild) are ignored
     rather than treated as "matches nothing", which would silently drop a good mod.
+
+    A value that is neither a string nor a sequence of them is also "no constraint". The
+    metadata is third-party data, and a typo in it is allowed to be wrong — not to abort the
+    run: ``{"minecraft": 123}`` used to reach the iteration below and raise ``TypeError``,
+    which cost the *whole* check its report. A mapping is refused for the same reason, since
+    iterating it yields its keys (``{"any": "1.21"}`` would have reported a range of "any").
     """
     if spec is None:
         return [lambda _version: True]
@@ -341,8 +423,10 @@ def parse_spec(spec: RangeSpec) -> List[Callable[[str], bool]]:
     alternatives: Sequence[str]
     if isinstance(spec, str):
         alternatives = [spec]
-    else:
+    elif isinstance(spec, Sequence) and not isinstance(spec, (bytes, bytearray)):
         alternatives = [str(item) for item in spec]
+    else:
+        return [lambda _version: True]
 
     any_of: List[Callable[[str], bool]] = []
     for alternative in alternatives:
@@ -370,12 +454,19 @@ def covers(spec: RangeSpec, version: str) -> bool:
 
 
 def normalize_spec(spec: RangeSpec) -> str:
-    """A short human-readable form of a range specification, for reports."""
+    """A short human-readable form of a range specification, for reports.
+
+    ``*`` covers "not declared" and "declared as something this plugin cannot read" alike:
+    the report shows an unconstrained range either way, rather than a ``123`` or a dict's key
+    presented to an admin as if it were a Minecraft version.
+    """
     if spec is None:
         return "*"
     if isinstance(spec, str):
         text = spec.strip()
         return text or "*"
+    if not isinstance(spec, Sequence) or isinstance(spec, (bytes, bytearray)):
+        return "*"
     parts = [str(item).strip() for item in spec]
     parts = [part for part in parts if part]
     return " | ".join(parts) if parts else "*"

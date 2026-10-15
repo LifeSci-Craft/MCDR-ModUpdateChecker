@@ -1,7 +1,14 @@
 # Mod Update Checker
 
+[![CI](https://github.com/LifeSci-Craft/MCDR-ModUpdateChecker/actions/workflows/ci.yml/badge.svg)](https://github.com/LifeSci-Craft/MCDR-ModUpdateChecker/actions/workflows/ci.yml)
+[![MCDR](https://img.shields.io/badge/MCDR-2.13.0%2B-blue)](https://mcdreforged.com/)
+[![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org/)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 > MCDR 的 Mod 更新检查插件：检查服务端 `mods/` 中的 Mod 是否有适配当前 Minecraft 版本与加载器
 > 的新版本，更新信息来自 **Modrinth**。
+
+**English**: see [`README_en.md`](README_en.md).
 
 **默认只检查和报告**：不会下载文件，也不会改动 `mods/`。下载到插件文件夹、安装到 `mods/`，
 都需要显式开启或用命令指定；安装只会在服务端停止后进行，并保留旧版备份。不需要 API key，也没有

@@ -95,6 +95,17 @@ class RateLimited(UpstreamError):
     """429 after the retries were exhausted."""
 
 
+class _BodyInterrupted(UpstreamError):
+    """The response body broke while it was being read — worth another attempt.
+
+    Private, and a subclass of :class:`UpstreamError` on purpose: a caller that only knows
+    "the upstream failed" (which is every caller) keeps working unchanged, while
+    :meth:`HttpClient._request` can tell this one apart and retry it. It is never raised out
+    of the client: once the attempts are used up the retry loop re-raises it, which reads to
+    the caller exactly like the ``UpstreamError`` it is.
+    """
+
+
 class RateLimiter:
     """A sliding-window limiter: at most ``per_minute`` grants per rolling minute.
 
@@ -313,8 +324,27 @@ class HttpClient:
             # Read the body rather than letting ``response.json()`` pull it in: the declared
             # length is checked first, and the bytes are then counted as they arrive, so an
             # unbounded or lying response cannot become an unbounded allocation.
+            #
+            # A body that breaks *while* it is being read is the one failure that can be
+            # retried, and it is the common one on a censored or flaky link — the connection
+            # was up for the headers and died mid-stream. The retry loop above covers the
+            # connection, so it has to cover this too, or ``network.retries`` only helps when
+            # the request never started.
             try:
                 return self._read_json(response, url, status)
+            except _BodyInterrupted as error:
+                last_error = error
+                if attempt >= self.retries:
+                    raise
+                wait = min(self.backoff_base * (2 ** attempt), 20.0)
+                self._log(
+                    "debug",
+                    "reading {} failed ({}), retrying in {:.1f}s".format(
+                        url, type(error.__cause__).__name__ or "error", wait
+                    ),
+                )
+                time.sleep(wait)
+                continue
             finally:
                 response.close()
 
@@ -346,6 +376,17 @@ class HttpClient:
         Two checks rather than one, for the same reason the download path has two: the declared
         length catches a large response before any of it is read, and the running total catches a
         response that declares nothing, declares a lie, or is chunked.
+
+        Two kinds of failure leave here as an :class:`UpstreamError`, and the distinction is
+        the caller's: a body that broke mid-read (``ChunkedEncodingError``,
+        ``IncompleteRead``, a reset connection) is retried, because the next attempt may well
+        succeed, while anything the parser itself rejected is not, because the same bytes will
+        be rejected again. ``RecursionError`` belongs to the second group even though it looks
+        like a crash: ``json.loads`` raises it for a deeply nested document, and it is not a
+        ``ValueError``, so it used to escape the client entirely — past the retry loop, past
+        every ``except UpstreamError`` in the callers, and out into the check that had no
+        report. The document that does it costs a few hundred kilobytes, well under
+        :attr:`json_max_bytes`, so the size limit is not a defence against it.
         """
         self._check_declared_size(response, url, status)
         chunks = []
@@ -363,7 +404,7 @@ class HttpClient:
                     )
                 chunks.append(chunk)
         except requests.RequestException as error:
-            raise UpstreamError(
+            raise _BodyInterrupted(
                 "{}: {}".format(type(error).__name__, error), status=status, url=url
             ) from error
 
@@ -373,6 +414,22 @@ class HttpClient:
         except (UnicodeDecodeError, ValueError) as error:
             raise UpstreamError(
                 "the response was not JSON ({}: {})".format(type(error).__name__, error),
+                status=status,
+                url=url,
+            ) from error
+        except MemoryError as error:
+            # A nesting bomb is the one shape that reaches here as an allocation failure rather
+            # than as ``RecursionError``, depending on the interpreter's limits. Both mean the
+            # same thing to the caller: this response is not usable, and asking for it again
+            # would do the same thing again.
+            raise UpstreamError(
+                "the response was too deeply nested to parse (MemoryError)",
+                status=status,
+                url=url,
+            ) from error
+        except RecursionError as error:
+            raise UpstreamError(
+                "the response was too deeply nested to parse (RecursionError)",
                 status=status,
                 url=url,
             ) from error
