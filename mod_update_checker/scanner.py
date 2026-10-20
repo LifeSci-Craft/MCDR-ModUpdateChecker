@@ -317,12 +317,9 @@ def _iter_mod_jars(directory: Path) -> Tuple[List[Path], List[str], str]:
 def _loads_lenient(raw: str) -> Any:
     """Parse JSON, then retry after stripping the JSON5-isms that turn up in the wild.
 
-    Refuses anything over :data:`METADATA_SIZE_LIMIT` up front as well. The entry's declared
-    uncompressed size is checked before this runs, so this is the second half of one boundary
-    rather than a duplicate: it is also the only bound on the work ``json.loads`` is asked to do.
+    The entry has already been read under :data:`METADATA_SIZE_LIMIT` by
+    :func:`_read_entry_capped`, which is what bounds the work ``json.loads`` is asked to do.
     """
-    if len(raw) > METADATA_SIZE_LIMIT:
-        raise ValueError("metadata entry is too large to parse")
     try:
         return json.loads(raw)
     except ValueError:

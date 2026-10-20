@@ -196,8 +196,6 @@ def _vote_mc_version(mods: Iterable) -> Optional[str]:
         return None
 
     most = max(votes.values())
-    if most <= 0:
-        return None
     # Ties are broken by comparing versions, not by comparing strings: "1.22" > "1.21" and
     # "1.9" > "1.21" as text, and picking either of those over the real answer is how a guess
     # makes every mod look like it has no compatible build.
