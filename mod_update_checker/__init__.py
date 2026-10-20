@@ -999,10 +999,7 @@ def _clamp_and_report(server: PluginServerInterface, config: Config) -> List[str
         if missing:
             continue
         name = parts[-1]
-        try:
-            value: Any = getattr(target, name)
-        except AttributeError:
-            continue
+        value: Any = getattr(target, name)
         try:
             number = int(value)
         except (TypeError, ValueError):
@@ -1042,8 +1039,7 @@ def _apply_language(server: PluginServerInterface, config: Config) -> None:
             # a silent fall back to English, which looks exactly like the admin having asked for
             # English. One debug line is the difference between "we chose English" and "we ended
             # up in English and cannot say why".
-            if server is not None:
-                server.logger.debug("get_mcdr_language() failed: {}".format(error))
+            server.logger.debug("get_mcdr_language() failed: {}".format(error))
 
     choice = i18n.resolve(config.language, mcdr_language)
     global _translator
@@ -3927,19 +3923,16 @@ def _field(label: str, value: str, value_colour: Any = RColor.white) -> RTextLis
 
 
 def _approved_install_count(server: PluginServerInterface) -> int:
-    """How many downloads an admin has authorised by hand, or ``0`` if that cannot be told.
+    """How many downloads an admin has authorised by hand.
 
     Read for the status page only. ``!!muc status`` reports the automatic setting, and after
     ``!!muc install`` that one line would otherwise still say "off" — technically true, and
     exactly the kind of half-answer that makes an admin go looking for a change that is already
     there.
     """
-    try:
-        ledger = DownloadLedger(
-            Path(server.get_data_folder()) / DOWNLOAD_LEDGER_FILE_NAME, logger=None
-        )
-    except Exception:  # noqa: BLE001 - a status page is not worth failing over
-        return 0
+    ledger = DownloadLedger(
+        Path(server.get_data_folder()) / DOWNLOAD_LEDGER_FILE_NAME, logger=None
+    )
     return len(ledger.approved_keys())
 
 

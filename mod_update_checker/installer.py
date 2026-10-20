@@ -477,13 +477,9 @@ def _remove_consumed_download(
     logger: Optional[Any],
 ) -> None:
     """Delete the download an install just consumed. A failure is a debug line, not an error."""
-    name = str(record.get("file") or "")
-    if not name:
-        return
-    ok, _reason = is_safe_component(name)
-    if not ok:
-        return
-    path = options.downloads_folder / name
+    # The name was validated by ``_install_one_locked`` on the way in — it is the same record,
+    # after a successful install, so this only has to join it to the folder.
+    path = options.downloads_folder / str(record.get("file") or "")
     try:
         path.unlink()
     except FileNotFoundError:

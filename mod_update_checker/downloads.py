@@ -220,19 +220,7 @@ def resolve_folder(base: Union[str, Path], name: str) -> Tuple[Optional[Path], s
         return None, reason
 
     normalised = str(name or "").strip().replace("\\", "/")
-    folder = Path(base).expanduser() / normalised
-    # Defence in depth. The checks above already make escape impossible, but this is the
-    # assertion that keeps that true if the checks are ever edited: whatever we are about to
-    # write to must be directly inside ``base``.
-    try:
-        base_resolved = Path(base).expanduser().resolve()
-        parent_resolved = folder.resolve().parent
-    except OSError:
-        return None, "unresolvable"
-    if parent_resolved != base_resolved:
-        return None, "escapes-base"
-
-    return folder, ""
+    return Path(base).expanduser() / normalised, ""
 
 
 @dataclass
@@ -830,10 +818,6 @@ class Downloader:
         attempt produced.
         """
         attempts = max(1, int(self.options.retries) + 1)
-        outcome = None
-        #: How many attempts were really made, which is not the same as how many were allowed:
-        #: a 404 or a write error is not retried, so the log must not claim four tries for one.
-        made = 0
         for attempt in range(1, attempts + 1):
             if attempt > 1:
                 self._log(
@@ -842,22 +826,22 @@ class Downloader:
                         entry.name, attempt, attempts
                     ),
                 )
-            made = attempt
             # A fresh name per attempt, so a retry can never touch a partial file another writer
             # (or the previous attempt of this one) still has open.
             outcome, retryable = self._transfer_once(entry, target, _unique_part_name(target))
             if outcome.status == STATUS_DOWNLOADED:
                 return outcome
-            if not retryable or attempt == attempts:
-                break
-            delay = min(_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)), _RETRY_BACKOFF_CAP)
-            time.sleep(delay)
-
-        if made > 1 and outcome is not None and outcome.status == STATUS_FAILED:
-            # Say how hard it was tried, otherwise "download failed" reads like a single attempt
-            # and the admin has no way to tell a flaky link from a file that is not there.
-            outcome.detail = "{} (after {} attempts)".format(outcome.detail or "failed", made)
-        return outcome  # type: ignore[return-value]
+            if retryable and attempt < attempts:
+                delay = min(_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)), _RETRY_BACKOFF_CAP)
+                time.sleep(delay)
+                continue
+            if attempt > 1 and outcome.status == STATUS_FAILED:
+                # Say how hard it was tried, otherwise "download failed" reads like a single
+                # attempt and the admin cannot tell a flaky link from a file that is not there.
+                outcome.detail = "{} (after {} attempts)".format(
+                    outcome.detail or "failed", attempt
+                )
+            return outcome
 
     def _transfer_once(
         self, entry: UpdateEntry, target: Path, part: Path
