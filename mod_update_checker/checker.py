@@ -818,10 +818,6 @@ class Checker:
         and the only shared state it touches is the resolve cache, which locks.
         """
         query = mod.mod_id or Path(mod.file_name).stem
-        if not query:
-            entry.status = STATUS_UNRESOLVED
-            return
-
         asked_modrinth = bool(self.options.use_modrinth)
         by_modrinth = (
             self._match_on_modrinth(mod, entry, query, server) if asked_modrinth else False
@@ -955,16 +951,14 @@ class Checker:
     ) -> None:
         """Warnings that explain breakage better than any version comparison."""
         for mod in scan.mods:
-            entry = entries.get(mod.file_name)
-            if entry is None or entry.status == STATUS_IGNORED:
+            entry = entries[mod.file_name]
+            if entry.status == STATUS_IGNORED:
                 continue
             note = mc_mismatch_note(mod, server.mc_version)
             if note is not None and note[0] not in {key for key, _ in entry.notes}:
                 entry.add_note(note[0], **note[1])
 
-        client_only = [
-            mod.file_name for mod in scan.client_only() if mod.file_name in entries
-        ]
+        client_only = [mod.file_name for mod in scan.client_only()]
         if client_only:
             report.advisories.append(
                 ("advisory.client_only", {"count": len(client_only), "files": ", ".join(client_only[:8])})
@@ -996,9 +990,7 @@ class Checker:
                 report.advisories.append(("advisory.missing_dependencies", args))
         for dep, files in client_only.items():
             for file_name in files:
-                entry = entries.get(file_name)
-                if entry is not None:
-                    entry.add_note("note.client_only_dependency", dep=dep)
+                entries[file_name].add_note("note.client_only_dependency", dep=dep)
         if report.duplicate_ids:
             report.advisories.append(
                 ("advisory.duplicates", {"count": len(report.duplicate_ids)})

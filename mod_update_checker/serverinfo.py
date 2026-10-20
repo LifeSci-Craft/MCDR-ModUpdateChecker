@@ -182,8 +182,7 @@ def _vote_mc_version(mods: Iterable) -> Optional[str]:
             votes[candidate] = votes.get(candidate, 0) + 1
     if not votes:
         return None
-    best = max(votes.items(), key=lambda item: (item[1], item[0]))
-    return best[0] if best[1] > 0 else None
+    return max(votes.items(), key=lambda item: (item[1], item[0]))[0]
 
 
 def _candidate_versions(spec) -> List[str]:

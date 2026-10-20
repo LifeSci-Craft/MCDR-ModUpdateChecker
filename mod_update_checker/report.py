@@ -515,7 +515,7 @@ class Report:
     def counts(self) -> Dict[str, int]:
         tally = {status: 0 for status in ALL_STATUSES}
         for entry in self.entries:
-            tally[entry.status] = tally.get(entry.status, 0) + 1
+            tally[entry.status] += 1
         return tally
 
     @property

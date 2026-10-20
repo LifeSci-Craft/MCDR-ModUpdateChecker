@@ -3055,7 +3055,7 @@ def _manual_confirm(source: CommandSource, prefix: str) -> None:
         return
 
     report = _last_report
-    entry = report.entry_by_handle(str(pending["number"])) if report is not None else None
+    entry = report.entry_by_handle(str(pending["number"]))
     if entry is None or entry.file_name != pending["file_name"]:
         # The report was replaced between the two commands, so the number means something else
         # now — act on nothing rather than on whatever it happens to point at.
@@ -3063,7 +3063,7 @@ def _manual_confirm(source: CommandSource, prefix: str) -> None:
         source.reply(tr("command.action.stale", command=prefix))
         return
 
-    number = int(pending["number"] or 0)
+    number = int(pending["number"])
     if pending["kind"] == "download":
         _clear_pending()
         _confirmed_download(source, entry, number, prefix)

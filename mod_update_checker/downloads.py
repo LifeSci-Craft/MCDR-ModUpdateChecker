@@ -673,7 +673,7 @@ class Downloader:
             delay = min(_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)), _RETRY_BACKOFF_CAP)
             time.sleep(delay)
 
-        if attempts > 1 and outcome is not None and outcome.status == STATUS_FAILED:
+        if attempts > 1 and outcome.status == STATUS_FAILED:
             # Say how hard it was tried, otherwise "download failed" reads like a single attempt
             # and the admin has no way to tell a flaky link from a file that is not there.
             outcome.detail = "{} (after {} attempts)".format(outcome.detail or "failed", attempts)
