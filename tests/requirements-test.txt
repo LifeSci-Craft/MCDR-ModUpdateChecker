@@ -19,5 +19,5 @@
 # minimum the plugin supports — that is `>=2.13.0` in mcdreforged.plugin.json, and it is
 # verified for real by `tools/mcdr_matrix.py`, which installs each version in turn and runs
 # the plugin inside it. See tests/README.md.
-pytest==9.1.1
+pytest==9.2.0
 mcdreforged==2.16.0
